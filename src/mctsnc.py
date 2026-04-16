@@ -1292,20 +1292,38 @@ class MCTSNC:
     @staticmethod
     @cuda.jit(void(float32, int32[:, :, :], boolean[:, :], int32[:, :], int32[:, :], int32[:], int32[:, :]))        
     def _select(ucb_c, trees, trees_leaves, trees_ns, trees_ns_wins, trees_nodes_selected, trees_selected_paths):
-        """CUDA kernel responsible for computations of stage: selections."""
+        """CUDA kernel responsible for computations of stage: selections.
+        输入: 
+            ==> ucb_c: ucb系数
+            trees: 树节点池，(n_trees, max_nodes, max_actions+1)
+            trees_leaves: 叶子节点标记，(n_trees, max_nodes)
+            trees_ns: 节点访问次数，(n_trees, max_nodes)
+            trees_ns_wins: 节点胜率，(n_trees, max_nodes)
+            trees_nodes_selected: 选中的节点，(n_trees, max_nodes)
+            trees_selected_paths: 选中的路径，(n_trees, max_nodes)
+        """
+        # shared_ucbs 存放当前节点的所有子节点的ucb值。假设子节点（动作）个数不会超过512个；同时，blockSize < 512
         shared_ucbs = cuda.shared.array(512, dtype=float32) # 512 - assumed limit on max actions
+        # 用于计算 UCB reduce-max 的共享内存
         shared_best_child = cuda.shared.array(512, dtype=int32) # 512 - assumed limit on max actions (array instead of one index due to max-argmax reduction pattern)
         shared_selected_path = cuda.shared.array(2048 + 2, dtype=int32) # 2048 - assumed equal to MAX_TREE_DEPTH 
         ti = cuda.blockIdx.x # tree index 
         tpb = cuda.blockDim.x
         t = cuda.threadIdx.x
         state_max_actions = int16(trees.shape[2] - 1)
+        
+        # node 是当前正在检查的节点Id
         node = int32(0)
         depth = int16(0)
         if t == 0:
             shared_selected_path[0] = int32(0) # path always starting from root
+        
+        # 循环直到到达叶子节点
         while not trees_leaves[ti, node]:
+            # 线程并行：并行所有动作子节点
+            # TODO: 当最大动作数 >> block中线程数的处理
             if t < state_max_actions:
+                # 每个线程检查一个子节点
                 child = trees[ti, node, 1 + t]
                 shared_best_child[t] = child                
                 if child == int32(-1):
@@ -1314,11 +1332,14 @@ class MCTSNC:
                     child_n = trees_ns[ti, child]             
                     if child_n == int32(0):
                         shared_ucbs[t] = float32(inf)
-                    else:                        
+                    else:
+                        # 子节点的胜率百分比 + UCB_c * sqrt(log(父节点访问次数)/子节点访问次数)
                         shared_ucbs[t] = trees_ns_wins[ti, child] / float32(child_n) + ucb_c * math.sqrt(math.log(trees_ns[ti, node]) / child_n)
             else:
                 shared_ucbs[t] = -float32(inf)
             cuda.syncthreads()
+
+            # reduce-max的并行计算
             stride = tpb >> 1 # half of tpb
             while stride > 0: # max-argmax reduction pattern
                 if t < stride:
