@@ -59,7 +59,8 @@ from puct_gpu_kernels import (
     _reset_puct,
     _select_puct,
     _extract_leaf_states,
-    _expand_and_backup_puct,
+    _prepare_expansion_puct,
+    _commit_expansion_and_backup_puct,
     _reduce_over_trees_puct,
     _reduce_over_actions_puct,
 )
@@ -330,10 +331,10 @@ def test_6_expand_grows_tree():
         agent.bridge.nn_priors.fill_(1.0 / max_actions)
         agent.bridge.nn_values.fill_(0.5)
 
-        _expand_and_backup_puct[n_trees, agent.tpb_s](
-            np.float32(0.99), np.float32(1.0), np.float32(0.5), np.int32(1),
-            agent.bridge.dev_nn_priors, agent.bridge.dev_nn_values,
-            agent.bridge.dev_leaf_valid,
+        # Phase B1: prepare expansion (store priors, sort ranks, surface parent state)
+        _prepare_expansion_puct[n_trees, agent.tpb_s](
+            np.float32(1.0), np.float32(0.5), np.int32(1),
+            agent.bridge.dev_nn_priors, agent.bridge.dev_leaf_valid,
             agent.dev_trees, agent.dev_trees_sizes, agent.dev_trees_depths,
             agent.dev_trees_robot_turns,
             agent.dev_trees_leaves, agent.dev_trees_terminals, agent.dev_trees_ns,
@@ -341,8 +342,26 @@ def test_6_expand_grows_tree():
             agent.dev_trees_action_priors,
             agent.dev_trees_prior_rank, agent.dev_trees_pw_boundary,
             agent.dev_trees_nodes_selected, agent.dev_trees_selected_paths,
-            np.int32(agent.max_tree_size), np.int32(state_dim),
-            np.int32(max_actions),
+            np.int32(agent.max_tree_size), np.int32(state_dim), np.int32(max_actions),
+            agent.bridge.dev_expansion_valid, agent.bridge.dev_expanded_parent_states,
+            agent.bridge.dev_expanded_actions,
+        )
+        cuda.synchronize()
+        # (no host environment step in unit test — next_states stay zero)
+        # Phase B2: commit expansion + backup
+        _commit_expansion_and_backup_puct[n_trees, agent.tpb_s](
+            np.float32(0.99), np.float32(1.0), np.float32(0.5), np.int32(1),
+            agent.bridge.dev_nn_values, agent.bridge.dev_leaf_valid,
+            agent.bridge.dev_expansion_valid, agent.bridge.dev_expanded_next_states,
+            agent.bridge.dev_expanded_rewards, agent.bridge.dev_expanded_terminals,
+            agent.dev_trees, agent.dev_trees_sizes, agent.dev_trees_depths,
+            agent.dev_trees_robot_turns,
+            agent.dev_trees_leaves, agent.dev_trees_terminals, agent.dev_trees_ns,
+            agent.dev_trees_total_value, agent.dev_trees_states,
+            agent.dev_trees_action_priors,
+            agent.dev_trees_prior_rank, agent.dev_trees_pw_boundary,
+            agent.dev_trees_nodes_selected, agent.dev_trees_selected_paths,
+            np.int32(agent.max_tree_size), np.int32(max_actions),
         )
         cuda.synchronize()
 
@@ -377,7 +396,7 @@ def test_7_progressive_widening():
         policy = UniformPolicyNet(state_dim, max_actions).cuda()
         value = ConstantValueNet(state_dim, 1, constant=0.5).cuda()
 
-        agent.run(root_state, 0, policy, value)
+        agent.run(root_state, 0, policy, value, problem=None)
 
         ns_root = int(agent.dev_trees_ns.copy_to_host()[0, 0])
         pw = int(agent.dev_trees_pw_boundary.copy_to_host()[0, 0])
@@ -432,10 +451,10 @@ def test_8_backup_value():
         agent.bridge.nn_priors.fill_(1.0 / max_actions)
         agent.bridge.nn_values.fill_(const_val)
 
-        _expand_and_backup_puct[n_trees, agent.tpb_s](
-            np.float32(0.99), np.float32(1.0), np.float32(0.5), np.int32(1),
-            agent.bridge.dev_nn_priors, agent.bridge.dev_nn_values,
-            agent.bridge.dev_leaf_valid,
+        # Phase B1
+        _prepare_expansion_puct[n_trees, agent.tpb_s](
+            np.float32(1.0), np.float32(0.5), np.int32(1),
+            agent.bridge.dev_nn_priors, agent.bridge.dev_leaf_valid,
             agent.dev_trees, agent.dev_trees_sizes, agent.dev_trees_depths,
             agent.dev_trees_robot_turns,
             agent.dev_trees_leaves, agent.dev_trees_terminals, agent.dev_trees_ns,
@@ -443,8 +462,25 @@ def test_8_backup_value():
             agent.dev_trees_action_priors,
             agent.dev_trees_prior_rank, agent.dev_trees_pw_boundary,
             agent.dev_trees_nodes_selected, agent.dev_trees_selected_paths,
-            np.int32(agent.max_tree_size), np.int32(state_dim),
-            np.int32(max_actions),
+            np.int32(agent.max_tree_size), np.int32(state_dim), np.int32(max_actions),
+            agent.bridge.dev_expansion_valid, agent.bridge.dev_expanded_parent_states,
+            agent.bridge.dev_expanded_actions,
+        )
+        cuda.synchronize()
+        # Phase B2
+        _commit_expansion_and_backup_puct[n_trees, agent.tpb_s](
+            np.float32(0.99), np.float32(1.0), np.float32(0.5), np.int32(1),
+            agent.bridge.dev_nn_values, agent.bridge.dev_leaf_valid,
+            agent.bridge.dev_expansion_valid, agent.bridge.dev_expanded_next_states,
+            agent.bridge.dev_expanded_rewards, agent.bridge.dev_expanded_terminals,
+            agent.dev_trees, agent.dev_trees_sizes, agent.dev_trees_depths,
+            agent.dev_trees_robot_turns,
+            agent.dev_trees_leaves, agent.dev_trees_terminals, agent.dev_trees_ns,
+            agent.dev_trees_total_value, agent.dev_trees_states,
+            agent.dev_trees_action_priors,
+            agent.dev_trees_prior_rank, agent.dev_trees_pw_boundary,
+            agent.dev_trees_nodes_selected, agent.dev_trees_selected_paths,
+            np.int32(agent.max_tree_size), np.int32(max_actions),
         )
         cuda.synchronize()
 
@@ -472,7 +508,7 @@ def test_9_reduction():
         root_state = np.zeros(state_dim, dtype=np.float32)
         policy = UniformPolicyNet(state_dim, max_actions).cuda()
         value = ZeroValueNet(state_dim, 1).cuda()
-        agent.run(root_state, 0, policy, value)
+        agent.run(root_state, 0, policy, value, problem=None)
 
         actions_ns = agent.dev_actions_ns.copy_to_host()
         total = int(np.sum(actions_ns))
@@ -498,7 +534,7 @@ def test_10_full_run():
         policy = UniformPolicyNet(state_dim, max_actions).cuda()
         value = ConstantValueNet(state_dim, 2, constant=0.3).cuda()
 
-        best_action, best_n, actions_info = agent.run(root_state, 0, policy, value)
+        best_action, best_n, actions_info = agent.run(root_state, 0, policy, value, problem=None)
         ok = 0 <= best_action < max_actions and best_n > 0
         record("Test 10: Full run smoke", ok,
                f"best_action={best_action}, best_n={best_n}, steps={agent.steps}")

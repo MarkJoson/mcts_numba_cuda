@@ -77,11 +77,38 @@ class NumbaPytorchBridge:
             (n_trees,), dtype=torch.int32, device="cuda"
         )
 
+        # ── Added for Environment Dynamics Bridge ────────────────────────────
+        self.expansion_valid: torch.Tensor = torch.zeros(
+            (n_trees,), dtype=torch.int32, device="cuda"
+        )
+        self.expanded_parent_states: torch.Tensor = torch.zeros(
+            (n_trees, state_dim), dtype=torch.float32, device="cuda"
+        )
+        self.expanded_actions: torch.Tensor = torch.zeros(
+            (n_trees, action_dim), dtype=torch.float32, device="cuda"
+        )
+        self.expanded_next_states: torch.Tensor = torch.zeros(
+            (n_trees, state_dim), dtype=torch.float32, device="cuda"
+        )
+        self.expanded_rewards: torch.Tensor = torch.zeros(
+            (n_trees, num_robots), dtype=torch.float32, device="cuda"
+        )
+        self.expanded_terminals: torch.Tensor = torch.zeros(
+            (n_trees,), dtype=torch.bool, device="cuda"
+        )
+
         # ── Numba views of the *same* memory (zero-copy) ────────────────────
         self.dev_leaf_states = cuda.as_cuda_array(self.leaf_states)
         self.dev_nn_priors = cuda.as_cuda_array(self.nn_priors)
         self.dev_nn_values = cuda.as_cuda_array(self.nn_values)
         self.dev_leaf_valid = cuda.as_cuda_array(self.leaf_valid)
+
+        self.dev_expansion_valid = cuda.as_cuda_array(self.expansion_valid)
+        self.dev_expanded_parent_states = cuda.as_cuda_array(self.expanded_parent_states)
+        self.dev_expanded_actions = cuda.as_cuda_array(self.expanded_actions)
+        self.dev_expanded_next_states = cuda.as_cuda_array(self.expanded_next_states)
+        self.dev_expanded_rewards = cuda.as_cuda_array(self.expanded_rewards)
+        self.dev_expanded_terminals = cuda.as_cuda_array(self.expanded_terminals)
 
     # ── Diagnostic helpers ───────────────────────────────────────────────────
 
@@ -107,6 +134,12 @@ class NumbaPytorchBridge:
         self.nn_priors.zero_()
         self.nn_values.zero_()
         self.leaf_valid.zero_()
+        self.expansion_valid.zero_()
+        self.expanded_parent_states.zero_()
+        self.expanded_actions.zero_()
+        self.expanded_next_states.zero_()
+        self.expanded_rewards.zero_()
+        self.expanded_terminals.zero_()
 
     def __repr__(self) -> str:
         return (

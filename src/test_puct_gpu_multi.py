@@ -109,7 +109,7 @@ def run_multi_dimensional_test():
             start_time = time.time()
             
             # Run PUCT iteration
-            best_action, best_n, action_infos = agent.run(root_state, root_turn=0, policy_model=policy, value_model=value)
+            best_action, best_n, action_infos = agent.run(root_state, root_turn=0, policy_model=policy, value_model=value, problem=None)
             
             torch.cuda.synchronize()
             elapsed = time.time() - start_time

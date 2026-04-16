@@ -62,7 +62,8 @@ from puct_gpu_kernels import (
     _reset_puct,
     _select_puct,
     _extract_leaf_states,
-    _expand_and_backup_puct,
+    _prepare_expansion_puct,
+    _commit_expansion_and_backup_puct,
     _reduce_over_trees_puct,
     _reduce_over_actions_puct,
 )
@@ -317,7 +318,8 @@ class PUCTGpu:
     # ── Main run loop ────────────────────────────────────────────────────────
 
     def run(self, root_state: np.ndarray, root_turn: int,
-            policy_model, value_model):
+            policy_model, value_model, problem,
+            action_sampler=None, root_action_cache=None):
         """
         Run PUCT search from *root_state* and return the best action index.
 
@@ -331,6 +333,19 @@ class PUCTGpu:
             Maps (B, state_dim) → (B, max_actions).  Called with no_grad.
         value_model : torch.nn.Module
             Maps (B, state_dim) → (B, num_robots).  Called with no_grad.
+        problem : ContinuousProblem mapping objects
+            Provides .step() and .reward() callbacks for host-side simulation.
+        action_sampler : callable, optional
+            Signature: ``action_sampler(parent_state_flat, action_idx, tree_idx)``
+            → np.ndarray of shape ``(action_dim, 1)``.
+            When provided, the host env step calls this instead of using the
+            raw discrete slot index as the action.  This allows the adapter to
+            map each discrete expansion slot to a freshly sampled continuous
+            action vector.
+        root_action_cache : dict, optional
+            If provided, every root-node expansion (selected_node == 0) will
+            store ``root_action_cache[action_idx] = sampled_action`` so the
+            adapter can resolve the winning slot back to a continuous vector.
 
         Returns
         -------
@@ -433,12 +448,11 @@ class PUCTGpu:
                     self.bridge.nn_values.copy_(values)
             self.time_nn += time.time() - t1
 
-            # ── KERNEL B: Expand + Backup ─────────────────────────────────────
+            # ── KERNEL B1: Prepare Expansion ──────────────────────────────────
             t1 = time.time()
-            _expand_and_backup_puct[self.n_trees, self.tpb_s](
-                gamma_f32, C_pw_f32, alpha_pw_f32, num_robots_i32,
-                self.bridge.dev_nn_priors, self.bridge.dev_nn_values,
-                self.bridge.dev_leaf_valid,
+            _prepare_expansion_puct[self.n_trees, self.tpb_s](
+                C_pw_f32, alpha_pw_f32, num_robots_i32,
+                self.bridge.dev_nn_priors, self.bridge.dev_leaf_valid,
                 self.dev_trees, self.dev_trees_sizes, self.dev_trees_depths,
                 self.dev_trees_robot_turns,
                 self.dev_trees_leaves, self.dev_trees_terminals, self.dev_trees_ns,
@@ -447,6 +461,76 @@ class PUCTGpu:
                 self.dev_trees_prior_rank, self.dev_trees_pw_boundary,
                 self.dev_trees_nodes_selected, self.dev_trees_selected_paths,
                 max_tree_size_i32, state_dim_i32, max_actions_i32,
+                self.bridge.dev_expansion_valid, self.bridge.dev_expanded_parent_states,
+                self.bridge.dev_expanded_actions
+            )
+            cuda.synchronize()
+            self.time_expand_backup += time.time() - t1
+
+            # ── HOST 2: Environment Step ──────────────────────────────────────
+            # Only step environments for valid expansions
+            # We assume policy output is already discretized/ranked or sample is deterministic
+            t1 = time.time()
+            exp_mask = self.bridge.expansion_valid.cpu().numpy().astype(bool)
+            if np.any(exp_mask):
+                parent_states_np = self.bridge.expanded_parent_states.cpu().numpy()
+                actions_np = self.bridge.expanded_actions.cpu().numpy()
+                # Snapshot selected nodes so we can identify root expansions
+                selected_nodes_np = self.dev_trees_nodes_selected.copy_to_host()
+
+                next_states = np.zeros((self.n_trees, self.state_dim), dtype=np.float32)
+                rewards = np.zeros((self.n_trees, self.num_robots), dtype=np.float32)
+                terminals = np.zeros((self.n_trees,), dtype=bool)
+
+                # Batch iter (or sequential if problem.step isn't batched)
+                for i in range(self.n_trees):
+                    if exp_mask[i]:
+                        action_idx = int(actions_np[i][0])
+                        if action_sampler is not None:
+                            # Delegate to caller-provided mapping: slot → continuous vector
+                            action_i = action_sampler(
+                                parent_states_np[i], action_idx, i)
+                            # Cache root-level expansions for final action resolution
+                            if (root_action_cache is not None
+                                    and int(selected_nodes_np[i]) == 0):
+                                root_action_cache[action_idx] = action_i.copy()
+                        else:
+                            # Fallback: use raw slot index (works for discrete problems)
+                            action_i = actions_np[i]
+                        if problem is not None:
+                            # problem.step expects column vectors shape (dim, 1)
+                            _ns = problem.step(
+                                parent_states_np[i].reshape(-1, 1),
+                                action_i.reshape(-1, 1),
+                                problem.dt)
+                            _r = problem.normalized_reward(
+                                parent_states_np[i].reshape(-1, 1),
+                                action_i.reshape(-1, 1))
+                            _term = problem.is_terminal(_ns)
+                            next_states[i] = _ns.flatten()
+                            rewards[i] = _r.flatten()
+                            terminals[i] = _term
+
+                # Send back to device
+                self.bridge.expanded_next_states.copy_(torch.from_numpy(next_states).cuda())
+                self.bridge.expanded_rewards.copy_(torch.from_numpy(rewards).cuda())
+                self.bridge.expanded_terminals.copy_(torch.from_numpy(terminals).cuda())
+            self.time_expand_backup += time.time() - t1
+
+            # ── KERNEL B2: Commit Expansion and Backup ────────────────────────
+            t1 = time.time()
+            _commit_expansion_and_backup_puct[self.n_trees, self.tpb_s](
+                gamma_f32, C_pw_f32, alpha_pw_f32, num_robots_i32,
+                self.bridge.dev_nn_values, self.bridge.dev_leaf_valid,
+                self.bridge.dev_expansion_valid, self.bridge.dev_expanded_next_states,
+                self.bridge.dev_expanded_rewards, self.bridge.dev_expanded_terminals,
+                self.dev_trees, self.dev_trees_sizes, self.dev_trees_depths,
+                self.dev_trees_robot_turns,
+                self.dev_trees_leaves, self.dev_trees_terminals, self.dev_trees_ns,
+                self.dev_trees_total_value, self.dev_trees_states, self.dev_trees_action_priors,
+                self.dev_trees_prior_rank, self.dev_trees_pw_boundary,
+                self.dev_trees_nodes_selected, self.dev_trees_selected_paths,
+                max_tree_size_i32, max_actions_i32,
             )
             cuda.synchronize()
             self.time_expand_backup += time.time() - t1

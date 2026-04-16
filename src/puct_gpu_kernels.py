@@ -5,12 +5,13 @@ All ``@cuda.jit`` kernel functions for the GPU-accelerated PUCT algorithm.
 
 Kernel naming follows the plan phases:
 
-    _reset_puct                  Phase 4
-    _select_puct                 Phase 5
-    _extract_leaf_states         Phase 6
-    _expand_and_backup_puct      Phase 8  (includes PW, Phase 9)
-    _reduce_over_trees_puct      Phase 10
-    _reduce_over_actions_puct    Phase 10
+    _reset_puct,
+    _select_puct,
+    _extract_leaf_states,
+    _prepare_expansion_puct,
+    _commit_expansion_and_backup_puct,
+    _reduce_over_trees_puct,
+    _reduce_over_actions_puct,
 
 Architecture
 ------------
@@ -171,7 +172,8 @@ def _select_puct(C_exp, alpha_exp,
 
     cuda.syncthreads()
 
-    while not trees_leaves[ti, node]:
+    max_depth = int16(trees_selected_paths.shape[1] - 2)  # shape[-1] = MAX_TREE_DEPTH + 2
+    while not trees_leaves[ti, node] and depth < max_depth:
         pw_limit = int32(trees_pw_boundary[ti, node])
         robot_turn = int32(trees_robot_turns[ti, node])
         parent_n = int32(trees_ns[ti, node])
@@ -269,71 +271,41 @@ def _extract_leaf_states(trees_nodes_selected, trees_states, trees_terminals,
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Phase 8+9 — _expand_and_backup_puct
+# Phase 8+9 — _prepare_expansion_puct & _commit_expansion_and_backup_puct
 # ════════════════════════════════════════════════════════════════════════════
 
 @cuda.jit
-def _expand_and_backup_puct(
-        gamma, C_pw, alpha_pw, num_robots,
-        nn_priors, nn_values, leaf_valid,
+def _prepare_expansion_puct(
+        C_pw, alpha_pw, num_robots,
+        nn_priors, leaf_valid,
         trees, trees_sizes, trees_depths, trees_robot_turns,
         trees_leaves, trees_terminals, trees_ns,
         trees_total_value, trees_states, trees_action_priors,
         trees_prior_rank, trees_pw_boundary,
         trees_nodes_selected, trees_selected_paths,
-        max_tree_size, state_dim, max_actions):
+        max_tree_size, state_dim, max_actions,
+        expansion_valid_out, parent_states_out, actions_out):
     """
-    Expansion + Prior Storage + Backup in a single kernel.
-
-    Expansion (Phase 8)
-    -------------------
-    - Store NN policy priors for the selected leaf.
-    - Sort priors (descending) into ``trees_prior_rank`` so that selection
-      can iterate by prior rank.
-    - Set ``pw_boundary = 1``: only the highest-prior action is initially
-      accessible.
-    - Allocate one child node (highest-prior action).
-
-    Backup (Phase 8)
-    ----------------
-    - Walk ``trees_selected_paths``, incrementing ``ns`` and accumulating
-      discounted ``nn_values`` at each ancestor.
-
-    Progressive Widening Update (Phase 9)
-    ---------------------------------------
-    - During backup, after updating ``ns[node]``, check whether the new
-      visit count unlocks a new action:
-          new_pw = ceil(C_pw * ns[node]^alpha_pw)
-          if new_pw > pw_boundary[node]: allocate next child.
-
-    Notes
-    -----
-    - Only thread 0 performs sequential mutations (expansion + backup) to
-      avoid intra-block data races.
-    - ``cuda.syncthreads()`` is called once before backup to ensure the
-      priors are visible to all threads (though only t==0 uses them).
+    Expansion Phase 1: Store priors, sort ranks, prep the best action.
     """
     ti = cuda.blockIdx.x
     tpb = cuda.blockDim.x
     t = cuda.threadIdx.x
     selected = int32(trees_nodes_selected[ti])
 
-    # ── EXPANSION ────────────────────────────────────────────────────────────
+    if t == 0:
+        expansion_valid_out[ti] = int32(0)
+
+    # ── EXPANSION PREP ────────────────────────────────────────────────────────
     if t == 0 and leaf_valid[ti] == int32(1):
-        # Store NN priors for this leaf
         for a in range(max_actions):
             trees_action_priors[ti, selected, a] = nn_priors[ti, a]
 
         current_size = trees_sizes[ti]
         if current_size < max_tree_size and not trees_terminals[ti, selected]:
-            # Mark leaf as internal node
-            trees_leaves[ti, selected] = False
-
-            # ── Insertion sort: priors descending → prior_rank ───────────────
-            # Initialise rank array to identity
+            # Sort priors
             for a in range(max_actions):
                 trees_prior_rank[ti, selected, a] = int16(a)
-            # Insertion sort O(max_actions²) — acceptable since run once
             for i in range(1, max_actions):
                 key_rank = trees_prior_rank[ti, selected, i]
                 key_prior = nn_priors[ti, key_rank]
@@ -343,40 +315,81 @@ def _expand_and_backup_puct(
                     j -= 1
                 trees_prior_rank[ti, selected, j + 1] = int16(key_rank)
 
-            # First child: highest-prior action (rank 0)
-            trees_pw_boundary[ti, selected] = int16(1)
             best_action = int32(trees_prior_rank[ti, selected, 0])
+            
+            # Export to Host for Simulation
+            expansion_valid_out[ti] = int32(1)
+            actions_out[ti, 0] = float32(best_action) # Can map to continuous if needed by host
+            for e in range(state_dim):
+                parent_states_out[ti, e] = trees_states[ti, selected, e]
 
-            child_idx = current_size
-            trees[ti, selected, 1 + best_action] = child_idx
-            trees[ti, child_idx, 0] = selected          # parent pointer
-            for a in range(max_actions):
-                if a != best_action:
-                    trees[ti, selected, 1 + a] = int32(-1)
-            trees_leaves[ti, child_idx] = True
-            trees_terminals[ti, child_idx] = False
-            trees_ns[ti, child_idx] = int32(0)
-            trees_depths[ti, child_idx] = trees_depths[ti, selected] + int16(1)
-            parent_turn = int32(trees_robot_turns[ti, selected])
-            trees_robot_turns[ti, child_idx] = int8((parent_turn + 1) % num_robots)
-            trees_pw_boundary[ti, child_idx] = int16(0)
-            # Zero total_value for new child
-            for r in range(num_robots):
-                trees_total_value[ti, child_idx, r] = float32(0.0)
-            # Zero action priors for new child
-            for a in range(max_actions):
-                trees_action_priors[ti, child_idx, a] = float32(0.0)
-                trees_prior_rank[ti, child_idx, a] = int16(a)
-            # Advance tree size
-            trees_sizes[ti] = current_size + 1
+@cuda.jit
+def _commit_expansion_and_backup_puct(
+        gamma, C_pw, alpha_pw, num_robots,
+        nn_values, leaf_valid, expansion_valid,
+        expanded_next_states, expanded_rewards, expanded_terminals,
+        trees, trees_sizes, trees_depths, trees_robot_turns,
+        trees_leaves, trees_terminals, trees_ns,
+        trees_total_value, trees_states, trees_action_priors,
+        trees_prior_rank, trees_pw_boundary,
+        trees_nodes_selected, trees_selected_paths,
+        max_tree_size, max_actions):
+    """
+    Expansion Phase 2: Consume Host simulated data, allocate child, run backup with exact rewards.
+    """
+    ti = cuda.blockIdx.x
+    tpb = cuda.blockDim.x
+    t = cuda.threadIdx.x
+    selected = int32(trees_nodes_selected[ti])
+    state_dim = expanded_next_states.shape[1]
+
+    # ── COMMIT EXPANSION ─────────────────────────────────────────────────────
+    if t == 0 and leaf_valid[ti] == int32(1):
+        if expansion_valid[ti] == int32(1):
+            trees_leaves[ti, selected] = False
+            trees_pw_boundary[ti, selected] = int16(1)
+
+            best_action = int32(trees_prior_rank[ti, selected, 0])
+            child_idx = trees_sizes[ti]
+
+            # ── bounds guard: skip expansion if tree is at capacity ──────────
+            # Without this check a full tree causes a CUDA illegal-address
+            # error (error 700) because child_idx == max_tree_size is OOB.
+            if child_idx < max_tree_size:
+                trees[ti, selected, 1 + best_action] = child_idx
+                trees[ti, child_idx, 0] = selected
+                for a in range(max_actions):
+                    if a != best_action:
+                        trees[ti, selected, 1 + a] = int32(-1)
+
+                trees_leaves[ti, child_idx] = True
+                trees_terminals[ti, child_idx] = expanded_terminals[ti]
+                trees_ns[ti, child_idx] = int32(0)
+                trees_depths[ti, child_idx] = trees_depths[ti, selected] + int16(1)
+                parent_turn = int32(trees_robot_turns[ti, selected])
+                trees_robot_turns[ti, child_idx] = int8((parent_turn + 1) % num_robots)
+                trees_pw_boundary[ti, child_idx] = int16(0)
+
+                for r in range(num_robots):
+                    trees_total_value[ti, child_idx, r] = float32(0.0)
+                for a in range(max_actions):
+                    trees_action_priors[ti, child_idx, a] = float32(0.0)
+                    trees_prior_rank[ti, child_idx, a] = int16(a)
+
+                for e in range(state_dim):
+                    trees_states[ti, child_idx, e] = expanded_next_states[ti, e]
+
+                trees_sizes[ti] = child_idx + 1
+            # else: tree is at capacity — skip expansion silently
         else:
-            # Tree full or terminal: keep as leaf but do not expand
             trees_pw_boundary[ti, selected] = int16(0)
 
     cuda.syncthreads()
 
     # ── BACKUP ───────────────────────────────────────────────────────────────
-    if t == 0 and leaf_valid[ti] == int32(1):
+    # Always backup ns even for terminal leaves (leaf_valid==0 means terminal,
+    # but we still traversed a path that needs ns updated).
+    if t == 0:
         path_length = int32(trees_selected_paths[ti, -1])
         leaf_depth = int32(trees_depths[ti, selected])
 
@@ -385,37 +398,29 @@ def _expand_and_backup_puct(
             node_depth = int32(trees_depths[ti, node])
             trees_ns[ti, node] += int32(1)
 
-            discount = math.pow(gamma, float32(leaf_depth - node_depth))
-            for r in range(num_robots):
-                trees_total_value[ti, node, r] += discount * nn_values[ti, r]
+            # Only accumulate value if this tree had a valid (non-terminal) leaf
+            if leaf_valid[ti] == int32(1):
+                # Backup formula matching puct_v0.hpp / puct_v1.hpp:
+                #   Each ancestor on the path gets:
+                #     gamma^(leaf_depth - node_depth) * leaf_value
+                #   + gamma^(leaf_depth - node_depth - 1) * step_reward   [if expanded]
+                discount = math.pow(float32(gamma), float32(leaf_depth - node_depth))
+                for r in range(num_robots):
+                    backup_val = discount * nn_values[ti, r]
+                    if expansion_valid[ti] == int32(1):
+                        rel = leaf_depth - node_depth - 1
+                        if rel >= 0:
+                            reward_discount = math.pow(float32(gamma), float32(rel))
+                        else:
+                            reward_discount = float32(1.0)
+                        backup_val += reward_discount * expanded_rewards[ti, r]
+                    trees_total_value[ti, node, r] += backup_val
 
-            # ── Progressive Widening check (Phase 9) ─────────────────────────
+            # ── Progressive Widening update ──────────────────────────────────
             node_n = float32(trees_ns[ti, node])
             old_pw = int32(trees_pw_boundary[ti, node])
             new_pw = int32(math.ceil(C_pw * math.pow(node_n, alpha_pw)))
             if new_pw > old_pw and old_pw < max_actions:
-                next_rank = old_pw         # 0-indexed
-                next_action = int32(trees_prior_rank[ti, node, next_rank])
-                new_child_idx = trees_sizes[ti]
-                if new_child_idx < max_tree_size:
-                    # Slot might already be allocated from a prior expansion;
-                    # only allocate if child slot is unoccupied.
-                    if trees[ti, node, 1 + next_action] == int32(-1):
-                        trees[ti, node, 1 + next_action] = new_child_idx
-                        trees[ti, new_child_idx, 0] = node
-                        trees_leaves[ti, new_child_idx] = True
-                        trees_terminals[ti, new_child_idx] = False
-                        trees_ns[ti, new_child_idx] = int32(0)
-                        trees_depths[ti, new_child_idx] = trees_depths[ti, node] + int16(1)
-                        parent_turn = int32(trees_robot_turns[ti, node])
-                        trees_robot_turns[ti, new_child_idx] = int8((parent_turn + 1) % num_robots)
-                        trees_pw_boundary[ti, new_child_idx] = int16(0)
-                        for r in range(num_robots):
-                            trees_total_value[ti, new_child_idx, r] = float32(0.0)
-                        for a in range(max_actions):
-                            trees_action_priors[ti, new_child_idx, a] = float32(0.0)
-                            trees_prior_rank[ti, new_child_idx, a] = int16(a)
-                        trees_sizes[ti] = new_child_idx + 1
                 trees_pw_boundary[ti, node] = int16(old_pw + 1)
 
 
