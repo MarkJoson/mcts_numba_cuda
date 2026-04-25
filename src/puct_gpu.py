@@ -64,6 +64,8 @@ from puct_gpu_kernels import (
     _extract_leaf_states,
     _prepare_expansion_puct,
     _commit_expansion_and_backup_puct,
+    _commit_expansion_puct_v2,
+    _backup_with_edge_rewards_puct,
     _reduce_over_trees_puct,
     _reduce_over_actions_puct,
 )
@@ -224,22 +226,23 @@ class PUCTGpu:
         per_state_memory = (
             f32 * self.state_dim
             + f32 * self.action_dim
-            + f32 * self.num_robots
-            + i32                                        # ns
-            + i32 * (1 + self.max_actions)              # tree row
-            + i16                                        # depth
-            + i8                                         # robot_turn
-            + 2                                          # leaf + terminal (bool)
-            + f32 * self.max_actions                    # action_priors
-            + i16 * self.max_actions                    # prior_rank
-            + i16                                        # pw_boundary
+            + f32 * self.num_robots                        # total_value
+            + f32 * self.num_robots                        # edge_rewards (Bug 2 fix)
+            + i32                                          # ns
+            + i32 * (1 + self.max_actions)                # tree row
+            + i16                                          # depth
+            + i8                                           # robot_turn
+            + 2                                            # leaf + terminal (bool)
+            + f32 * self.max_actions                      # action_priors
+            + i16 * self.max_actions                      # prior_rank
+            + i16                                          # pw_boundary
         )
 
         # Per-tree overhead (path, selected node, sizes)
         per_tree_overhead = (
             i32                                           # trees_sizes
             + i32                                         # trees_nodes_selected
-            + i32 * (self.MAX_TREE_DEPTH + 2)            # selected_paths
+            + i32 * (self.MAX_TREE_DEPTH + 2)             # selected_paths
         )
 
         available = self.device_memory_bytes - self.n_trees * per_tree_overhead
@@ -287,6 +290,9 @@ class PUCTGpu:
         self.dev_trees_prior_rank = cuda.device_array((T, S, A), dtype=np.int16)
         self.dev_trees_pw_boundary = cuda.device_array((T, S), dtype=np.int16)
 
+        # ── Per-edge reward array (Bug 2 fix: stepwise backup) ────────────────
+        self.dev_trees_edge_rewards = cuda.device_array((T, S, R), dtype=np.float32)
+
         # ── Reduction output arrays ───────────────────────────────────────────
         self.dev_actions_ns = cuda.device_array(A, dtype=np.int64)
         self.dev_actions_total_value = cuda.device_array((A, R), dtype=np.float32)
@@ -297,6 +303,7 @@ class PUCTGpu:
         self.bridge = NumbaPytorchBridge(T, D, Da, A, R)
 
         # ── Thread-per-block settings ─────────────────────────────────────────
+        # Thread Per Block 每 Block 线程数。
         self.tpb_r = min(
             int(2 ** math.ceil(math.log2(max(D, 1)))),
             self.cuda_tpb_default
@@ -321,7 +328,7 @@ class PUCTGpu:
             policy_model, value_model, problem,
             action_sampler=None, root_action_cache=None):
         """
-        Run PUCT search from *root_state* and return the best action index.
+        从根节点开始, 执行MCTS-PUCT算法, 返回最优动作。
 
         Parameters
         ----------
@@ -398,9 +405,11 @@ class PUCTGpu:
 
         for step in range(self.max_simulations):
             # ── Wall-clock check ──────────────────────────────────────────────
+            # TODO. 删除search_time_limit这个功能
             if time.time() - t_loop_start >= self.search_time_limit:
                 break
-
+            
+            # TODO. 使用 loguru logger 实现记录，抛弃 verbose debug
             if self.verbose_debug:
                 print(f"  [step {step + 1}]")
 
@@ -499,13 +508,15 @@ class PUCTGpu:
                             action_i = actions_np[i]
                         if problem is not None:
                             # problem.step expects column vectors shape (dim, 1)
-                            _ns = problem.step(
-                                parent_states_np[i].reshape(-1, 1),
-                                action_i.reshape(-1, 1),
-                                problem.dt)
-                            _r = problem.normalized_reward(
-                                parent_states_np[i].reshape(-1, 1),
-                                action_i.reshape(-1, 1))
+                            _s_col = parent_states_np[i].reshape(-1, 1)
+                            _a_col = action_i.reshape(-1, 1)
+                            _ns = problem.step(_s_col, _a_col, problem.dt)
+                            # Use reward_from_transition if available (avoids
+                            # redundant step() inside normalized_reward)
+                            if hasattr(problem, 'reward_from_transition'):
+                                _r = problem.reward_from_transition(_s_col, _ns)
+                            else:
+                                _r = problem.normalized_reward(_s_col, _a_col)
                             _term = problem.is_terminal(_ns)
                             next_states[i] = _ns.flatten()
                             rewards[i] = _r.flatten()
@@ -517,11 +528,11 @@ class PUCTGpu:
                 self.bridge.expanded_terminals.copy_(torch.from_numpy(terminals).cuda())
             self.time_expand_backup += time.time() - t1
 
-            # ── KERNEL B2: Commit Expansion and Backup ────────────────────────
+            # ── KERNEL B2: Commit Expansion (v2 — fixes Bug 1 + Bug 2) ─────────
             t1 = time.time()
-            _commit_expansion_and_backup_puct[self.n_trees, self.tpb_s](
-                gamma_f32, C_pw_f32, alpha_pw_f32, num_robots_i32,
-                self.bridge.dev_nn_values, self.bridge.dev_leaf_valid,
+            _commit_expansion_puct_v2[self.n_trees, self.tpb_s](
+                C_pw_f32, alpha_pw_f32, num_robots_i32,
+                self.bridge.dev_nn_priors, self.bridge.dev_leaf_valid,
                 self.bridge.dev_expansion_valid, self.bridge.dev_expanded_next_states,
                 self.bridge.dev_expanded_rewards, self.bridge.dev_expanded_terminals,
                 self.dev_trees, self.dev_trees_sizes, self.dev_trees_depths,
@@ -530,7 +541,21 @@ class PUCTGpu:
                 self.dev_trees_total_value, self.dev_trees_states, self.dev_trees_action_priors,
                 self.dev_trees_prior_rank, self.dev_trees_pw_boundary,
                 self.dev_trees_nodes_selected, self.dev_trees_selected_paths,
+                self.dev_trees_edge_rewards,
                 max_tree_size_i32, max_actions_i32,
+            )
+            cuda.synchronize()
+
+            # ── KERNEL B3: Backup with stepwise edge rewards (v2) ─────────────
+            _backup_with_edge_rewards_puct[self.n_trees, self.tpb_s](
+                gamma_f32, C_pw_f32, alpha_pw_f32, num_robots_i32,
+                self.bridge.dev_nn_values, self.bridge.dev_leaf_valid,
+                self.bridge.dev_expansion_valid,
+                self.dev_trees_ns, self.dev_trees_total_value,
+                self.dev_trees_depths, self.dev_trees_pw_boundary,
+                self.dev_trees_edge_rewards,
+                self.dev_trees_nodes_selected, self.dev_trees_selected_paths,
+                max_actions_i32,
             )
             cuda.synchronize()
             self.time_expand_backup += time.time() - t1

@@ -4,11 +4,14 @@
 # Run the GPU_PUCT_Adapter example runner against decision_making/code examples.
 #
 # Usage:
+#   # Generic runner (any example):
 #   bash run_decision_making_gpu.sh                          # example1, smoke test
-#   bash run_decision_making_gpu.sh --example 8              # example8, 2-robot pursuit-evasion
+#   bash run_decision_making_gpu.sh --example 8              # example8, quick test
 #   bash run_decision_making_gpu.sh --example 8 --steps 40   # full episode
-#   bash run_decision_making_gpu.sh --example 8 \
-#       --model-dir /path/to/saved/example8                  # with pretrained oracles
+#
+#   # Full example8 pipeline (with plots, movie, diagnostics):
+#   bash run_decision_making_gpu.sh example8                 # run_example8.py
+#   bash run_decision_making_gpu.sh example8 --movie --trials 5
 #
 # Environment:
 #   Python   : py311_numba conda env (Numba 0.65 + torch 2.5.1 + CUDA 12.4)
@@ -40,4 +43,11 @@ echo "========================================================"
 echo ""
 
 cd "${MCTS_SRC}"
-exec "${VENV_PY}" "${DECISION_CODE}/run_gpu_example.py" "$@"
+
+# If first argument is "example8", use the dedicated full-pipeline runner
+if [ "${1:-}" = "example8" ]; then
+    shift
+    exec "${VENV_PY}" "${MCTS_SRC}/run_example8.py" "$@"
+else
+    exec "${VENV_PY}" "${DECISION_CODE}/run_gpu_example.py" "$@"
+fi

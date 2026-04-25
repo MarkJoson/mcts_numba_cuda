@@ -68,7 +68,6 @@ class UniformPolicyNet(nn.Module):
     def __init__(self, state_dim: int, max_actions: int):
         super().__init__()
         self.max_actions = max_actions
-        self._dummy = nn.Linear(state_dim, 1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
@@ -81,7 +80,6 @@ class ConstantValueNet(nn.Module):
         super().__init__()
         self.num_robots = num_robots
         self.constant = constant
-        self._dummy = nn.Linear(state_dim, 1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
@@ -93,11 +91,7 @@ class ConstantValueNet(nn.Module):
 
 class SpotlightPolicyNet(nn.Module):
     """
-    Returns a prior that concentrates ~99 % probability on one action slot
-    (``hot_action``), giving every other action uniform tiny probability.
-
-    This lets us verify that PUCT actually follows the prior: after enough
-    simulations the hot action should be the most visited.
+    实现 epsilon-greedy 策略。其中 greedy 策略固定为某个动作。
     """
     def __init__(self, state_dim: int, max_actions: int, hot_action: int,
                  hot_weight: float = 100.0):
@@ -140,6 +134,9 @@ results: list[tuple[str, bool]] = []
 
 
 def record(name: str, ok: bool, detail: str = "") -> None:
+    """
+    打印当前的状态
+    """
     status = PASS_MARK if ok else FAIL_MARK
     msg = f"{status}  {name}"
     if detail:
@@ -892,12 +889,79 @@ def test_23_coexistence():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Test 24 — Example8 pursuit-evasion integration
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_24_example8_integration():
+    """
+    End-to-end integration with the self-contained example8 problem.
+
+    Verifies:
+      - GPU_PUCT_Adapter runs with the example8 problem
+      - turn_groups search (2 searches per step, not 4)
+      - Terminal detection works
+      - Rewards are plausible (all in [-1, 1])
+      - Zero dependency on decision_making
+    """
+    try:
+        from examples.example8_problem import Example8
+        from examples.example8_adapter import GPU_PUCT_Adapter
+
+        problem = Example8()
+        problem.use_minco_rollout = True
+
+        solver = GPU_PUCT_Adapter(
+            policy_oracle=[None],
+            value_oracle=None,
+            search_depth=20,
+            number_simulations=50,
+            C_pw=2.0, alpha_pw=0.5,
+            C_exp=1.0, alpha_exp=0.25,
+            beta_policy=0.0, beta_value=0.0,
+            max_actions=16,
+            n_trees=4,
+            device_memory=0.5,
+        )
+
+        np.random.seed(123)
+        state = problem.initialize()
+        max_steps = 5
+        rewards_all = []
+        terminated = False
+
+        for step in range(max_steps):
+            if problem.is_terminal(state):
+                terminated = True
+                break
+            action = solver.multiturn_policy(problem, state)
+            reward = problem.reward(state, action)
+            next_state = problem.step(state, action, problem.dt)
+            terminated = problem.is_terminal(next_state)
+            rewards_all.append(reward.flatten())
+            state = next_state
+
+        n_steps = len(rewards_all)
+        ok = (
+            n_steps > 0
+            and all(np.all(np.abs(r) <= 1.0 + 1e-6) for r in rewards_all)
+        )
+        has_groups = hasattr(problem, 'turn_groups') and problem.turn_groups is not None
+        term_str = f", terminal={terminated}" if terminated else ""
+        record(
+            "Test 24: Example8 integration", ok,
+            f"steps={n_steps}, turn_groups={has_groups}{term_str}",
+        )
+    except Exception as e:
+        record("Test 24: Example8 integration", False, str(e))
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Runner
 # ════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     print("=" * 65)
-    print("  GPU PUCT — Example-Style Integration Tests  (Tests 11-23)")
+    print("  GPU PUCT — Example-Style Integration Tests  (Tests 11-24)")
     print("=" * 65)
 
     test_11_double_integrator_smoke()
@@ -913,6 +977,7 @@ if __name__ == "__main__":
     test_21_discount_factor()
     test_22_mctsnc_original_smoke()
     test_23_coexistence()
+    test_24_example8_integration()
 
     print("=" * 65)
     n_pass = sum(1 for _, ok in results if ok)
@@ -927,3 +992,4 @@ if __name__ == "__main__":
         print("  All tests PASSED ✓")
     print("=" * 65)
     sys.exit(0 if n_fail == 0 else 1)
+

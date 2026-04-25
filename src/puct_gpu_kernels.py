@@ -90,6 +90,7 @@ def _reset_puct(root_state, root_turn,
     trees_action_priors : float32[n_trees, max_tree_size, max_actions]
     trees_pw_boundary : int16[n_trees, max_tree_size]
     """
+    # TODO. 该拷贝可以直接通过 torch.ops + torch.compile 实现，从而获得两方面的好处：异步拷贝，走拷贝的stream.
     ti = cuda.blockIdx.x
     tpb = cuda.blockDim.x
     t = cuda.threadIdx.x
@@ -159,9 +160,9 @@ def _select_puct(C_exp, alpha_exp,
     shared_best_child = cuda.shared.array(512, dtype=int32)
     shared_selected_path = cuda.shared.array(2050, dtype=int32)
 
-    ti = cuda.blockIdx.x
+    ti = cuda.blockIdx.x        # 树id
     tpb = cuda.blockDim.x
-    t = cuda.threadIdx.x
+    t = cuda.threadIdx.x        # thread id
     max_actions = trees.shape[2] - 1
 
     node = int32(0)
@@ -539,3 +540,182 @@ def _reduce_over_actions_puct(actions_ns, best_action_out, best_n_out):
     if t == 0:
         best_action_out[0] = shared_action[0]
         best_n_out[0] = shared_ns[0]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# V2 kernels — fixes for Bug 1 (child clearing), Bug 2 (stepwise backup),
+#               Problem 4/13 (PW boundary +1)
+# ════════════════════════════════════════════════════════════════════════════
+
+@cuda.jit
+def _commit_expansion_puct_v2(
+        C_pw, alpha_pw, num_robots,
+        nn_priors, leaf_valid, expansion_valid,
+        expanded_next_states, expanded_rewards, expanded_terminals,
+        trees, trees_sizes, trees_depths, trees_robot_turns,
+        trees_leaves, trees_terminals, trees_ns,
+        trees_total_value, trees_states, trees_action_priors,
+        trees_prior_rank, trees_pw_boundary,
+        trees_nodes_selected, trees_selected_paths,
+        trees_edge_rewards,
+        max_tree_size, max_actions):
+    """
+    V2 expansion kernel — replaces ``_commit_expansion_and_backup_puct``.
+
+    Fixes vs v1
+    -----------
+    1. Does NOT clear other children's pointers (Bug 1 fix).
+       Only sets ``trees[ti, selected, 1 + best_action] = child_idx``.
+    2. Writes per-edge reward to ``trees_edge_rewards[ti, child_idx, :]``
+       so the separate backup kernel can accumulate stepwise rewards (Bug 2).
+    3. PW boundary jumps to ``min(ceil(C_pw * N^alpha_pw), max_actions)``
+       instead of old_pw + 1 (Problem 4/13 fix).
+
+    This kernel does NOT perform backup — that is done by
+    ``_backup_with_edge_rewards_puct``.
+
+    Parameters
+    ----------
+    trees_edge_rewards : float32[n_trees, max_tree_size, num_robots]
+        Per-edge reward array.  Written at child_idx on expansion.
+    (all other parameters identical to ``_commit_expansion_and_backup_puct``)
+    """
+    ti = cuda.blockIdx.x
+    tpb = cuda.blockDim.x
+    t = cuda.threadIdx.x
+    selected = int32(trees_nodes_selected[ti])
+    state_dim = expanded_next_states.shape[1]
+
+    # ── COMMIT EXPANSION ─────────────────────────────────────────────────────
+    if t == 0 and leaf_valid[ti] == int32(1):
+        if expansion_valid[ti] == int32(1):
+            trees_leaves[ti, selected] = False
+
+            best_action = int32(trees_prior_rank[ti, selected, 0])
+            child_idx = trees_sizes[ti]
+
+            if child_idx < max_tree_size:
+                # FIX Bug 1: Only link this child — do NOT clear other slots.
+                trees[ti, selected, 1 + best_action] = child_idx
+                trees[ti, child_idx, 0] = selected
+
+                trees_leaves[ti, child_idx] = True
+                trees_terminals[ti, child_idx] = expanded_terminals[ti]
+                trees_ns[ti, child_idx] = int32(0)
+                trees_depths[ti, child_idx] = trees_depths[ti, selected] + int16(1)
+                parent_turn = int32(trees_robot_turns[ti, selected])
+                trees_robot_turns[ti, child_idx] = int8((parent_turn + 1) % num_robots)
+                trees_pw_boundary[ti, child_idx] = int16(0)
+
+                for r in range(num_robots):
+                    trees_total_value[ti, child_idx, r] = float32(0.0)
+                for a in range(max_actions):
+                    trees_action_priors[ti, child_idx, a] = float32(0.0)
+                    trees_prior_rank[ti, child_idx, a] = int16(a)
+
+                for e in range(state_dim):
+                    trees_states[ti, child_idx, e] = expanded_next_states[ti, e]
+
+                # FIX Bug 2: Store per-edge reward for stepwise backup.
+                for r in range(num_robots):
+                    trees_edge_rewards[ti, child_idx, r] = expanded_rewards[ti, r]
+
+                trees_sizes[ti] = child_idx + 1
+            # else: tree at capacity — skip silently
+
+            # FIX Problem 4/13: PW boundary for the PARENT (selected) node.
+            # After expansion, the selected node now has one more child.
+            # Update pw_boundary to the full computed value.
+            parent_n = float32(trees_ns[ti, selected])
+            # Use parent visit count + 1 (we haven't backed up yet but are
+            # about to, so anticipate the ns increment).
+            new_pw_sel = int32(math.ceil(C_pw * math.pow(parent_n + float32(1.0), alpha_pw)))
+            if new_pw_sel > int32(max_actions):
+                new_pw_sel = int32(max_actions)
+            old_pw_sel = int32(trees_pw_boundary[ti, selected])
+            if new_pw_sel > old_pw_sel:
+                trees_pw_boundary[ti, selected] = int16(new_pw_sel)
+
+        else:
+            trees_pw_boundary[ti, selected] = int16(0)
+
+
+@cuda.jit
+def _backup_with_edge_rewards_puct(
+        gamma, C_pw, alpha_pw, num_robots,
+        nn_values, leaf_valid, expansion_valid,
+        trees_ns, trees_total_value,
+        trees_depths, trees_pw_boundary,
+        trees_edge_rewards,
+        trees_nodes_selected, trees_selected_paths,
+        max_actions):
+    """
+    V2 backup kernel — accumulates stepwise per-edge rewards along the path.
+
+    Matches CPU PUCT_V1 backup semantics
+    -------------------------------------
+    For each node at depth ``d`` on the selected path::
+
+        value(d) = sum_{k=d}^{leaf_depth-1} gamma^(k-d) * edge_reward[path[k+1]]
+                 + gamma^(leaf_depth - d) * nn_value
+
+    Where ``edge_reward[child]`` is the transition reward stored by the
+    expansion kernel when that child was first created.
+
+    This is invoked AFTER ``_commit_expansion_puct_v2``.
+
+    Parameters
+    ----------
+    trees_edge_rewards : float32[n_trees, max_tree_size, num_robots]
+        Per-edge rewards written by ``_commit_expansion_puct_v2``.
+    (other parameters: same as backup section of _commit_expansion_and_backup_puct)
+    """
+    ti = cuda.blockIdx.x
+    t = cuda.threadIdx.x
+
+    if t == 0:
+        path_length = int32(trees_selected_paths[ti, -1])
+        selected = int32(trees_nodes_selected[ti])
+        leaf_depth = int32(trees_depths[ti, selected])
+
+        for p in range(path_length):
+            node = int32(trees_selected_paths[ti, p])
+            node_depth = int32(trees_depths[ti, node])
+            trees_ns[ti, node] += int32(1)
+
+            if leaf_valid[ti] == int32(1):
+                # ── Stepwise reward accumulation (Bug 2 fix) ─────────────
+                # Accumulate edge rewards along path[p+1 .. path_length-1]
+                backup_val_arr = cuda.local.array(8, dtype=float32)
+                for r in range(num_robots):
+                    backup_val_arr[r] = float32(0.0)
+
+                # Sum discounted edge rewards from node_depth to leaf_depth
+                for k in range(int32(node_depth), int32(leaf_depth)):
+                    # path[k+1 - 0] is the child at depth k+1
+                    # We need to find the node at depth k+1 on the path.
+                    # path index = k + 1 - 0 if root is at index 0 with depth 0.
+                    # Actually path[i] has depth i (since path starts at root=depth 0).
+                    path_child_idx = k + int32(1)
+                    if path_child_idx < path_length:
+                        child_node = int32(trees_selected_paths[ti, path_child_idx])
+                        disc = math.pow(float32(gamma), float32(k - node_depth))
+                        for r in range(num_robots):
+                            backup_val_arr[r] += disc * trees_edge_rewards[ti, child_node, r]
+
+                # Add discounted leaf value
+                leaf_disc = math.pow(float32(gamma), float32(leaf_depth - node_depth))
+                for r in range(num_robots):
+                    backup_val_arr[r] += leaf_disc * nn_values[ti, r]
+
+                for r in range(num_robots):
+                    trees_total_value[ti, node, r] += backup_val_arr[r]
+
+            # ── Progressive Widening update (Problem 4/13 fix) ───────────
+            node_n = float32(trees_ns[ti, node])
+            old_pw = int32(trees_pw_boundary[ti, node])
+            new_pw = int32(math.ceil(C_pw * math.pow(node_n, alpha_pw)))
+            if new_pw > int32(max_actions):
+                new_pw = int32(max_actions)
+            if new_pw > old_pw:
+                trees_pw_boundary[ti, node] = int16(new_pw)
