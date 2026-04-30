@@ -22,6 +22,9 @@ SELECT_EXPAND = 1       # Node needs expansion (PW not saturated); CAS lock held
 SELECT_TERMINAL = 2     # Traversal hit a terminal node
 SELECT_DEPTH_LIMIT = 3  # Hit path capacity limit; treat as evaluation leaf
 
+SEL_IN_PROGRESS = -2    # final_node: selection still in progress (replaces done flag)
+SEL_INVALID_NODE = -1   # final_node / output: no valid node selected
+
 MAX_SELECT_RETRY = 3
 
 # ============================================================
@@ -37,14 +40,14 @@ class Traverse:
 # 由[tree_id, node_id]索引
 class Node:
     status: int         # 节点状态: OK / Terminal
-    inflight: int       # CAS expansion lock (0 = free, 1 = claimed)
+    inflight: int       # expansion claim now uses edge_inflight[*, node, slot]
     state: int          # 对应的状态空间，指向状态池
     expanded: int       # 已经展开的 edge 个数。如果 =0 说明是叶子节点, 由于是渐宽树，所以会逐步展开
     legals: int         # 在 pw_limit 约束下，允许展开的节点个数
     value: float        # 对应当前状态的状态价值
 
 # 由[tree_id, edge_id]索引
-# edge_id = (node_id << 6) | slot
+# edge_id = (node_id << 8) | slot   (8-bit slot for MAX_ACTION=256)
 class Edge:
     child_id: int       # -1: Invalid, 否则是正常的node id
     n: int              # 访问次数 (真实，只在 backup 时增加)
@@ -71,7 +74,6 @@ def init_data():
 
     NODE_SHAPE = (TREE_CNT, MAX_NODE)
     nodes_status = cuda.device_array(NODE_SHAPE, np.int32)      # type: ignore
-    nodes_inflight = cuda.device_array(NODE_SHAPE, np.int32)    # type: ignore  # CAS expansion lock
     nodes_state = cuda.device_array(NODE_SHAPE, np.int32)       # type: ignore
     nodes_expanded = cuda.device_array(NODE_SHAPE, np.int32)    # type: ignore  # expanded child count
     nodes_value = cuda.device_array((TREE_CNT, MAX_NODE, ROBOT_TURNS), np.int32)  # type: ignore
@@ -235,40 +237,21 @@ def _puct_score(cpuct, prior, w, n_edge, n_edge_inflight, sqrt_parent_n_eff):
 
 
 @cuda.jit(device=True, inline=True)
-def _reconstruct_parent(tree, wid, d, out_path_eids, edge_child_id, n_nodes):
-    """
-    Reconstruct the parent node at depth d by walking the edge path from root.
-    Returns -1 if path is broken.
-    """
-    parent = int32(0)  # root
-    i = int32(0)
-    while i < d:
-        e = out_path_eids[tree, wid, i]
-        if parent >= 0 and parent < n_nodes and e >= 0:
-            parent = edge_child_id[tree, parent, e]
-        else:
-            return int32(-1)
-        i += int32(1)
-    return parent
-
-
-@cuda.jit(device=True, inline=True)
 def _rollback_vloss_path(tree, wid, depth, lane,
-                          out_path_eids, edge_inflight,
-                          edge_child_id, n_nodes):
+                          out_path_eids, edge_inflight, virtual_loss):
     """
-    Roll back virtual visits on edges for the current attempt.
-    All lanes participate: each lane handles depths at stride=32.
-    path_eids[0:depth] are valid.
-    Reconstructs parent node from eid path since node_N / out_path_nodes are removed.
+    Roll back virtual visits on edge_inflight for the current attempt.
+    Only int32 atomics on edge_inflight — no W modification during selection.
+    Each eid is encoded as (parent << 8) | slot — extract directly.
     Caller must syncwarp after return.
     """
     d = lane
     while d < depth:
-        parent = _reconstruct_parent(tree, wid, d, out_path_eids, edge_child_id, n_nodes)
-        eid = out_path_eids[tree, wid, d]
-        if parent >= 0 and eid >= 0:
-            cuda.atomic.sub(edge_inflight, (tree, parent, eid), int32(1))
+        encoded = out_path_eids[tree, wid, d]
+        if encoded >= 0:
+            parent = encoded >> int32(8)
+            slot = encoded & int32(0xFF)
+            cuda.atomic.sub(edge_inflight, (tree, parent, slot), virtual_loss)
         d += int32(WARP_SIZE)
 
 
@@ -276,13 +259,13 @@ def _rollback_vloss_path(tree, wid, depth, lane,
 # Selection kernel
 # ============================================================
 
-@cuda.jit(void(float32, float32, float32,
+@cuda.jit(void(float32, float32, float32, int32,
                    int32[:, :, :], float32[:, :, :], float32[:, :, :], int32[:, :, :], int32[:, :, :],
-                   int32[:, :], int32[:, :], int32[:, :],
+                   int32[:, :], int32[:, :],
                    int32[:, :], int32[:, :], int32[:, :, :], int32[:, :]))
-def _select_kernel_native(cpuct, c_pw, alpha_pw,
+def _select_kernel_native(cpuct, c_pw, alpha_pw, virtual_loss,
                           edge_child_id, edge_prior, edge_W, edge_N, edge_inflight,
-                          node_status, node_expanded, node_in_flight,
+                          node_status, node_expanded,
                           out_selected_node, out_selected_kind,
                           out_path_eids, out_path_len):
     """
@@ -311,58 +294,53 @@ def _select_kernel_native(cpuct, c_pw, alpha_pw,
     if tree >= out_selected_node.shape[0]:
         return
 
+    # 防止输出数组大小不够
     warp_count = cuda.blockDim.x >> int32(5)
     active_warps = min(warp_count, out_selected_node.shape[1])
-
     if wid >= active_warps:
         return
 
-    # Initialize output to invalid
+    # lane0 负责将输出数组初始化
     if lane == 0:
-        out_selected_node[tree, wid] = int32(-1)
+        out_selected_node[tree, wid] = int32(SEL_INVALID_NODE)
         out_selected_kind[tree, wid] = int32(SELECT_INVALID)
         out_path_len[tree, wid] = int32(0)
 
-    max_edge_slots = out_path_eids.shape[2]
-    if max_edge_slots < 1:
-        return
-
-    max_edge_steps = max_edge_slots
-
-    n_nodes = node_status.shape[1]
     max_edges = edge_child_id.shape[2]
-    if n_nodes <= 0:
-        return
+    max_edge_steps = out_path_eids.shape[2]
+    n_nodes = node_status.shape[1]
+    assert max_edge_steps >= 1
+    assert n_nodes > 0
 
-    final_node = int32(-1)
-    final_kind = int32(SELECT_INVALID)
+    # final_node packs kind + expand_slot + node_id:
+    #   SEL_IN_PROGRESS = in progress (replaces done flag)
+    #   >= 0 = (kind << 22) | (expand_slot << 14) | node_id  on success
+    # expand_slot is the slot used for CAS lock on edge_inflight (SELECT_EXPAND only)
+    final_node = int32(SEL_IN_PROGRESS)
     final_len = int32(0)
 
-    done = int32(0)
     attempt = int32(0)
 
-    while attempt < int32(MAX_SELECT_RETRY) and done == int32(0):
+    while attempt < int32(MAX_SELECT_RETRY) and final_node == int32(SEL_IN_PROGRESS):
         node = int32(0)      # start from root
         depth = int32(0)
 
         cuda.syncwarp(FULL_MASK)
 
         while True:
-            # Defensive guard: invalid node
+            # 防御性编程: 节点的id值是无效值，或者大于最大节点数，认为是无效节点
             if node < 0 or node >= n_nodes:
-                _rollback_vloss_path(tree, wid, depth, lane,
-                                      out_path_eids, edge_inflight,
-                                      edge_child_id, n_nodes)
+                _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, virtual_loss)
                 cuda.syncwarp(FULL_MASK)
                 break
 
-            # Terminal node
+            # 终止态的节点
             if node_status[tree, node] == NODE_STATUS_TERMINAL:
-                final_node = node
-                final_kind = int32(SELECT_TERMINAL)
+                final_node = (int32(SELECT_TERMINAL) << int32(22)) | node
                 final_len = depth + int32(1)
-                done = int32(1)
                 break
+            
+            # TODO: 如果是超出步长的节点，需要考虑用 Value 网络重新估计节点价值
 
             cur_expanded = node_expanded[tree, node]
             if cur_expanded < 0:
@@ -384,38 +362,31 @@ def _select_kernel_native(cpuct, c_pw, alpha_pw,
 
             allowed = _allowed_children(c_pw, alpha_pw, parent_n_eff, max_edges)
 
-            # Progressive widening: node can still expand new children
+            # Progressive widening: claim via edge_inflight atomic add (virtual_loss aware)
             if cur_expanded < allowed:
                 claim_ok = int32(1)
                 if lane == 0:
-                    old = cuda.atomic.cas(
-                        node_in_flight, (tree, node),
-                        int32(0), int32(1),
-                    )
+                    old = cuda.atomic.add(edge_inflight, (tree, node, cur_expanded), virtual_loss)
                     if old != 0:
                         claim_ok = int32(0)
+                        # Rollback: we didn't actually claim, remove our virtual_loss addition
+                        cuda.atomic.sub(edge_inflight, (tree, node, cur_expanded), virtual_loss)
 
                 claim_ok = cuda.shfl_sync(FULL_MASK, claim_ok, 0)
 
                 if claim_ok != 0:
-                    final_node = node
-                    final_kind = int32(SELECT_EXPAND)
+                    final_node = (int32(SELECT_EXPAND) << int32(22)) | (cur_expanded << int32(14)) | node
                     final_len = depth + int32(1)
-                    done = int32(1)
                 else:
                     # Another warp already claimed this node — rollback and retry from root
-                    _rollback_vloss_path(tree, wid, depth, lane,
-                                          out_path_eids, edge_inflight,
-                                          edge_child_id, n_nodes)
+                    _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, virtual_loss)
                     cuda.syncwarp(FULL_MASK)
                 break
 
             # Path capacity hit — treat as depth-limit leaf
             if depth >= max_edge_steps:
-                final_node = node
-                final_kind = int32(SELECT_DEPTH_LIMIT)
+                final_node = (int32(SELECT_DEPTH_LIMIT) << int32(22)) | node
                 final_len = depth + int32(1)
-                done = int32(1)
                 break
 
             # Fully expanded under PW: PUCT selection among existing children
@@ -450,35 +421,38 @@ def _select_kernel_native(cpuct, c_pw, alpha_pw,
 
             # No valid child found — data inconsistency, rollback and abort this attempt
             if best_child < 0:
-                _rollback_vloss_path(tree, wid, depth, lane,
-                                      out_path_eids, edge_inflight,
-                                      edge_child_id, n_nodes)
+                _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, virtual_loss)
                 cuda.syncwarp(FULL_MASK)
                 break
 
             parent = node
 
-            # Apply virtual visit on selected edge
+            # Add virtual loss to the selected edge (visible to other warps via atomic)
             if lane == 0:
-                out_path_eids[tree, wid, depth] = best_eid
-                cuda.atomic.add(edge_inflight, (tree, parent, best_eid), int32(1))
+                out_path_eids[tree, wid, depth] = (parent << int32(8)) | best_eid
+                cuda.atomic.add(edge_inflight, (tree, parent, best_eid), virtual_loss)
 
             cuda.syncwarp(FULL_MASK)
 
             node = best_child
             depth += int32(1)
 
-        if done == int32(0):
+        if final_node == int32(SEL_IN_PROGRESS):
             attempt += int32(1)
 
-    # Write final result
+    # Write final result (decode packed final_node)
+    # Encoding: (kind << 22) | (expand_slot << 14) | node_id
+    # out_selected_kind packs expand_slot in upper bits: kind | (expand_slot << 4)
     if lane == 0:
-        if done != 0:
-            out_selected_node[tree, wid] = final_node
-            out_selected_kind[tree, wid] = final_kind
+        if final_node >= 0:
+            kind = final_node >> int32(22)
+            expand_slot = (final_node >> int32(14)) & int32(0xFF)
+            node_id = final_node & int32(0x3FFF)
+            out_selected_node[tree, wid] = node_id
+            out_selected_kind[tree, wid] = kind | (expand_slot << int32(4))
             out_path_len[tree, wid] = final_len
         else:
-            out_selected_node[tree, wid] = int32(-1)
+            out_selected_node[tree, wid] = int32(SEL_INVALID_NODE)
             out_selected_kind[tree, wid] = int32(SELECT_INVALID)
             out_path_len[tree, wid] = int32(0)
 
@@ -487,29 +461,29 @@ def _select_kernel_native(cpuct, c_pw, alpha_pw,
 # Backup kernel
 # ============================================================
 
-@cuda.jit(void(float32[:, :, :], int32[:, :, :], int32[:, :, :], int32[:, :, :],
-                   int32[:, :],
+@cuda.jit(void(int32,
+                   float32[:, :, :], int32[:, :, :], int32[:, :, :],
                    int32[:, :], int32[:, :],
                    int32[:, :, :], int32[:, :],
                    float32[:, :, :]))
-def _backup_kernel_native(edge_W, edge_N, edge_inflight, edge_child_id,
-                          node_in_flight,
+def _backup_kernel_native(virtual_loss,
+                          edge_W, edge_N, edge_inflight,
                           out_selected_node, out_selected_kind,
                           out_path_eids, out_path_len,
                           path_edge_values):
     """
     完成 backup：将 virtual visit 转换为真实统计。
 
-    Selection 阶段已经做了（virtual）：
-      edge_inflight += 1        （边的虚拟访问计数）
+    Selection 阶段只操作 edge_inflight (int32)：
+      edge_inflight += virtual_loss       （所有候选边先膨胀，losers 后削减）
 
     Backup 阶段完成转换：
-      edge_inflight -= 1        （撤销虚拟）
-      edge_N += 1               （写入真实）
-      edge_W += value           （写入真实累积价值）
+      edge_inflight -= virtual_loss       （撤销虚拟）
+      edge_N += 1                          （写入真实）
+      edge_W += value                      （写入真实累积价值，无需 W 偏移）
 
-    node 路径通过 out_path_eids + edge_child_id 从 root 重建。
-
+    out_selected_kind 编码: kind | (expand_slot << 4)
+    每个 eid 编码为 (parent << 8) | slot，直接解码即可。
     path_edge_values[tree, wid, d] 必须是已转换好视角的 value。
     """
     tree = cuda.blockIdx.x
@@ -524,7 +498,8 @@ def _backup_kernel_native(edge_W, edge_N, edge_inflight, edge_child_id,
     if wid >= active_warps:
         return
 
-    kind = out_selected_kind[tree, wid]
+    raw_kind = out_selected_kind[tree, wid]
+    kind = raw_kind & int32(0xF)
     if kind == SELECT_INVALID:
         return
 
@@ -532,23 +507,24 @@ def _backup_kernel_native(edge_W, edge_N, edge_inflight, edge_child_id,
     if plen <= 0:
         return
 
-    n_nodes = edge_child_id.shape[1]
     edge_count = plen - int32(1)
 
     # Each lane handles edges at stride=32
     d = lane
     while d < edge_count:
-        parent = _reconstruct_parent(tree, wid, d, out_path_eids, edge_child_id, n_nodes)
-        eid = out_path_eids[tree, wid, d]
-        if parent >= 0 and eid >= 0:
+        encoded = out_path_eids[tree, wid, d]
+        if encoded >= 0:
+            parent = encoded >> int32(8)
+            slot = encoded & int32(0xFF)
             v = path_edge_values[tree, wid, d]
-            cuda.atomic.sub(edge_inflight, (tree, parent, eid), int32(1))
-            cuda.atomic.add(edge_N, (tree, parent, eid), int32(1))
-            cuda.atomic.add(edge_W, (tree, parent, eid), v)
+            cuda.atomic.sub(edge_inflight, (tree, parent, slot), virtual_loss)
+            cuda.atomic.add(edge_N, (tree, parent, slot), int32(1))
+            cuda.atomic.add(edge_W, (tree, parent, slot), v)
         d += int32(WARP_SIZE)
 
-    # Release CAS lock for SELECT_EXPAND nodes
+    # Release expansion claim on edge_inflight (virtual_loss-aware)
     if lane == 0 and kind == SELECT_EXPAND:
         leaf = out_selected_node[tree, wid]
+        expand_slot = (raw_kind >> int32(4)) & int32(0xFF)
         if leaf >= 0:
-            cuda.atomic.exch(node_in_flight, (tree, leaf), int32(0))
+            cuda.atomic.sub(edge_inflight, (tree, leaf, expand_slot), virtual_loss)
