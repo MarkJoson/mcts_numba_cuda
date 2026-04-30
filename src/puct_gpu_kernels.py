@@ -55,6 +55,22 @@ except Exception:
 
 from numba import cuda, void, int8, int16, int32, int64, float32, boolean
 
+#### *******************************
+# *MCTS 树的基本概念
+# 整个游戏被建模为回合制，追捕者和逃跑者交替行动。
+# 树的每一层代表一个队伍的一次行动，每一个节点（或节点对应的父边）代表一个状态（以及一次队伍行动）
+# 对于 PUCT_v0 原始实现，符合标准的 MCTS 流程：选择、展开、评估、回传。
+# 对于 PUCT_v1 原始实现，其流程与AlphaZero相似，但不完全一致：
+# 每次 MCTS 循环，
+#   - 模拟步骤（蒙特卡洛估计价值），进行 max_depth 步，而后用价值网络估计终止态价值。
+#   - 会一直扩展树节点，直到最大深度，或者到Terminal状态。对比 PUCT_v0，会在第一个叶子节点停止
+#   - 某一节点的价值是其子节点价值的平均值
+#   - 终止态价值 <- Value；对比 PUCT_v0/2，终止态价值 <- reward；
+# 在 扩展阶段 环境会进行步进，并储存对应的状态，Reward。
+# 最终在一次循环结束后更新计算每条轨迹每一步的value
+# 
+#
+#### *******************************
 
 # ════════════════════════════════════════════════════════════════════════════
 # Phase 4 — _reset_puct
@@ -143,7 +159,14 @@ def _select_puct(C_exp, alpha_exp,
                  trees_nodes_selected, trees_selected_paths):
     """
     Walk each tree from root to a leaf using the PUCT UCB formula.
-
+    输入: 
+        ==> ucb_c: ucb系数
+        trees: 树节点池，(n_trees, max_nodes, max_actions+1)
+        trees_leaves: 叶子节点标记，(n_trees, max_nodes)
+        trees_ns: 节点访问次数，(n_trees, max_nodes)
+        trees_ns_wins: 节点胜率，(n_trees, max_nodes)
+        trees_nodes_selected: 选中的节点，(n_trees, max_nodes)
+        trees_selected_paths: 选中的路径，(n_trees, max_nodes)
     PUCT UCB (from puct_v1.hpp L140):
         Q(child, robot)  =  total_value[child, robot] / ns[child]
         U(child, parent) =  C_exp * sqrt(ns[parent]^alpha_exp / ns[child])
@@ -155,7 +178,9 @@ def _select_puct(C_exp, alpha_exp,
     Path is stored in ``trees_selected_paths[ti, 0..depth]``; the path
     length is stored in ``trees_selected_paths[ti, -1]``.
     """
+    # TODO: 使用小block_size，大批量树计算的方式，减少树结构稀疏时的空转等待。同时保证同时运行并行度。
     # Shared memory — 512 slots covers max_actions ≤ 512 (MCTSNC convention)
+    # shared_ucbs 存放当前节点的所有子节点的ucb值。假设子节点（动作）个数不会超过512个；同时，blockSize < 512
     shared_ucbs = cuda.shared.array(512, dtype=float32)
     shared_best_child = cuda.shared.array(512, dtype=int32)
     shared_selected_path = cuda.shared.array(2050, dtype=int32)
@@ -172,42 +197,44 @@ def _select_puct(C_exp, alpha_exp,
         shared_selected_path[0] = int32(0)  # root is always on path
 
     cuda.syncthreads()
-
+    
     max_depth = int16(trees_selected_paths.shape[1] - 2)  # shape[-1] = MAX_TREE_DEPTH + 2
+    # 循环直到到达叶子节点
     while not trees_leaves[ti, node] and depth < max_depth:
-        pw_limit = int32(trees_pw_boundary[ti, node])
-        robot_turn = int32(trees_robot_turns[ti, node])
+        # 线程并行：并行所有动作子节点
+        # TODO: 当最大动作数 >> block中线程数的处理
+        # TODO: 合并具有共同访存的数组
+
+        # &pw_limit, robot_turn, parent_n 是
+        pw_limit = int32(trees_pw_boundary[ti, node])           # 连续MCTS: 渐进加宽的搜索边界
+        robot_turn = int32(trees_robot_turns[ti, node])         # 
         parent_n = int32(trees_ns[ti, node])
 
-        # Each thread evaluates one action slot
-        if t < max_actions:
-            rank = t
-            if rank < pw_limit:
-                action = int32(trees_prior_rank[ti, node, rank])
-                child = int32(trees[ti, node, 1 + action])
-                shared_best_child[t] = child
-                if child == int32(-1):
-                    shared_ucbs[t] = -float32(inf)
-                else:
-                    child_n = int32(trees_ns[ti, child])
-                    if child_n == int32(0):
-                        shared_ucbs[t] = float32(inf)
-                    else:
-                        q = trees_total_value[ti, child, robot_turn] / float32(child_n)
-                        exploration = C_exp * math.sqrt(
-                            math.pow(float32(parent_n), alpha_exp) / float32(child_n)
-                        )
-                        shared_ucbs[t] = q + exploration
-            else:
+        #! ***** 计算所有子节点的 UCB 值 *****
+        rank = t
+        if t < max_actions and rank < pw_limit:
+            action = int32(trees_prior_rank[ti, node, rank])
+            child = int32(trees[ti, node, 1 + action])
+            shared_best_child[t] = child
+            if child == int32(-1):
                 shared_ucbs[t] = -float32(inf)
-                shared_best_child[t] = int32(-1)
+            else:
+                child_n = int32(trees_ns[ti, child])
+                if child_n == int32(0):
+                    shared_ucbs[t] = float32(inf)
+                else:
+                    q = trees_total_value[ti, child, robot_turn] / float32(child_n)
+                    exploration = C_exp * math.sqrt(
+                        math.pow(float32(parent_n), alpha_exp) / float32(child_n)
+                    )
+                    shared_ucbs[t] = q + exploration
         else:
             shared_ucbs[t] = -float32(inf)
             shared_best_child[t] = int32(-1)
 
         cuda.syncthreads()
 
-        # Max-argmax reduction (identical pattern to mctsnc.py L1343-1351)
+        #! ***** 并行计算reduce-max *****
         stride = tpb >> 1
         while stride > 0:
             if t < stride:
@@ -217,16 +244,14 @@ def _select_puct(C_exp, alpha_exp,
                     shared_best_child[t] = shared_best_child[t_stride]
             cuda.syncthreads()
             stride >>= 1
-
-        # Descend to best child
         node = shared_best_child[0]
         depth += int16(1)
         if t == 0:
             shared_selected_path[depth] = node
+        
+        cuda.syncthreads()      # TODO. 确认下这里是否一定需要同步
 
-        cuda.syncthreads()
-
-    # Write path back to global memory
+    # 抵达叶子节点后
     path_length = int32(depth) + int32(1)
     e = t
     while e < path_length:
@@ -288,7 +313,10 @@ def _prepare_expansion_puct(
         expansion_valid_out, parent_states_out, actions_out):
     """
     Expansion Phase 1: Store priors, sort ranks, prep the best action.
+    从若干候选动作中选择一个动作。
     """
+    # TODO. 如果只是选择 Top-1 算子，那么使用Kernel实现是极其低效的。
+    # 
     ti = cuda.blockIdx.x
     tpb = cuda.blockDim.x
     t = cuda.threadIdx.x
@@ -298,6 +326,7 @@ def _prepare_expansion_puct(
         expansion_valid_out[ti] = int32(0)
 
     # ── EXPANSION PREP ────────────────────────────────────────────────────────
+    #! 下面这一托都是在 t=0 上执行的？ 神经？
     if t == 0 and leaf_valid[ti] == int32(1):
         for a in range(max_actions):
             trees_action_priors[ti, selected, a] = nn_priors[ti, a]
@@ -305,6 +334,7 @@ def _prepare_expansion_puct(
         current_size = trees_sizes[ti]
         if current_size < max_tree_size and not trees_terminals[ti, selected]:
             # Sort priors
+            # 归并排序
             for a in range(max_actions):
                 trees_prior_rank[ti, selected, a] = int16(a)
             for i in range(1, max_actions):
@@ -319,6 +349,7 @@ def _prepare_expansion_puct(
             best_action = int32(trees_prior_rank[ti, selected, 0])
             
             # Export to Host for Simulation
+            # 导出，用于mcts模拟
             expansion_valid_out[ti] = int32(1)
             actions_out[ti, 0] = float32(best_action) # Can map to continuous if needed by host
             for e in range(state_dim):
@@ -579,15 +610,21 @@ def _commit_expansion_puct_v2(
     trees_edge_rewards : float32[n_trees, max_tree_size, num_robots]
         Per-edge reward array.  Written at child_idx on expansion.
     (all other parameters identical to ``_commit_expansion_and_backup_puct``)
+
+    leaf_valid: 在 _extract_leaf_states 中设置，当状态不是终止态时=1
+    expansion_valid: 是否需要扩展, 在 _prepare_expension_puct 中被设置；当前状态!=终止态 && 树有空间时允许扩展节点。
+
+    将扩展的结果挂载到 MCTS 树上作为新的子节点
     """
-    ti = cuda.blockIdx.x
+    ti = cuda.blockIdx.x        # 树ID
     tpb = cuda.blockDim.x
-    t = cuda.threadIdx.x
+    t = cuda.threadIdx.x        # 线程id
     selected = int32(trees_nodes_selected[ti])
     state_dim = expanded_next_states.shape[1]
 
     # ── COMMIT EXPANSION ─────────────────────────────────────────────────────
-    if t == 0 and leaf_valid[ti] == int32(1):
+    #! 下面这一托都是在 t=0 上执行的
+    if t == 0 and leaf_valid[ti] == int32(1):       # 每个树一个线程,
         if expansion_valid[ti] == int32(1):
             trees_leaves[ti, selected] = False
 

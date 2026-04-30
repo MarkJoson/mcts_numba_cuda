@@ -373,7 +373,7 @@ class PUCTGpu:
         # ── Reset ────────────────────────────────────────────────────────────
         bpg_r = self.n_trees
         tpb_r = self.tpb_r
-
+        # TODO. 
         _reset_puct[bpg_r, tpb_r](
             dev_root_state, np.int8(root_turn),
             self.dev_trees, self.dev_trees_sizes, self.dev_trees_depths,
@@ -413,7 +413,7 @@ class PUCTGpu:
             if self.verbose_debug:
                 print(f"  [step {step + 1}]")
 
-            # ── KERNEL A: Selection ───────────────────────────────────────────
+            #& ── KERNEL A: Selection ───────────────────────────────────────────
             t1 = time.time()
             _select_puct[self.n_trees, self.tpb_s](
                 C_exp_f32, alpha_exp_f32,
@@ -427,8 +427,9 @@ class PUCTGpu:
             cuda.synchronize()
             self.time_select += time.time() - t1
 
-            # ── KERNEL A2: Extract leaf states ────────────────────────────────
+            #& ── KERNEL A2: Extract leaf states ────────────────────────────────
             t1 = time.time()
+            # TODO. 使用pytorch小算子+compile的方式取代
             _extract_leaf_states[self.n_trees, self.tpb_r](
                 self.dev_trees_nodes_selected, self.dev_trees_states,
                 self.dev_trees_terminals,
@@ -480,7 +481,8 @@ class PUCTGpu:
             # Only step environments for valid expansions
             # We assume policy output is already discretized/ranked or sample is deterministic
             t1 = time.time()
-            exp_mask = self.bridge.expansion_valid.cpu().numpy().astype(bool)
+            exp_mask = self.bridge.expansion_valid.cpu().numpy().astype(bool)       #! 只扩展有效的环境，不是所有环节都会被扩展
+            # TODO. 这一部分需要放在GPU上执行
             if np.any(exp_mask):
                 parent_states_np = self.bridge.expanded_parent_states.cpu().numpy()
                 actions_np = self.bridge.expanded_actions.cpu().numpy()

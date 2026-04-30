@@ -1295,11 +1295,11 @@ class MCTSNC:
         """CUDA kernel responsible for computations of stage: selections.
         输入: 
             ==> ucb_c: ucb系数
-            trees: 树节点池，(n_trees, max_nodes, max_actions+1)
-            trees_leaves: 叶子节点标记，(n_trees, max_nodes)
-            trees_ns: 节点访问次数，(n_trees, max_nodes)
-            trees_ns_wins: 节点胜率，(n_trees, max_nodes)
-            trees_nodes_selected: 选中的节点，(n_trees, max_nodes)
+            trees: 树节点池，(n_trees, max_nodes, max_actions+1)   => 对应新版代码的边节点池
+            trees_leaves: 叶子节点标记，(n_trees, max_nodes)        => 对应新版代码的 expended
+            trees_ns: 节点访问次数，(n_trees, max_nodes)            => 对应新版代码的 node_N
+            trees_ns_wins: 节点胜率，(n_trees, max_nodes)          => 对应新版代码的 node_value
+            trees_nodes_selected: 选中的节点，(n_trees, max_nodes)  =>
             trees_selected_paths: 选中的路径，(n_trees, max_nodes)
         """
         # shared_ucbs 存放当前节点的所有子节点的ucb值。假设子节点（动作）个数不会超过512个；同时，blockSize < 512
@@ -1368,10 +1368,16 @@ class MCTSNC:
     @cuda.jit(void(int32, int32[:, :, :], int32[:], int8[:, :], boolean[:, :], boolean[:, :], int8[:, :, :, :], int8[:, :, :], int32[:], xoroshiro128p_type[:], int16[:, :]))
     def _expand_1_ocp_thrifty(max_tree_size, trees, trees_sizes, trees_turns, trees_leaves, trees_terminals, trees_boards, trees_extra_infos, 
                                    trees_nodes_selected, random_generators_expand_1, trees_actions_expanded):
-        """CUDA kernel responsible for computations of stage: expansions (substage 1, variant ``"ocp_thrifty"``)."""
+        """CUDA kernel responsible for computations of stage: expansions (substage 1, variant ``"ocp_thrifty"``).
+        trees_nodes_selected: [num_trees], 存储所有树待扩展的节点，大小 
+        trees_extra_infos: [num_tress, num_nodes, info_size], 存储每个节点的 extra_info
+        trees_terminals: [num_trees, num_nodes], 存储对应节点是否是terminal状态
+        """
         shared_board = cuda.shared.array((32, 32), dtype=int8) # assumed max board size (for selected node in tree associated with block)
         shared_extra_info = cuda.shared.array(4096, dtype=int8) # 4096 - assumed limit on max extra info
+        # 合法动作标志位，每个线程处理一个单元；
         shared_legal_actions = cuda.shared.array(512, dtype=boolean) # 512 - assumed limit on max actions
+        # 查找表，存储某个动作对应的
         shared_legal_actions_child_shifts = cuda.shared.array(512, dtype=int16) # 512 - assumed limit on max actions
         ti = cuda.blockIdx.x # tree index
         tpb = cuda.blockDim.x
@@ -1380,6 +1386,8 @@ class MCTSNC:
         state_max_actions = int16(trees.shape[2] - 1)
         _, _, m, n = trees_boards.shape
         m_n = m * n
+
+        #! 搬运数据 boards 和 extra_infos
         bept = (m_n + tpb - 1) // tpb # board elements per thread
         e = t # board element flat index
         selected = trees_nodes_selected[ti] # node selected
@@ -1392,28 +1400,35 @@ class MCTSNC:
         _, _, extra_info_memory = trees_extra_infos.shape
         eipt = (extra_info_memory + tpb - 1) // tpb
         e = t
-        for _ in range(eipt):
+        for _ in range(eipt):   # 动用所有thread搬运当前节点的 extra_info，大小不超过 4*512=2KB.
             if e < extra_info_memory:
                 shared_extra_info[e] = trees_extra_infos[ti, selected, e]
             e += tpb
         cuda.syncthreads()
+        
+        #! 合法性检查
         selected_is_terminal = trees_terminals[ti, selected]
         if selected_is_terminal:
             shared_legal_actions[t] = False
         elif t < state_max_actions:            
             is_action_legal(m, n, shared_board, shared_extra_info, trees_turns[ti, selected], t, shared_legal_actions)            
-        cuda.syncthreads() 
+        cuda.syncthreads()
+
+        #! 合法性检查
         size_so_far = trees_sizes[ti]
         child_shift = int16(-1)
         rand_child_for_playout = int16(-3) # remains like this when tree cannot grow due to memory exhausted
         if t < state_max_actions:
             shared_legal_actions_child_shifts[t] = int16(-1)
-        if t == 0:
+        if t == 0:      # 0号线程检查合法动作，选择最优孩子
             if not selected_is_terminal:
+                # 这里没有充分利用并行，制作一个紧凑的映射表，将合法动作进行压缩
                 for i in range(state_max_actions):
                     if shared_legal_actions[i] and size_so_far + child_shift + 1 < max_tree_size:
                         child_shift += 1
                     shared_legal_actions_child_shifts[i] = child_shift                                
+                # trees_actions_expanded 每棵树的**最后一个元素**记录本次一共有多少个children要被展开 
+                # 倒数第二个元素记录展开哪个child
                 if child_shift >= int16(0):
                     trees_actions_expanded[ti, -1] = child_shift + 1 # information how many children expanded (as last entry)
                     trees_leaves[ti, selected] = False                                
@@ -1425,6 +1440,8 @@ class MCTSNC:
                 trees_actions_expanded[ti, -1] = int16(1) # terminal in fact not expanded, but shall be played out (hence 1 needed)
                 trees_actions_expanded[ti, -2] = int16(-1) # fake child for playouts indicating that selected is terminal (and playouts computed from outcome)    
         cuda.syncthreads()
+
+        #! 紧凑型数据写入，保存所有可能的孩子节点
         if t < state_max_actions: 
             child_index = int32(-1)
             if shared_legal_actions[t]:
@@ -1517,7 +1534,7 @@ class MCTSNC:
     @cuda.jit(void(int32, int32[:, :, :], int32[:], int8[:, :], boolean[:, :], boolean[:, :], int8[:, :, :, :], int8[:, :, :], int32[:], int16[:, :]))
     def _expand_1_acp_thrifty(max_tree_size, trees, trees_sizes, trees_turns, trees_leaves, trees_terminals, trees_boards, trees_extra_infos, 
                            trees_nodes_selected, trees_actions_expanded):
-        """CUDA kernel responsible for computations of stage: expansions (substage 1, variant ``"acp_thrifty"``)."""
+        """空间压缩型，全节点评估。CUDA kernel responsible for computations of stage: expansions (substage 1, variant ``"acp_thrifty"``)."""
         shared_board = cuda.shared.array((32, 32), dtype=int8) # assumed max board size (for selected node in tree associated with block)
         shared_extra_info = cuda.shared.array(4096, dtype=int8) # 4096 - assumed limit on max extra info
         shared_legal_actions = cuda.shared.array(512, dtype=boolean) # 512 - assumed limit on max actions
