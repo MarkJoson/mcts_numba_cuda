@@ -3,238 +3,552 @@ import numpy as np
 import numba as nb
 import numba.cuda as cuda
 from numba import void, float32, int32
-# 数据结构设计
+
+# ============================================================
+# Constants
+# ============================================================
+
+WARP_SIZE = 32
+FULL_MASK = 0xFFFFFFFF
+INT32_MAX = 2147483647
+NEG_INF_F32 = -3.4028234663852886e38
+
+NODE_STATUS_OK = 0
+NODE_STATUS_TERMINAL = 1
+
+# Selection result kinds
+SELECT_INVALID = 0      # No valid selection; virtual loss already rolled back
+SELECT_EXPAND = 1       # Node needs expansion (PW not saturated); CAS lock held
+SELECT_TERMINAL = 2     # Traversal hit a terminal node
+SELECT_DEPTH_LIMIT = 3  # Hit path capacity limit; treat as evaluation leaf
+
+MAX_SELECT_RETRY = 3
+
+# ============================================================
+# Data structure documentation
+# ============================================================
 
 class Tree:
     pass
 
 class Traverse:
-    path: list          # 记录遍历的；路径
+    path: list          # 记录遍历的路径
 
 # 由[tree_id, node_id]索引
 class Node:
     status: int         # 节点状态: OK / Terminal
-    inflight: int       # inflight 的数量
+    inflight: int       # CAS expansion lock (0 = free, 1 = claimed)
     state: int          # 对应的状态空间，指向状态池
-    N: int              # 节点访问次数
-    expended: int       # 已经展开的 edge 个数。如果 =0 说明是叶子节点, 由于是渐宽树，所以会逐步展开
+    expanded: int       # 已经展开的 edge 个数。如果 =0 说明是叶子节点, 由于是渐宽树，所以会逐步展开
     legals: int         # 在 pw_limit 约束下，允许展开的节点个数
     value: float        # 对应当前状态的状态价值
-    
-
-selected_vec_list: list # 用于存储当前被选中的边节点列表
 
 # 由[tree_id, edge_id]索引
 # edge_id = (node_id << 6) | slot
 class Edge:
-    child_id: int       # -1: Invalid, 否则是正常的node id 
-    n: int              # 访问次数
-    inflight: int       # 虚拟代价
-    W: float            # 累积动作价值
+    child_id: int       # -1: Invalid, 否则是正常的node id
+    n: int              # 访问次数 (真实，只在 backup 时增加)
+    inflight: int       # 虚拟访问计数 (selection 时 +1，rollback 或 backup 时 -1)
+    W: float            # 累积动作价值 (只在 backup 时增加真实 value)
     prob: float         # 对应的NN采样概率
-    prior: float        # 先验价值，来自 Value 计算？
+    prior: float        # 先验概率 (用于PUCT公式)
+
+# ============================================================
+# Device array allocation
+# ============================================================
 
 def init_data():
-
-    # 宽松存储，将256个Action一次性分配完毕
     TREE_CNT = 16
     MAX_NODE = 16384        # 最大16K个节点
     MAX_ACTION = 256        # 每个节点最大256个动作
+    MAX_WARPS_PER_TREE = 8
+    MAX_PATH_DEPTH = 64
 
     TREE_SHAPE = (TREE_CNT,)
     trees_selected = cuda.device_array(TREE_SHAPE, np.int32)    # type: ignore
 
     ROBOT_TURNS = 2
-    
-    NODE_SHAPE = (TREE_CNT, MAX_NODE)
-    nodes_status = cuda.device_array(NODE_SHAPE, np.int32)      # type: ignore      # TODO. 与 expanded 合并
-    nodes_inflight = cuda.device_array(NODE_SHAPE, np.int32)    # type: ignore
-    nodes_state = cuda.device_array(NODE_SHAPE, np.int32)       # type: ignore
-    nodes_value = cuda.device_array((TREE_CNT, MAX_NODE, ROBOT_TURNS), np.int32)       # type: ignore      # TODO. 也许可以和state存到一块
 
+    NODE_SHAPE = (TREE_CNT, MAX_NODE)
+    nodes_status = cuda.device_array(NODE_SHAPE, np.int32)      # type: ignore
+    nodes_inflight = cuda.device_array(NODE_SHAPE, np.int32)    # type: ignore  # CAS expansion lock
+    nodes_state = cuda.device_array(NODE_SHAPE, np.int32)       # type: ignore
+    nodes_expanded = cuda.device_array(NODE_SHAPE, np.int32)    # type: ignore  # expanded child count
+    nodes_value = cuda.device_array((TREE_CNT, MAX_NODE, ROBOT_TURNS), np.int32)  # type: ignore
 
     EDGE_SHAPE = (TREE_CNT, MAX_NODE, MAX_ACTION)
     edges_child_id = cuda.device_array(EDGE_SHAPE, np.int32)    # type: ignore
-    edges_n = cuda.device_array(EDGE_SHAPE, np.int32)           # type: ignore      # 访问次数
-    edges_inflight = cuda.device_array(EDGE_SHAPE, np.int32)    # type: ignore      # 虚拟损失
-    edges_W = cuda.device_array(EDGE_SHAPE, np.float32)         # type: ignore      # 累计价值
+    edges_n = cuda.device_array(EDGE_SHAPE, np.int32)           # type: ignore  # visit count
+    edges_inflight = cuda.device_array(EDGE_SHAPE, np.int32)    # type: ignore  # virtual loss count
+    edges_W = cuda.device_array(EDGE_SHAPE, np.float32)         # type: ignore  # cumulative value
     edges_prob = cuda.device_array(EDGE_SHAPE, np.float32)      # type: ignore
-    edges_prior = cuda.device_array(EDGE_SHAPE, np.float32)     # type: ignore
+    edges_prior = cuda.device_array(EDGE_SHAPE, np.float32)     # type: ignore  # PUCT prior
 
+    # Output arrays for selection kernel
+    out_shape = (TREE_CNT, MAX_WARPS_PER_TREE)
+    out_selected_node = cuda.device_array(out_shape, np.int32)  # type: ignore
+    out_selected_kind = cuda.device_array(out_shape, np.int32)  # type: ignore
+    out_path_eids = cuda.device_array((TREE_CNT, MAX_WARPS_PER_TREE, MAX_PATH_DEPTH), np.int32)   # type: ignore
+    out_path_len = cuda.device_array(out_shape, np.int32)       # type: ignore
 
-NODE_STATUS_OK = 0
-NODE_STATUS_TERMINAL = 1
+    # Value buffer for backup kernel (per-edge value along path)
+    path_edge_values = cuda.device_array((TREE_CNT, MAX_WARPS_PER_TREE, MAX_PATH_DEPTH), np.float32)  # type: ignore
 
-WARP_SIZE = 32
-FULL_MASK = 0xFFFFFFFF
-INT32_MAX = 2147483647
+# ============================================================
+# Device helpers
+# ============================================================
 
 @cuda.jit(device=True, inline=True)
-def warp_reduce_max_argmax_f32(v, idx):
+def _score_better(score, eid, best_score, best_eid):
     """
-    warp-level reduce max + argmax.
-
-    输入：
-    - v: 当前 lane 的 value, float32
-    - idx: 当前 lane 对应的全局 index, int32
-
-    输出：
-    - lane 0 上返回 warp 的 max value 和 argmax index
-    - 其他 lane 上返回值未必有意义，除非你再 broadcast
+    Deterministic best-score comparison:
+      1. Larger score wins
+      2. On tie, smaller eid wins (deterministic)
     """
-    other_v = cuda.shfl_down_sync(FULL_MASK, v, 16)
-    other_i = cuda.shfl_down_sync(FULL_MASK, idx, 16)
-    if other_v > v or (other_v == v and other_i < idx):
-        v = other_v
-        idx = other_i
-
-    other_v = cuda.shfl_down_sync(FULL_MASK, v, 8)
-    other_i = cuda.shfl_down_sync(FULL_MASK, idx, 8)
-    if other_v > v or (other_v == v and other_i < idx):
-        v = other_v
-        idx = other_i
-
-    other_v = cuda.shfl_down_sync(FULL_MASK, v, 4)
-    other_i = cuda.shfl_down_sync(FULL_MASK, idx, 4)
-    if other_v > v or (other_v == v and other_i < idx):
-        v = other_v
-        idx = other_i
-
-    other_v = cuda.shfl_down_sync(FULL_MASK, v, 2)
-    other_i = cuda.shfl_down_sync(FULL_MASK, idx, 2)
-    if other_v > v or (other_v == v and other_i < idx):
-        v = other_v
-        idx = other_i
-
-    other_v = cuda.shfl_down_sync(FULL_MASK, v, 1)
-    other_i = cuda.shfl_down_sync(FULL_MASK, idx, 1)
-    if other_v > v or (other_v == v and other_i < idx):
-        v = other_v
-        idx = other_i
-
-    return v, idx
+    if score > best_score:
+        return True
+    if score == best_score and eid < best_eid:
+        return True
+    return False
 
 
-@cuda.jit(int32(float32, float32, int32), device=True, inline=True)
-def _max_children(Cpw, alpha_pw, n_visit):
-    return math.ceil(Cpw*math.pow(n_visit, alpha_pw))
+@cuda.jit(device=True, inline=True)
+def _warp_reduce_best(score, eid, child):
+    """
+    Warp-level reduce-max over (score, eid, child).
+    Tie-breaking: larger score wins; on tie, smaller eid wins.
+    Broadcasts lane 0 winner to all lanes so every lane sees the same result.
+    """
+    other_score = cuda.shfl_down_sync(FULL_MASK, score, 16)
+    other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 16)
+    other_child = cuda.shfl_down_sync(FULL_MASK, child, 16)
+    if _score_better(other_score, other_eid, score, eid):
+        score = other_score
+        eid = other_eid
+        child = other_child
 
-EPS = 1e-5
+    other_score = cuda.shfl_down_sync(FULL_MASK, score, 8)
+    other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 8)
+    other_child = cuda.shfl_down_sync(FULL_MASK, child, 8)
+    if _score_better(other_score, other_eid, score, eid):
+        score = other_score
+        eid = other_eid
+        child = other_child
 
-@cuda.jit(void(float32, float32, float32, float32,
-                   int32[:, :, :], float32[:, :, :], int32[:, :, :],
+    other_score = cuda.shfl_down_sync(FULL_MASK, score, 4)
+    other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 4)
+    other_child = cuda.shfl_down_sync(FULL_MASK, child, 4)
+    if _score_better(other_score, other_eid, score, eid):
+        score = other_score
+        eid = other_eid
+        child = other_child
+
+    other_score = cuda.shfl_down_sync(FULL_MASK, score, 2)
+    other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 2)
+    other_child = cuda.shfl_down_sync(FULL_MASK, child, 2)
+    if _score_better(other_score, other_eid, score, eid):
+        score = other_score
+        eid = other_eid
+        child = other_child
+
+    other_score = cuda.shfl_down_sync(FULL_MASK, score, 1)
+    other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 1)
+    other_child = cuda.shfl_down_sync(FULL_MASK, child, 1)
+    if _score_better(other_score, other_eid, score, eid):
+        score = other_score
+        eid = other_eid
+        child = other_child
+
+    # Broadcast lane 0 winner to all lanes — critical for subsequent node assignment
+    score = cuda.shfl_sync(FULL_MASK, score, 0)
+    eid = cuda.shfl_sync(FULL_MASK, eid, 0)
+    child = cuda.shfl_sync(FULL_MASK, child, 0)
+
+    return score, eid, child
+
+
+@cuda.jit(int32(int32), device=True, inline=True)
+def _warp_reduce_sum(val):
+    """
+    Warp-level sum reduction. All lanes contribute their val,
+    all lanes receive the total sum.
+    """
+    other = cuda.shfl_down_sync(FULL_MASK, val, 16)
+    val += other
+    other = cuda.shfl_down_sync(FULL_MASK, val, 8)
+    val += other
+    other = cuda.shfl_down_sync(FULL_MASK, val, 4)
+    val += other
+    other = cuda.shfl_down_sync(FULL_MASK, val, 2)
+    val += other
+    other = cuda.shfl_down_sync(FULL_MASK, val, 1)
+    val += other
+    val = cuda.shfl_sync(FULL_MASK, val, 0)
+    return val
+
+
+@cuda.jit(int32(float32, float32, int32, int32), device=True, inline=True)
+def _allowed_children(c_pw, alpha_pw, n_node, max_edges):
+    """
+    Progressive widening:
+        allowed = ceil(c_pw * N(s)^alpha_pw)
+    Clamped to [1, max_edges].
+    """
+    if max_edges <= 0:
+        return int32(0)
+
+    n = n_node
+    if n < 1:
+        n = int32(1)
+
+    val = c_pw * math.pow(float32(n), alpha_pw)
+
+    if val >= float32(max_edges):
+        return max_edges
+
+    k = int32(math.ceil(val))
+    if k < 1:
+        k = int32(1)
+    if k > max_edges:
+        k = max_edges
+
+    return k
+
+
+@cuda.jit(float32(float32, float32, float32, int32, int32, float32), device=True, inline=True)
+def _puct_score(cpuct, prior, w, n_edge, n_edge_inflight, sqrt_parent_n_eff):
+    """
+    PUCT with virtual-loss-aware effective counts:
+        Q   = W(s,a) / N_real(s,a)       (0 when N_real=0)
+        U   = cpuct * P(s,a) * sqrt(N_parent_eff) / (1 + N_edge_eff)
+        N_edge_eff = N_real + N_inflight
+
+    Virtual visits inflate N_edge_eff to reduce the exploration bonus
+    for sibling warps, discouraging duplicate selection of the same edge.
+    """
+    n_edge_eff = n_edge + n_edge_inflight
+    q = float32(0.0)
+    if n_edge > 0:
+        q = w / float32(n_edge)
+    u = cpuct * prior * sqrt_parent_n_eff / float32(n_edge_eff + int32(1))
+    return q + u
+
+
+@cuda.jit(device=True, inline=True)
+def _reconstruct_parent(tree, wid, d, out_path_eids, edge_child_id, n_nodes):
+    """
+    Reconstruct the parent node at depth d by walking the edge path from root.
+    Returns -1 if path is broken.
+    """
+    parent = int32(0)  # root
+    i = int32(0)
+    while i < d:
+        e = out_path_eids[tree, wid, i]
+        if parent >= 0 and parent < n_nodes and e >= 0:
+            parent = edge_child_id[tree, parent, e]
+        else:
+            return int32(-1)
+        i += int32(1)
+    return parent
+
+
+@cuda.jit(device=True, inline=True)
+def _rollback_vloss_path(tree, wid, depth, lane,
+                          out_path_eids, edge_inflight,
+                          edge_child_id, n_nodes):
+    """
+    Roll back virtual visits on edges for the current attempt.
+    All lanes participate: each lane handles depths at stride=32.
+    path_eids[0:depth] are valid.
+    Reconstructs parent node from eid path since node_N / out_path_nodes are removed.
+    Caller must syncwarp after return.
+    """
+    d = lane
+    while d < depth:
+        parent = _reconstruct_parent(tree, wid, d, out_path_eids, edge_child_id, n_nodes)
+        eid = out_path_eids[tree, wid, d]
+        if parent >= 0 and eid >= 0:
+            cuda.atomic.sub(edge_inflight, (tree, parent, eid), int32(1))
+        d += int32(WARP_SIZE)
+
+
+# ============================================================
+# Selection kernel
+# ============================================================
+
+@cuda.jit(void(float32, float32, float32,
+                   int32[:, :, :], float32[:, :, :], float32[:, :, :], int32[:, :, :], int32[:, :, :],
                    int32[:, :], int32[:, :], int32[:, :],
-                   int32[:, :], int32[:, :, :]))
-def _select_kernel_native(Cexp, alpha_exp, Cpw, alpha_pw,
-                          edge_child_id, edges_W, edges_n,
-                          node_status, node_expended, node_n,
-                          trees_nodes_selected, trees_selected_paths):
-    """每个 warp 独立遍历树，选出一个待扩展节点。
+                   int32[:, :], int32[:, :], int32[:, :, :], int32[:, :]))
+def _select_kernel_native(cpuct, c_pw, alpha_pw,
+                          edge_child_id, edge_prior, edge_W, edge_N, edge_inflight,
+                          node_status, node_expanded, node_in_flight,
+                          out_selected_node, out_selected_kind,
+                          out_path_eids, out_path_len):
+    """
+    每个 warp 独立遍历树，选出待扩展节点。
 
     1 block = 1 tree；1 warp = 1 条遍历路径。
-    虚拟损失避免 warp 之间重复选择同一条边；跨 warp 去重确保节点不重复扩展。
+    选择每条边后立刻对其加 virtual visit (edge_inflight += 1)，
+    通过 PUCT 中的有效 N 降低后续 warp 选同一条边的概率。
+    CAS-based expansion claim 避免重复扩展。
+
+    node_N / out_path_nodes 已删除：
+      - parent_n_eff 由 warp-level sum over edge_N + edge_inflight 实时计算
+      - 节点路径可通过 out_path_eids + edge_child_id 从 root 重建
 
     输出：
-      trees_nodes_selected[tree, warp]   — 选中的待扩展节点 id
-      trees_selected_paths[tree, warp, :] — 遍历路径，末尾元素 = 路径长度
+      out_selected_node[tree, wid]  — 被选中的节点 id
+      out_selected_kind[tree, wid]  — SELECT_EXPAND / SELECT_TERMINAL / SELECT_DEPTH_LIMIT / SELECT_INVALID
+      out_path_eids[tree, wid, :]   — 路径上的边 id
+      out_path_len[tree, wid]       — 路径上的节点数
     """
     tree = cuda.blockIdx.x
     tid = cuda.threadIdx.x
-    wid = tid // 32          # warp id in block
-    lid = tid & 31          # lane id in warp
-    warp_count = cuda.blockDim.x // 32
-    max_path_dim = trees_selected_paths.shape[2]
-    max_depth = max_path_dim - 1   # 最后一个位置留给路径长度
+    lane = tid & int32(31)
+    wid = tid >> int32(5)
 
-    # ── 跨 warp 通信用的 shared memory ──
-    s_warp_node = cuda.shared.array(32, dtype=int32)       # type: ignore  # warp
-    s_warp_depth = cuda.shared.array(32, dtype=int32)      # type: ignore
-    s_warp_valid = cuda.shared.array(32, dtype=int32)      # type: ignore
+    if tree >= out_selected_node.shape[0]:
+        return
 
-    node = 0    # 从根节点开始
-    depth = 0
+    warp_count = cuda.blockDim.x >> int32(5)
+    active_warps = min(warp_count, out_selected_node.shape[1])
 
-    # 根节点写入路径        # TODO. 默认不写入节点id，而是写入边 id； 节点的 N 作废，全部使用边 N 代替
-    trees_selected_paths[tree, wid, 0] = int32(0)
+    if wid >= active_warps:
+        return
 
-    # 每个 warp 独立遍历一次树
-    while depth < max_depth:
-        if node_status[tree, node] == NODE_STATUS_TERMINAL:
-            break
+    # Initialize output to invalid
+    if lane == 0:
+        out_selected_node[tree, wid] = int32(-1)
+        out_selected_kind[tree, wid] = int32(SELECT_INVALID)
+        out_path_len[tree, wid] = int32(0)
 
-        n_visit = node_n[tree, node]
-        max_children_val = max(_max_children(Cpw, alpha_pw, n_visit), 1)    # 需保证未访问节点至少可扩展 1 个子节点
-        cur_expended = node_expended[tree, node]
+    max_edge_slots = out_path_eids.shape[2]
+    if max_edge_slots < 1:
+        return
 
-        # 节点尚未完全扩展 -> 选为待扩展节点，停止下钻
-        if cur_expended < max_children_val:
-            break
+    max_edge_steps = max_edge_slots
 
-        # warp 内的 lane 以 stride=32 遍历边，计算 UCB，使用规约选择算子
-        best_ucb = -math.inf
-        best_child = int32(-1)
-        best_eid = int32(-1)
+    n_nodes = node_status.shape[1]
+    max_edges = edge_child_id.shape[2]
+    if n_nodes <= 0:
+        return
 
-        eid = lid
-        while eid < cur_expended:
-            child = edge_child_id[tree, node, eid]
-            if child != int32(-1):
-                w = edges_W[tree, node, eid]
-                n_edge = edges_n[tree, node, eid]
-                if n_edge > 0:
-                    q = w / float32(n_edge)
-                    u_val = Cexp * math.sqrt(math.pow(max(float32(1.0), w), alpha_exp) / float32(n_edge))
-                    ucb = q + u_val
+    final_node = int32(-1)
+    final_kind = int32(SELECT_INVALID)
+    final_len = int32(0)
+
+    done = int32(0)
+    attempt = int32(0)
+
+    while attempt < int32(MAX_SELECT_RETRY) and done == int32(0):
+        node = int32(0)      # start from root
+        depth = int32(0)
+
+        cuda.syncwarp(FULL_MASK)
+
+        while True:
+            # Defensive guard: invalid node
+            if node < 0 or node >= n_nodes:
+                _rollback_vloss_path(tree, wid, depth, lane,
+                                      out_path_eids, edge_inflight,
+                                      edge_child_id, n_nodes)
+                cuda.syncwarp(FULL_MASK)
+                break
+
+            # Terminal node
+            if node_status[tree, node] == NODE_STATUS_TERMINAL:
+                final_node = node
+                final_kind = int32(SELECT_TERMINAL)
+                final_len = depth + int32(1)
+                done = int32(1)
+                break
+
+            cur_expanded = node_expanded[tree, node]
+            if cur_expanded < 0:
+                cur_expanded = int32(0)
+            if cur_expanded > max_edges:
+                cur_expanded = max_edges
+
+            # Compute parent_n_eff from edges (sum of edge_N + edge_inflight)
+            parent_n_eff = int32(0)
+            eid = lane
+            while eid < cur_expanded:
+                child = edge_child_id[tree, node, eid]
+                if child >= 0 and child < n_nodes:
+                    parent_n_eff += edge_N[tree, node, eid] + edge_inflight[tree, node, eid]
+                eid += int32(WARP_SIZE)
+            parent_n_eff = _warp_reduce_sum(parent_n_eff)
+            if parent_n_eff < 1:
+                parent_n_eff = int32(1)
+
+            allowed = _allowed_children(c_pw, alpha_pw, parent_n_eff, max_edges)
+
+            # Progressive widening: node can still expand new children
+            if cur_expanded < allowed:
+                claim_ok = int32(1)
+                if lane == 0:
+                    old = cuda.atomic.cas(
+                        node_in_flight, (tree, node),
+                        int32(0), int32(1),
+                    )
+                    if old != 0:
+                        claim_ok = int32(0)
+
+                claim_ok = cuda.shfl_sync(FULL_MASK, claim_ok, 0)
+
+                if claim_ok != 0:
+                    final_node = node
+                    final_kind = int32(SELECT_EXPAND)
+                    final_len = depth + int32(1)
+                    done = int32(1)
                 else:
-                    ucb = math.inf       # 未访问过的子节点优先级最高       # TODO. 未选择节点会有值函数输出的价值作为初始参考
+                    # Another warp already claimed this node — rollback and retry from root
+                    _rollback_vloss_path(tree, wid, depth, lane,
+                                          out_path_eids, edge_inflight,
+                                          edge_child_id, n_nodes)
+                    cuda.syncwarp(FULL_MASK)
+                break
 
-                if ucb > best_ucb:
-                    best_ucb = ucb
-                    best_child = child
-                    best_eid = eid
-            eid += 32
+            # Path capacity hit — treat as depth-limit leaf
+            if depth >= max_edge_steps:
+                final_node = node
+                final_kind = int32(SELECT_DEPTH_LIMIT)
+                final_len = depth + int32(1)
+                done = int32(1)
+                break
 
-        # warp 级 reduce-max / argmax                                   # TODO. 使用CCCL的库代替    
-        for offset in (16, 8, 4, 2, 1):
-            other_ucb = cuda.shfl_down_sync(0xFFFFFFFF, best_ucb, offset)
-            other_child = cuda.shfl_down_sync(0xFFFFFFFF, best_child, offset)
-            other_eid = cuda.shfl_down_sync(0xFFFFFFFF, best_eid, offset)
-            if other_ucb > best_ucb:
-                best_ucb = other_ucb
-                best_child = other_child
-                best_eid = other_eid                                   # TODO: best_eid 有什么用？ 不如用 warp_reduce_max_argmax_f32 代替
+            # Fully expanded under PW: PUCT selection among existing children
+            sqrt_parent_n_eff = math.sqrt(float32(parent_n_eff))
 
-        # 安全兜底：无合法子节点时停止                                      # TODO. 什么时候会出现无合法子节点？
-        if best_child == int32(-1):
-            break
+            best_score = float32(NEG_INF_F32)
+            best_eid = int32(INT32_MAX)
+            best_child = int32(-1)
 
-        # 下钻到最优子节点，保存路径                                        # TODO. 虚拟损失如何添加？
-        node = best_child
-        depth += 1
-        if lid == 0:
-            trees_selected_paths[tree, wid, depth] = node
+            eid = lane
+            while eid < cur_expanded:
+                child = edge_child_id[tree, node, eid]
+                if child >= 0 and child < n_nodes:
+                    prior = edge_prior[tree, node, eid]
+                    w = edge_W[tree, node, eid]
+                    n_edge = edge_N[tree, node, eid]
+                    n_inflight = edge_inflight[tree, node, eid]
 
-    # 记录每个 warp 的结果
-    if lid == 0:
-        s_warp_node[wid] = node
-        s_warp_depth[wid] = depth
-        s_warp_valid[wid] = int32(1)
+                    score = _puct_score(cpuct, prior, w, n_edge, n_inflight, sqrt_parent_n_eff)
 
-    cuda.syncthreads()
+                    if _score_better(score, int32(eid), best_score, best_eid):
+                        best_score = score
+                        best_eid = int32(eid)
+                        best_child = child
 
-    # 跨 warp 去重：相同节点只保留 wid 最小的
-    # TODO. warp级别的规约，不应该只交给 iwid=0 的线程做
-    if lid == 0:
-        for i in range(warp_count):
-            if s_warp_valid[i]:
-                for j in range(i + 1, warp_count):
-                    if s_warp_valid[j] and s_warp_node[i] == s_warp_node[j]:
-                        s_warp_valid[j] = int32(0)
+                eid += int32(WARP_SIZE)
 
-    cuda.syncthreads()                                                  # TODO: 不必要
+            # Warp reduce: find best (score, eid, child) and broadcast to all lanes
+            best_score, best_eid, best_child = _warp_reduce_best(
+                best_score, best_eid, best_child,
+            )
 
-    # 写出最终结果
-    if lid == 0:
-        trees_nodes_selected[tree, wid] = s_warp_node[wid]
-        # 末尾元素存路径长度（路径上的节点数）
-        trees_selected_paths[tree, wid, max_path_dim - 1] = (s_warp_depth[wid] + int32(1))
+            # No valid child found — data inconsistency, rollback and abort this attempt
+            if best_child < 0:
+                _rollback_vloss_path(tree, wid, depth, lane,
+                                      out_path_eids, edge_inflight,
+                                      edge_child_id, n_nodes)
+                cuda.syncwarp(FULL_MASK)
+                break
+
+            parent = node
+
+            # Apply virtual visit on selected edge
+            if lane == 0:
+                out_path_eids[tree, wid, depth] = best_eid
+                cuda.atomic.add(edge_inflight, (tree, parent, best_eid), int32(1))
+
+            cuda.syncwarp(FULL_MASK)
+
+            node = best_child
+            depth += int32(1)
+
+        if done == int32(0):
+            attempt += int32(1)
+
+    # Write final result
+    if lane == 0:
+        if done != 0:
+            out_selected_node[tree, wid] = final_node
+            out_selected_kind[tree, wid] = final_kind
+            out_path_len[tree, wid] = final_len
+        else:
+            out_selected_node[tree, wid] = int32(-1)
+            out_selected_kind[tree, wid] = int32(SELECT_INVALID)
+            out_path_len[tree, wid] = int32(0)
+
+
+# ============================================================
+# Backup kernel
+# ============================================================
+
+@cuda.jit(void(float32[:, :, :], int32[:, :, :], int32[:, :, :], int32[:, :, :],
+                   int32[:, :],
+                   int32[:, :], int32[:, :],
+                   int32[:, :, :], int32[:, :],
+                   float32[:, :, :]))
+def _backup_kernel_native(edge_W, edge_N, edge_inflight, edge_child_id,
+                          node_in_flight,
+                          out_selected_node, out_selected_kind,
+                          out_path_eids, out_path_len,
+                          path_edge_values):
+    """
+    完成 backup：将 virtual visit 转换为真实统计。
+
+    Selection 阶段已经做了（virtual）：
+      edge_inflight += 1        （边的虚拟访问计数）
+
+    Backup 阶段完成转换：
+      edge_inflight -= 1        （撤销虚拟）
+      edge_N += 1               （写入真实）
+      edge_W += value           （写入真实累积价值）
+
+    node 路径通过 out_path_eids + edge_child_id 从 root 重建。
+
+    path_edge_values[tree, wid, d] 必须是已转换好视角的 value。
+    """
+    tree = cuda.blockIdx.x
+    tid = cuda.threadIdx.x
+    lane = tid & int32(31)
+    wid = tid >> int32(5)
+
+    if tree >= out_selected_node.shape[0]:
+        return
+
+    active_warps = min(cuda.blockDim.x >> int32(5), out_selected_node.shape[1])
+    if wid >= active_warps:
+        return
+
+    kind = out_selected_kind[tree, wid]
+    if kind == SELECT_INVALID:
+        return
+
+    plen = out_path_len[tree, wid]
+    if plen <= 0:
+        return
+
+    n_nodes = edge_child_id.shape[1]
+    edge_count = plen - int32(1)
+
+    # Each lane handles edges at stride=32
+    d = lane
+    while d < edge_count:
+        parent = _reconstruct_parent(tree, wid, d, out_path_eids, edge_child_id, n_nodes)
+        eid = out_path_eids[tree, wid, d]
+        if parent >= 0 and eid >= 0:
+            v = path_edge_values[tree, wid, d]
+            cuda.atomic.sub(edge_inflight, (tree, parent, eid), int32(1))
+            cuda.atomic.add(edge_N, (tree, parent, eid), int32(1))
+            cuda.atomic.add(edge_W, (tree, parent, eid), v)
+        d += int32(WARP_SIZE)
+
+    # Release CAS lock for SELECT_EXPAND nodes
+    if lane == 0 and kind == SELECT_EXPAND:
+        leaf = out_selected_node[tree, wid]
+        if leaf >= 0:
+            cuda.atomic.exch(node_in_flight, (tree, leaf), int32(0))
