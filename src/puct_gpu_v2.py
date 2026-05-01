@@ -13,8 +13,9 @@ FULL_MASK = 0xFFFFFFFF
 INT32_MAX = 2147483647
 NEG_INF_F32 = -3.4028234663852886e38
 
-NODE_STATUS_OK = 0
-NODE_STATUS_TERMINAL = 1
+NODE_EXPANDED_TERMINAL = -1  # node_expanded sentinel: terminal node
+PACKED_NODE_LIMIT = 16384    # final_node stores node_id in 14 bits
+PACKED_EDGE_LIMIT = 256      # path edge encoding stores slot in 8 bits
 
 # Selection result kinds
 SELECT_INVALID = 0      # No valid selection; virtual loss already rolled back
@@ -39,8 +40,7 @@ class Traverse:
 
 # 由[tree_id, node_id]索引
 class Node:
-    status: int         # 节点状态: OK / Terminal
-    expanded: int       # 已经展开的 edge 个数。如果 =0 说明是叶子节点, 由于是渐宽树，所以会逐步展开
+    expanded: int       # >=0: 已经展开的 edge 个数; -1: terminal
     prepare_expand: int # 预计展开的节点数量
     state: int          # 对应的状态空间，指向状态池
     value: float        # 对应当前状态的状态价值
@@ -73,9 +73,8 @@ def init_data():
     ROBOT_TURNS = 2
 
     NODE_SHAPE = (TREE_CNT, MAX_NODE)
-    nodes_status = cuda.device_array(NODE_SHAPE, np.int32)      # type: ignore
     nodes_state = cuda.device_array(NODE_SHAPE, np.int32)       # type: ignore
-    nodes_expanded = cuda.device_array(NODE_SHAPE, np.int32)    # type: ignore  # expanded child count
+    nodes_expanded = cuda.device_array(NODE_SHAPE, np.int32)    # type: ignore  # >=0 expanded count, -1 terminal
     nodes_value = cuda.device_array((TREE_CNT, MAX_NODE, ROBOT_TURNS), np.int32)  # type: ignore
 
     EDGE_SHAPE = (TREE_CNT, MAX_NODE, MAX_ACTION)
@@ -340,11 +339,11 @@ def _rollback_vloss_path(tree, wid, depth, lane,
 @cuda.jit(void(
     float32, float32, float32,
     int32[:, :, :], float32[:, :, :], float32[:, :, :], int32[:, :, :], int32[:, :, :],
-    int32[:, :], int32[:, :],
-    int32[:, :], int32[:, :], int32[:, :, :]))
+    int32[:, :],
+    int32[:, :], int32[:, :, :], int32[:, :]))
 def _select_kernel_native(cpuct, c_pw, alpha_pw,
                           edge_child_id, edge_prior, edge_W, edge_N, edge_inflight,
-                          node_status, node_expanded,
+                          node_expanded,
                           out_selected_node, out_path_eids, out_path_len):
     """
     每个 warp 独立遍历树，选出待扩展节点。1 block = 1 tree; 1 warp = 1 条遍历路径。
@@ -375,9 +374,15 @@ def _select_kernel_native(cpuct, c_pw, alpha_pw,
 
     max_edges = edge_child_id.shape[2]
     max_edge_steps = out_path_eids.shape[2]
-    n_nodes = node_status.shape[1]
-    assert max_edge_steps >= 1
-    assert n_nodes > 0
+    n_nodes = node_expanded.shape[1]
+
+    # Encoding guards:
+    #   final_node: (kind << 22) | (expand_slot << 14) | node_id
+    #   path eid  : (parent << 8) | slot
+    # If these limits are exceeded, returning invalid is safer than silently
+    # truncating ids during bit packing.
+    if max_edge_steps < 1 or n_nodes <= 0 or n_nodes > int32(PACKED_NODE_LIMIT) or max_edges <= 0 or max_edges > int32(PACKED_EDGE_LIMIT):
+        return
 
     # 对 final_node 进行了压缩，包含了 当前结果类型(31-22) + expand_slot(21-14) + node_id(0-13)
     #! 当节点状态是待扩展时，expand_slot指示了新的扩展节点的起始位置。
@@ -396,15 +401,29 @@ def _select_kernel_native(cpuct, c_pw, alpha_pw,
             cuda.syncwarp(FULL_MASK)
             break
 
-        # 终止态的节点
-        if node_status[tree, node] == NODE_STATUS_TERMINAL:
+        node_info = node_expanded[tree, node]
+
+        # 终止态的节点。node_expanded 使用负数 sentinel 表示 terminal，
+        # 避免 selection 每层同时读取 node_status 和 node_expanded。
+        if node_info == int32(NODE_EXPANDED_TERMINAL):
             final_node = (int32(SELECT_TERMINAL) << int32(22)) | node
             final_len = depth + int32(1)
             break
+
+        if node_info < int32(0) or node_info > max_edges:
+            _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, int32(1))
+            cuda.syncwarp(FULL_MASK)
+            break
         
         # TODO: 如果是超出步长的节点，需要考虑用 Value 网络重新估计节点价值
-        cur_expanded = node_expanded[tree, node]
-        cur_expanded = max(0, min(max_edges, cur_expanded))     # 约束当前节点范围
+        cur_expanded = node_info
+
+        # 显式处理尚未展开的非终止叶子节点。这样不用依赖 progressive
+        # widening 在 cur_expanded=0 时一定给出 allowed>=1。
+        if cur_expanded == int32(0):
+            final_node = (int32(SELECT_EXPAND) << int32(22)) | node
+            final_len = depth + int32(1)
+            break
 
         # 聚合所有边的访问次数，得到节点的访问次数，用于
         parent_n_eff = int32(0)
@@ -427,8 +446,9 @@ def _select_kernel_native(cpuct, c_pw, alpha_pw,
                 if expand_offset >= need_expand:
                     cuda.atomic.sub(edge_inflight, (tree, node, cur_expanded), int32(1))
             expand_offset = cuda.shfl_sync(FULL_MASK, expand_offset, 0)         #! 广播当前结果，让所有 lane 进入就绪状态
-            if expand_offset >= need_expand:
-                final_node = (int32(SELECT_EXPAND) << int32(22)) | (cur_expanded+expand_offset << int32(14)) | node
+            expand_slot = cur_expanded + expand_offset
+            if expand_offset >= int32(0) and expand_offset < need_expand and expand_slot >= int32(0) and expand_slot < max_edges and expand_slot < int32(PACKED_EDGE_LIMIT):
+                final_node = (int32(SELECT_EXPAND) << int32(22)) | (expand_slot << int32(14)) | node
                 final_len = depth + int32(1)
             else:   #! 扩展数量不允许进一步拓展，则退出
                 _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, int32(1))
