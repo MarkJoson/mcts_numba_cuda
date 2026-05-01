@@ -169,6 +169,130 @@ def _warp_reduce_best(score, eid, child):
     return score, eid, child
 
 
+@cuda.jit(device=True, inline=True)
+def _top2_insert(score, eid, inflight,
+                 best_score, best_eid, best_inflight,
+                 alt_score, alt_eid):
+    """
+    Insert one candidate into a deterministic top-2 score list.
+    Duplicate eids are ignored so reduction merges do not report the same
+    edge as both best and runner-up.
+    """
+    if eid == int32(INT32_MAX):
+        return best_score, best_eid, best_inflight, alt_score, alt_eid
+
+    if eid == best_eid:
+        if _score_better(score, eid, best_score, best_eid):
+            best_score = score
+            best_inflight = inflight
+        return best_score, best_eid, best_inflight, alt_score, alt_eid
+
+    if eid == alt_eid:
+        if _score_better(score, eid, alt_score, alt_eid):
+            alt_score = score
+        return best_score, best_eid, best_inflight, alt_score, alt_eid
+
+    if _score_better(score, eid, best_score, best_eid):
+        alt_score = best_score
+        alt_eid = best_eid
+        best_score = score
+        best_eid = eid
+        best_inflight = inflight
+    elif _score_better(score, eid, alt_score, alt_eid):
+        alt_score = score
+        alt_eid = eid
+
+    return best_score, best_eid, best_inflight, alt_score, alt_eid
+
+
+@cuda.jit(device=True, inline=True)
+def _warp_reduce_top2(best_score, best_eid, best_inflight,
+                      alt_score, alt_eid):
+    """
+    Warp-level top-2 reduce. Broadcasts lane 0's best and runner-up to all
+    lanes so lane 0 can claim best while every lane agrees on retry state.
+    Child ids are intentionally not shuffled; the selected child is loaded
+    after the winning eid is known.
+    """
+    other_best_score = cuda.shfl_down_sync(FULL_MASK, best_score, 16)
+    other_best_eid = cuda.shfl_down_sync(FULL_MASK, best_eid, 16)
+    other_best_inflight = cuda.shfl_down_sync(FULL_MASK, best_inflight, 16)
+    other_alt_score = cuda.shfl_down_sync(FULL_MASK, alt_score, 16)
+    other_alt_eid = cuda.shfl_down_sync(FULL_MASK, alt_eid, 16)
+    best_score, best_eid, best_inflight, alt_score, alt_eid = _top2_insert(
+        other_best_score, other_best_eid, other_best_inflight,
+        best_score, best_eid, best_inflight, alt_score, alt_eid,
+    )
+    best_score, best_eid, best_inflight, alt_score, alt_eid = _top2_insert(
+        other_alt_score, other_alt_eid, int32(0),
+        best_score, best_eid, best_inflight, alt_score, alt_eid,
+    )
+
+    other_best_score = cuda.shfl_down_sync(FULL_MASK, best_score, 8)
+    other_best_eid = cuda.shfl_down_sync(FULL_MASK, best_eid, 8)
+    other_best_inflight = cuda.shfl_down_sync(FULL_MASK, best_inflight, 8)
+    other_alt_score = cuda.shfl_down_sync(FULL_MASK, alt_score, 8)
+    other_alt_eid = cuda.shfl_down_sync(FULL_MASK, alt_eid, 8)
+    best_score, best_eid, best_inflight, alt_score, alt_eid = _top2_insert(
+        other_best_score, other_best_eid, other_best_inflight,
+        best_score, best_eid, best_inflight, alt_score, alt_eid,
+    )
+    best_score, best_eid, best_inflight, alt_score, alt_eid = _top2_insert(
+        other_alt_score, other_alt_eid, int32(0),
+        best_score, best_eid, best_inflight, alt_score, alt_eid,
+    )
+
+    other_best_score = cuda.shfl_down_sync(FULL_MASK, best_score, 4)
+    other_best_eid = cuda.shfl_down_sync(FULL_MASK, best_eid, 4)
+    other_best_inflight = cuda.shfl_down_sync(FULL_MASK, best_inflight, 4)
+    other_alt_score = cuda.shfl_down_sync(FULL_MASK, alt_score, 4)
+    other_alt_eid = cuda.shfl_down_sync(FULL_MASK, alt_eid, 4)
+    best_score, best_eid, best_inflight, alt_score, alt_eid = _top2_insert(
+        other_best_score, other_best_eid, other_best_inflight,
+        best_score, best_eid, best_inflight, alt_score, alt_eid,
+    )
+    best_score, best_eid, best_inflight, alt_score, alt_eid = _top2_insert(
+        other_alt_score, other_alt_eid, int32(0),
+        best_score, best_eid, best_inflight, alt_score, alt_eid,
+    )
+
+    other_best_score = cuda.shfl_down_sync(FULL_MASK, best_score, 2)
+    other_best_eid = cuda.shfl_down_sync(FULL_MASK, best_eid, 2)
+    other_best_inflight = cuda.shfl_down_sync(FULL_MASK, best_inflight, 2)
+    other_alt_score = cuda.shfl_down_sync(FULL_MASK, alt_score, 2)
+    other_alt_eid = cuda.shfl_down_sync(FULL_MASK, alt_eid, 2)
+    best_score, best_eid, best_inflight, alt_score, alt_eid = _top2_insert(
+        other_best_score, other_best_eid, other_best_inflight,
+        best_score, best_eid, best_inflight, alt_score, alt_eid,
+    )
+    best_score, best_eid, best_inflight, alt_score, alt_eid = _top2_insert(
+        other_alt_score, other_alt_eid, int32(0),
+        best_score, best_eid, best_inflight, alt_score, alt_eid,
+    )
+
+    other_best_score = cuda.shfl_down_sync(FULL_MASK, best_score, 1)
+    other_best_eid = cuda.shfl_down_sync(FULL_MASK, best_eid, 1)
+    other_best_inflight = cuda.shfl_down_sync(FULL_MASK, best_inflight, 1)
+    other_alt_score = cuda.shfl_down_sync(FULL_MASK, alt_score, 1)
+    other_alt_eid = cuda.shfl_down_sync(FULL_MASK, alt_eid, 1)
+    best_score, best_eid, best_inflight, alt_score, alt_eid = _top2_insert(
+        other_best_score, other_best_eid, other_best_inflight,
+        best_score, best_eid, best_inflight, alt_score, alt_eid,
+    )
+    best_score, best_eid, best_inflight, alt_score, alt_eid = _top2_insert(
+        other_alt_score, other_alt_eid, int32(0),
+        best_score, best_eid, best_inflight, alt_score, alt_eid,
+    )
+
+    best_score = cuda.shfl_sync(FULL_MASK, best_score, 0)
+    best_eid = cuda.shfl_sync(FULL_MASK, best_eid, 0)
+    best_inflight = cuda.shfl_sync(FULL_MASK, best_inflight, 0)
+    alt_score = cuda.shfl_sync(FULL_MASK, alt_score, 0)
+    alt_eid = cuda.shfl_sync(FULL_MASK, alt_eid, 0)
+
+    return best_score, best_eid, best_inflight, alt_score, alt_eid
+
+
 @cuda.jit(int32(int32), device=True, inline=True)
 def _warp_reduce_sum(val):
     """
@@ -272,8 +396,9 @@ def _select_kernel_native(cpuct, c_pw, alpha_pw, virtual_loss,
     每个 warp 独立遍历树，选出待扩展节点。
 
     1 block = 1 tree；1 warp = 1 条遍历路径。
-    选择每条边后立刻对其加 virtual visit (edge_inflight += 1)，
-    通过 PUCT 中的有效 N 降低后续 warp 选同一条边的概率。
+    一次扫描拿到 best / runner-up，只对 best edge 做 atomic claim。
+    如果 atomic 返回的 old inflight 与扫描时一致，直接接受；否则
+    用 runner-up 做冲突校验，必要时释放并重选。
     CAS-based expansion claim 避免重复扩展。
 
     node_N / out_path_nodes 已删除：
@@ -389,48 +514,100 @@ def _select_kernel_native(cpuct, c_pw, alpha_pw, virtual_loss,
                 final_len = depth + int32(1)
                 break
 
-            # Fully expanded under PW: PUCT selection among existing children
-            sqrt_parent_n_eff = math.sqrt(float32(parent_n_eff))
-
-            best_score = float32(NEG_INF_F32)
+            # Fully expanded under PW: PUCT selection among existing children.
+            # The hot path scans once to compute best + runner-up, then claims
+            # best. Only contention on best triggers a retry.
+            claimed = int32(0)
             best_eid = int32(INT32_MAX)
             best_child = int32(-1)
+            select_retry = int32(0)
 
-            eid = lane
-            while eid < cur_expanded:
-                child = edge_child_id[tree, node, eid]
-                if child >= 0 and child < n_nodes:
-                    prior = edge_prior[tree, node, eid]
-                    w = edge_W[tree, node, eid]
-                    n_edge = edge_N[tree, node, eid]
-                    n_inflight = edge_inflight[tree, node, eid]
+            while select_retry < int32(MAX_SELECT_RETRY) and claimed == int32(0):
+                if select_retry != int32(0):
+                    # First iteration reuses the parent_n_eff already computed
+                    # for progressive widening. Retries refresh it after
+                    # releasing a contended claim.
+                    parent_n_eff = int32(0)
+                    eid = lane
+                    while eid < cur_expanded:
+                        child = edge_child_id[tree, node, eid]
+                        if child >= 0 and child < n_nodes:
+                            parent_n_eff += edge_N[tree, node, eid] + edge_inflight[tree, node, eid]
+                        eid += int32(WARP_SIZE)
+                    parent_n_eff = _warp_reduce_sum(parent_n_eff)
+                    if parent_n_eff < 1:
+                        parent_n_eff = int32(1)
+                sqrt_parent_n_eff = math.sqrt(float32(parent_n_eff))
 
-                    score = _puct_score(cpuct, prior, w, n_edge, n_inflight, sqrt_parent_n_eff)
+                best_score = float32(NEG_INF_F32)
+                best_eid = int32(INT32_MAX)
+                best_child = int32(-1)
+                best_seen_inflight = int32(0)
+                alt_score = float32(NEG_INF_F32)
+                alt_eid = int32(INT32_MAX)
 
-                    if _score_better(score, int32(eid), best_score, best_eid):
-                        best_score = score
-                        best_eid = int32(eid)
-                        best_child = child
+                eid = lane
+                while eid < cur_expanded:
+                    child = edge_child_id[tree, node, eid]
+                    if child >= 0 and child < n_nodes:
+                        prior = edge_prior[tree, node, eid]
+                        w = edge_W[tree, node, eid]
+                        n_edge = edge_N[tree, node, eid]
+                        n_inflight = edge_inflight[tree, node, eid]
 
-                eid += int32(WARP_SIZE)
+                        score = _puct_score(cpuct, prior, w, n_edge, n_inflight, sqrt_parent_n_eff)
 
-            # Warp reduce: find best (score, eid, child) and broadcast to all lanes
-            best_score, best_eid, best_child = _warp_reduce_best(
-                best_score, best_eid, best_child,
-            )
+                        best_score, best_eid, best_seen_inflight, alt_score, alt_eid = _top2_insert(
+                            score, int32(eid), n_inflight,
+                            best_score, best_eid, best_seen_inflight,
+                            alt_score, alt_eid,
+                        )
 
-            # No valid child found — data inconsistency, rollback and abort this attempt
-            if best_child < 0:
+                    eid += int32(WARP_SIZE)
+
+                best_score, best_eid, best_seen_inflight, alt_score, alt_eid = _warp_reduce_top2(
+                    best_score, best_eid, best_seen_inflight,
+                    alt_score, alt_eid,
+                )
+
+                if best_eid == int32(INT32_MAX):
+                    break
+                best_child = edge_child_id[tree, node, best_eid]
+                if best_child < 0 or best_child >= n_nodes:
+                    break
+
+                claimed_old = int32(0)
+                if lane == 0:
+                    claimed_old = cuda.atomic.add(edge_inflight, (tree, node, best_eid), virtual_loss)
+                claimed_old = cuda.shfl_sync(FULL_MASK, claimed_old, 0)
+
+                claimed_score = _puct_score(
+                    cpuct,
+                    edge_prior[tree, node, best_eid],
+                    edge_W[tree, node, best_eid],
+                    edge_N[tree, node, best_eid],
+                    claimed_old,
+                    sqrt_parent_n_eff,
+                )
+
+                if claimed_old != best_seen_inflight and _score_better(alt_score, alt_eid, claimed_score, best_eid):
+                    if lane == 0:
+                        cuda.atomic.sub(edge_inflight, (tree, node, best_eid), virtual_loss)
+                    select_retry += int32(1)
+                    cuda.syncwarp(FULL_MASK)
+                else:
+                    claimed = int32(1)
+
+            # No valid child found, or contention never settled — rollback and abort this attempt
+            if claimed == int32(0) or best_child < 0:
                 _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, virtual_loss)
                 cuda.syncwarp(FULL_MASK)
                 break
 
             parent = node
 
-            # Add virtual loss to the selected edge (visible to other warps via atomic)
             if lane == 0:
                 out_path_eids[tree, wid, depth] = (parent << int32(8)) | best_eid
-                cuda.atomic.add(edge_inflight, (tree, parent, best_eid), virtual_loss)
 
             cuda.syncwarp(FULL_MASK)
 
