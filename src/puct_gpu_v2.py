@@ -40,21 +40,21 @@ class Traverse:
 # 由[tree_id, node_id]索引
 class Node:
     status: int         # 节点状态: OK / Terminal
-    inflight: int       # expansion claim now uses edge_inflight[*, node, slot]
-    state: int          # 对应的状态空间，指向状态池
     expanded: int       # 已经展开的 edge 个数。如果 =0 说明是叶子节点, 由于是渐宽树，所以会逐步展开
-    legals: int         # 在 pw_limit 约束下，允许展开的节点个数
+    prepare_expand: int # 预计展开的节点数量
+    state: int          # 对应的状态空间，指向状态池
     value: float        # 对应当前状态的状态价值
 
 # 由[tree_id, edge_id]索引
 # edge_id = (node_id << 8) | slot   (8-bit slot for MAX_ACTION=256)
 class Edge:
     child_id: int       # -1: Invalid, 否则是正常的node id
-    n: int              # 访问次数 (真实，只在 backup 时增加)
+    prior: float        # 先验概率 (用于PUCT公式)
+    N: int              # 访问次数 (真实，只在 backup 时增加)
     inflight: int       # 虚拟访问计数 (selection 时 +1，rollback 或 backup 时 -1)
     W: float            # 累积动作价值 (只在 backup 时增加真实 value)
     prob: float         # 对应的NN采样概率
-    prior: float        # 先验概率 (用于PUCT公式)
+
 
 # ============================================================
 # Device array allocation
@@ -115,6 +115,30 @@ def _score_better(score, eid, best_score, best_eid):
 
 
 @cuda.jit(device=True, inline=True)
+def _score_better_rotated(score, eid, best_score, best_eid, rotation, span):
+    """
+    Score comparison with a warp-specific rotated tie-break.
+    Used only by the experimental preclaim selector to avoid all warps
+    resolving perfectly equal scores to edge 0.
+    """
+    if score > best_score:
+        return True
+    if score == best_score:
+        if best_eid == int32(INT32_MAX):
+            return True
+        if span <= 0:
+            return eid < best_eid
+        eid_key = eid - rotation
+        if eid_key < 0:
+            eid_key += span
+        best_key = best_eid - rotation
+        if best_key < 0:
+            best_key += span
+        return eid_key < best_key
+    return False
+
+
+@cuda.jit(device=True, inline=True)
 def _warp_reduce_best(score, eid, child):
     """
     Warp-level reduce-max over (score, eid, child).
@@ -162,6 +186,60 @@ def _warp_reduce_best(score, eid, child):
         child = other_child
 
     # Broadcast lane 0 winner to all lanes — critical for subsequent node assignment
+    score = cuda.shfl_sync(FULL_MASK, score, 0)
+    eid = cuda.shfl_sync(FULL_MASK, eid, 0)
+    child = cuda.shfl_sync(FULL_MASK, child, 0)
+
+    return score, eid, child
+
+
+@cuda.jit(device=True, inline=True)
+def _warp_reduce_best_rotated(score, eid, child, rotation, span):
+    """
+    Warp-level reduce-max with a rotated tie-break. This is intentionally
+    separate from _warp_reduce_best so the production selector keeps its
+    deterministic smaller-eid tie-break.
+    """
+    other_score = cuda.shfl_down_sync(FULL_MASK, score, 16)
+    other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 16)
+    other_child = cuda.shfl_down_sync(FULL_MASK, child, 16)
+    if _score_better_rotated(other_score, other_eid, score, eid, rotation, span):
+        score = other_score
+        eid = other_eid
+        child = other_child
+
+    other_score = cuda.shfl_down_sync(FULL_MASK, score, 8)
+    other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 8)
+    other_child = cuda.shfl_down_sync(FULL_MASK, child, 8)
+    if _score_better_rotated(other_score, other_eid, score, eid, rotation, span):
+        score = other_score
+        eid = other_eid
+        child = other_child
+
+    other_score = cuda.shfl_down_sync(FULL_MASK, score, 4)
+    other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 4)
+    other_child = cuda.shfl_down_sync(FULL_MASK, child, 4)
+    if _score_better_rotated(other_score, other_eid, score, eid, rotation, span):
+        score = other_score
+        eid = other_eid
+        child = other_child
+
+    other_score = cuda.shfl_down_sync(FULL_MASK, score, 2)
+    other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 2)
+    other_child = cuda.shfl_down_sync(FULL_MASK, child, 2)
+    if _score_better_rotated(other_score, other_eid, score, eid, rotation, span):
+        score = other_score
+        eid = other_eid
+        child = other_child
+
+    other_score = cuda.shfl_down_sync(FULL_MASK, score, 1)
+    other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 1)
+    other_child = cuda.shfl_down_sync(FULL_MASK, child, 1)
+    if _score_better_rotated(other_score, other_eid, score, eid, rotation, span):
+        score = other_score
+        eid = other_eid
+        child = other_child
+
     score = cuda.shfl_sync(FULL_MASK, score, 0)
     eid = cuda.shfl_sync(FULL_MASK, eid, 0)
     child = cuda.shfl_sync(FULL_MASK, child, 0)
@@ -387,16 +465,16 @@ def _rollback_vloss_path(tree, wid, depth, lane,
                    int32[:, :, :], float32[:, :, :], float32[:, :, :], int32[:, :, :], int32[:, :, :],
                    int32[:, :], int32[:, :],
                    int32[:, :], int32[:, :], int32[:, :, :], int32[:, :]))
-def _select_kernel_native(cpuct, c_pw, alpha_pw, virtual_loss,
+def _select_kernel_native(cpuct, c_pw, alpha_pw,
                           edge_child_id, edge_prior, edge_W, edge_N, edge_inflight,
-                          node_status, node_expanded,
+                          node_status, node_expanded, node_need_expand,
                           out_selected_node, out_selected_kind,
                           out_path_eids, out_path_len):
     """
     每个 warp 独立遍历树，选出待扩展节点。
 
-    1 block = 1 tree；1 warp = 1 条遍历路径。
-    一次扫描拿到 best / runner-up，只对 best edge 做 atomic claim。
+    1 block = 1 tree; 1 warp = 1 条遍历路径。
+    一次扫描拿到 best / runner-up, 只对 best edge 做 atomic claim。
     如果 atomic 返回的 old inflight 与扫描时一致，直接接受；否则
     用 runner-up 做冲突校验，必要时释放并重选。
     CAS-based expansion claim 避免重复扩展。
@@ -437,185 +515,171 @@ def _select_kernel_native(cpuct, c_pw, alpha_pw, virtual_loss,
     assert max_edge_steps >= 1
     assert n_nodes > 0
 
-    # final_node packs kind + expand_slot + node_id:
-    #   SEL_IN_PROGRESS = in progress (replaces done flag)
-    #   >= 0 = (kind << 22) | (expand_slot << 14) | node_id  on success
-    # expand_slot is the slot used for CAS lock on edge_inflight (SELECT_EXPAND only)
+    # 对 final_node 进行了压缩，包含了 当前结果类型(31-22) + expand_slot(21-14) + node_id(0-13)
+    #! 当节点状态是待扩展时，expand_slot指示了新的扩展节点的起始位置。
+    # TODO: 认为每一个 final_node 是对应一次扩展？还是写明需要扩展节点的数量？
     final_node = int32(SEL_IN_PROGRESS)
     final_len = int32(0)
 
-    attempt = int32(0)
 
-    while attempt < int32(MAX_SELECT_RETRY) and final_node == int32(SEL_IN_PROGRESS):
-        node = int32(0)      # start from root
-        depth = int32(0)
+    # TODO: 因为某些原因，单次尝试可能会失败，如多个节点同时进入扩展，此时再重试一次可能会走不同的路径。但是这样的代价值的商榷。
+    node = int32(0)      # start from root
+    depth = int32(0)
+    while True:
+        # 防御性编程: 节点的id值是无效值，或者大于最大节点数，认为是无效节点
+        if node < 0 or node >= n_nodes:
+            _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, int32(1))
+            cuda.syncwarp(FULL_MASK)
+            break
 
-        cuda.syncwarp(FULL_MASK)
+        # 终止态的节点
+        if node_status[tree, node] == NODE_STATUS_TERMINAL:
+            final_node = (int32(SELECT_TERMINAL) << int32(22)) | node
+            final_len = depth + int32(1)
+            break
+        
+        # TODO: 如果是超出步长的节点，需要考虑用 Value 网络重新估计节点价值
 
-        while True:
-            # 防御性编程: 节点的id值是无效值，或者大于最大节点数，认为是无效节点
-            if node < 0 or node >= n_nodes:
-                _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, virtual_loss)
+        cur_expanded = node_expanded[tree, node]
+        cur_expanded = max(0, min(max_edges, cur_expanded))     # 约束当前节点范围
+
+        # 聚合所有边的访问次数，得到节点的访问次数，用于
+        parent_n_eff = int32(0)
+        eid = lane
+        while eid < cur_expanded:
+            child = edge_child_id[tree, node, eid]
+            assert child >= 0 and child < n_nodes
+            parent_n_eff += edge_N[tree, node, eid] + edge_inflight[tree, node, eid]    # TODO. 这里的 inflight 也存在共同访问时没有自增的问题
+            eid += int32(WARP_SIZE)
+        parent_n_eff = max(_warp_reduce_sum(parent_n_eff), int32(1))
+
+        allowed = _allowed_children(c_pw, alpha_pw, parent_n_eff, max_edges)
+        need_expand = allowed - cur_expanded
+
+        # 渐进增长树，多个 warp 会同时对 edge_inflight 进行原子加法。如果是数量上未满足待扩展需求节点数量，即作为扩展节点
+        if need_expand > 0:
+            expand_offset = int32(-1)
+            if lane == 0:
+                expand_offset = cuda.atomic.add(edge_inflight, (tree, node, cur_expanded), int32(1))
+                if expand_offset >= need_expand:
+                    cuda.atomic.sub(edge_inflight, (tree, node, cur_expanded), int32(1))
+            #! 广播当前结果，让所有 lane 进入就绪状态
+            expand_offset = cuda.shfl_sync(FULL_MASK, expand_offset, 0)
+            if expand_offset >= need_expand:
+                final_node = (int32(SELECT_EXPAND) << int32(22)) | (cur_expanded+expand_offset << int32(14)) | node
+                final_len = depth + int32(1)
+            else:   # 扩展数量不允许进一步拓展，则退出
+                _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, int32(1))
                 cuda.syncwarp(FULL_MASK)
-                break
+            break
 
-            # 终止态的节点
-            if node_status[tree, node] == NODE_STATUS_TERMINAL:
-                final_node = (int32(SELECT_TERMINAL) << int32(22)) | node
-                final_len = depth + int32(1)
-                break
-            
-            # TODO: 如果是超出步长的节点，需要考虑用 Value 网络重新估计节点价值
+        # 达到最大步长时，当前节点不再扩展，为叶子节点
+        if depth >= max_edge_steps:
+            final_node = (int32(SELECT_DEPTH_LIMIT) << int32(22)) | node
+            final_len = depth + int32(1)
+            break
 
-            cur_expanded = node_expanded[tree, node]
-            if cur_expanded < 0:
-                cur_expanded = int32(0)
-            if cur_expanded > max_edges:
-                cur_expanded = max_edges
+        # 当渐宽树在完整扩展的情况下，会在已有的孩子边中选择一个最优动作的进行扩展
+        #! 存在一种情况是多个线程同时进入了一个node。因此需要在计算 value 时引入虚拟损失。
+        claimed = int32(0)
+        best_eid = int32(INT32_MAX)
+        best_child = int32(-1)
+        select_retry = int32(0)
 
-            # Compute parent_n_eff from edges (sum of edge_N + edge_inflight)
-            parent_n_eff = int32(0)
-            eid = lane
-            while eid < cur_expanded:
-                child = edge_child_id[tree, node, eid]
-                if child >= 0 and child < n_nodes:
-                    parent_n_eff += edge_N[tree, node, eid] + edge_inflight[tree, node, eid]
-                eid += int32(WARP_SIZE)
-            parent_n_eff = _warp_reduce_sum(parent_n_eff)
-            if parent_n_eff < 1:
-                parent_n_eff = int32(1)
-
-            allowed = _allowed_children(c_pw, alpha_pw, parent_n_eff, max_edges)
-
-            # Progressive widening: claim via edge_inflight atomic add (virtual_loss aware)
-            if cur_expanded < allowed:
-                claim_ok = int32(1)
-                if lane == 0:
-                    old = cuda.atomic.add(edge_inflight, (tree, node, cur_expanded), virtual_loss)
-                    if old != 0:
-                        claim_ok = int32(0)
-                        # Rollback: we didn't actually claim, remove our virtual_loss addition
-                        cuda.atomic.sub(edge_inflight, (tree, node, cur_expanded), virtual_loss)
-
-                claim_ok = cuda.shfl_sync(FULL_MASK, claim_ok, 0)
-
-                if claim_ok != 0:
-                    final_node = (int32(SELECT_EXPAND) << int32(22)) | (cur_expanded << int32(14)) | node
-                    final_len = depth + int32(1)
-                else:
-                    # Another warp already claimed this node — rollback and retry from root
-                    _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, virtual_loss)
-                    cuda.syncwarp(FULL_MASK)
-                break
-
-            # Path capacity hit — treat as depth-limit leaf
-            if depth >= max_edge_steps:
-                final_node = (int32(SELECT_DEPTH_LIMIT) << int32(22)) | node
-                final_len = depth + int32(1)
-                break
-
-            # Fully expanded under PW: PUCT selection among existing children.
-            # The hot path scans once to compute best + runner-up, then claims
-            # best. Only contention on best triggers a retry.
-            claimed = int32(0)
-            best_eid = int32(INT32_MAX)
-            best_child = int32(-1)
-            select_retry = int32(0)
-
-            while select_retry < int32(MAX_SELECT_RETRY) and claimed == int32(0):
-                if select_retry != int32(0):
-                    # First iteration reuses the parent_n_eff already computed
-                    # for progressive widening. Retries refresh it after
-                    # releasing a contended claim.
-                    parent_n_eff = int32(0)
-                    eid = lane
-                    while eid < cur_expanded:
-                        child = edge_child_id[tree, node, eid]
-                        if child >= 0 and child < n_nodes:
-                            parent_n_eff += edge_N[tree, node, eid] + edge_inflight[tree, node, eid]
-                        eid += int32(WARP_SIZE)
-                    parent_n_eff = _warp_reduce_sum(parent_n_eff)
-                    if parent_n_eff < 1:
-                        parent_n_eff = int32(1)
-                sqrt_parent_n_eff = math.sqrt(float32(parent_n_eff))
-
-                best_score = float32(NEG_INF_F32)
-                best_eid = int32(INT32_MAX)
-                best_child = int32(-1)
-                best_seen_inflight = int32(0)
-                alt_score = float32(NEG_INF_F32)
-                alt_eid = int32(INT32_MAX)
-
+        while select_retry < int32(MAX_SELECT_RETRY) and claimed == int32(0):
+            if select_retry != int32(0):
+                # First iteration reuses the parent_n_eff already computed
+                # for progressive widening. Retries refresh it after
+                # releasing a contended claim.
+                parent_n_eff = int32(0)
                 eid = lane
                 while eid < cur_expanded:
                     child = edge_child_id[tree, node, eid]
                     if child >= 0 and child < n_nodes:
-                        prior = edge_prior[tree, node, eid]
-                        w = edge_W[tree, node, eid]
-                        n_edge = edge_N[tree, node, eid]
-                        n_inflight = edge_inflight[tree, node, eid]
-
-                        score = _puct_score(cpuct, prior, w, n_edge, n_inflight, sqrt_parent_n_eff)
-
-                        best_score, best_eid, best_seen_inflight, alt_score, alt_eid = _top2_insert(
-                            score, int32(eid), n_inflight,
-                            best_score, best_eid, best_seen_inflight,
-                            alt_score, alt_eid,
-                        )
-
+                        parent_n_eff += edge_N[tree, node, eid] + edge_inflight[tree, node, eid]
                     eid += int32(WARP_SIZE)
+                parent_n_eff = _warp_reduce_sum(parent_n_eff)
+                if parent_n_eff < 1:
+                    parent_n_eff = int32(1)
+            sqrt_parent_n_eff = math.sqrt(float32(parent_n_eff))
 
-                best_score, best_eid, best_seen_inflight, alt_score, alt_eid = _warp_reduce_top2(
-                    best_score, best_eid, best_seen_inflight,
-                    alt_score, alt_eid,
-                )
+            best_score = float32(NEG_INF_F32)
+            best_eid = int32(INT32_MAX)
+            best_child = int32(-1)
+            best_seen_inflight = int32(0)
+            alt_score = float32(NEG_INF_F32)
+            alt_eid = int32(INT32_MAX)
 
-                if best_eid == int32(INT32_MAX):
-                    break
-                best_child = edge_child_id[tree, node, best_eid]
-                if best_child < 0 or best_child >= n_nodes:
-                    break
+            eid = lane
+            while eid < cur_expanded:
+                child = edge_child_id[tree, node, eid]
+                if child >= 0 and child < n_nodes:
+                    prior = edge_prior[tree, node, eid]
+                    w = edge_W[tree, node, eid]
+                    n_edge = edge_N[tree, node, eid]
+                    n_inflight = edge_inflight[tree, node, eid]
 
-                claimed_old = int32(0)
-                if lane == 0:
-                    claimed_old = cuda.atomic.add(edge_inflight, (tree, node, best_eid), virtual_loss)
-                claimed_old = cuda.shfl_sync(FULL_MASK, claimed_old, 0)
+                    score = _puct_score(cpuct, prior, w, n_edge, n_inflight, sqrt_parent_n_eff)
 
-                claimed_score = _puct_score(
-                    cpuct,
-                    edge_prior[tree, node, best_eid],
-                    edge_W[tree, node, best_eid],
-                    edge_N[tree, node, best_eid],
-                    claimed_old,
-                    sqrt_parent_n_eff,
-                )
+                    best_score, best_eid, best_seen_inflight, alt_score, alt_eid = _top2_insert(
+                        score, int32(eid), n_inflight,
+                        best_score, best_eid, best_seen_inflight,
+                        alt_score, alt_eid,
+                    )
 
-                if claimed_old != best_seen_inflight and _score_better(alt_score, alt_eid, claimed_score, best_eid):
-                    if lane == 0:
-                        cuda.atomic.sub(edge_inflight, (tree, node, best_eid), virtual_loss)
-                    select_retry += int32(1)
-                    cuda.syncwarp(FULL_MASK)
-                else:
-                    claimed = int32(1)
+                eid += int32(WARP_SIZE)
 
-            # No valid child found, or contention never settled — rollback and abort this attempt
-            if claimed == int32(0) or best_child < 0:
-                _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, virtual_loss)
-                cuda.syncwarp(FULL_MASK)
+            best_score, best_eid, best_seen_inflight, alt_score, alt_eid = _warp_reduce_top2(
+                best_score, best_eid, best_seen_inflight,
+                alt_score, alt_eid,
+            )
+
+            if best_eid == int32(INT32_MAX):
+                break
+            best_child = edge_child_id[tree, node, best_eid]
+            if best_child < 0 or best_child >= n_nodes:
                 break
 
-            parent = node
-
+            claimed_old = int32(0)
             if lane == 0:
-                out_path_eids[tree, wid, depth] = (parent << int32(8)) | best_eid
+                claimed_old = cuda.atomic.add(edge_inflight, (tree, node, best_eid), virtual_loss)
+            claimed_old = cuda.shfl_sync(FULL_MASK, claimed_old, 0)
 
+            claimed_score = _puct_score(
+                cpuct,
+                edge_prior[tree, node, best_eid],
+                edge_W[tree, node, best_eid],
+                edge_N[tree, node, best_eid],
+                claimed_old,
+                sqrt_parent_n_eff,
+            )
+
+            if claimed_old != best_seen_inflight and _score_better(alt_score, alt_eid, claimed_score, best_eid):
+                if lane == 0:
+                    cuda.atomic.sub(edge_inflight, (tree, node, best_eid), virtual_loss)
+                select_retry += int32(1)
+                cuda.syncwarp(FULL_MASK)
+            else:
+                claimed = int32(1)
+
+        # No valid child found, or contention never settled — rollback and abort this attempt
+        if claimed == int32(0) or best_child < 0:
+            _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, virtual_loss)
             cuda.syncwarp(FULL_MASK)
+            break
 
-            node = best_child
-            depth += int32(1)
+        parent = node
 
-        if final_node == int32(SEL_IN_PROGRESS):
-            attempt += int32(1)
+        if lane == 0:
+            out_path_eids[tree, wid, depth] = (parent << int32(8)) | best_eid
+
+        cuda.syncwarp(FULL_MASK)
+
+        node = best_child
+        depth += int32(1)
+
+    if final_node == int32(SEL_IN_PROGRESS):
+        attempt += int32(1)
 
     # Write final result (decode packed final_node)
     # Encoding: (kind << 22) | (expand_slot << 14) | node_id
@@ -632,6 +696,179 @@ def _select_kernel_native(cpuct, c_pw, alpha_pw, virtual_loss,
             out_selected_node[tree, wid] = int32(SEL_INVALID_NODE)
             out_selected_kind[tree, wid] = int32(SELECT_INVALID)
             out_path_len[tree, wid] = int32(0)
+
+
+# @cuda.jit(void(float32, float32, float32, int32,
+#                    int32[:, :, :], float32[:, :, :], float32[:, :, :], int32[:, :, :], int32[:, :, :],
+#                    int32[:, :], int32[:, :],
+#                    int32[:, :], int32[:, :], int32[:, :, :], int32[:, :]))
+# def _select_kernel_preclaim(cpuct, c_pw, alpha_pw, virtual_loss,
+#                             edge_child_id, edge_prior, edge_W, edge_N, edge_inflight,
+#                             node_status, node_expanded,
+#                             out_selected_node, out_selected_kind,
+#                             out_path_eids, out_path_len):
+#     """
+#     Experimental selector for A/B comparison.
+
+#     Fully-expanded nodes use candidate pre-claim:
+#       1. each lane atomically adds virtual_loss to every candidate it scores
+#       2. score uses the atomic old inflight value
+#       3. warp keeps only the winning edge's claim and rolls back other claims
+
+#     This matches the "atomic before value/score" idea directly. It is kept as
+#     a separate kernel so the top2-retry native selector remains available.
+#     """
+#     tree = cuda.blockIdx.x
+#     tid = cuda.threadIdx.x
+#     lane = tid & int32(31)
+#     wid = tid >> int32(5)
+
+#     if tree >= out_selected_node.shape[0]:
+#         return
+
+#     warp_count = cuda.blockDim.x >> int32(5)
+#     active_warps = min(warp_count, out_selected_node.shape[1])
+#     if wid >= active_warps:
+#         return
+
+#     if lane == 0:
+#         out_selected_node[tree, wid] = int32(SEL_INVALID_NODE)
+#         out_selected_kind[tree, wid] = int32(SELECT_INVALID)
+#         out_path_len[tree, wid] = int32(0)
+
+#     max_edges = edge_child_id.shape[2]
+#     max_edge_steps = out_path_eids.shape[2]
+#     n_nodes = node_status.shape[1]
+#     assert max_edge_steps >= 1
+#     assert n_nodes > 0
+
+#     final_node = int32(SEL_IN_PROGRESS)
+#     final_len = int32(0)
+
+#     attempt = int32(0)
+
+#     while attempt < int32(MAX_SELECT_RETRY) and final_node == int32(SEL_IN_PROGRESS):
+#         node = int32(0)
+#         depth = int32(0)
+
+#         cuda.syncwarp(FULL_MASK)
+
+#         while True:
+#             if node < 0 or node >= n_nodes:
+#                 _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, virtual_loss)
+#                 cuda.syncwarp(FULL_MASK)
+#                 break
+
+#             if node_status[tree, node] == NODE_STATUS_TERMINAL:
+#                 final_node = (int32(SELECT_TERMINAL) << int32(22)) | node
+#                 final_len = depth + int32(1)
+#                 break
+
+#             cur_expanded = node_expanded[tree, node]
+#             if cur_expanded < 0:
+#                 cur_expanded = int32(0)
+#             if cur_expanded > max_edges:
+#                 cur_expanded = max_edges
+
+#             parent_n_eff = int32(0)
+#             eid = lane
+#             while eid < cur_expanded:
+#                 child = edge_child_id[tree, node, eid]
+#                 if child >= 0 and child < n_nodes:
+#                     parent_n_eff += edge_N[tree, node, eid] + edge_inflight[tree, node, eid]
+#                 eid += int32(WARP_SIZE)
+#             parent_n_eff = _warp_reduce_sum(parent_n_eff)
+#             if parent_n_eff < 1:
+#                 parent_n_eff = int32(1)
+
+#             allowed = _allowed_children(c_pw, alpha_pw, parent_n_eff, max_edges)
+
+#             if cur_expanded < allowed:
+#                 claim_ok = int32(1)
+#                 if lane == 0:
+#                     old = cuda.atomic.add(edge_inflight, (tree, node, cur_expanded), virtual_loss)
+#                     if old != 0:
+#                         claim_ok = int32(0)
+#                         cuda.atomic.sub(edge_inflight, (tree, node, cur_expanded), virtual_loss)
+
+#                 claim_ok = cuda.shfl_sync(FULL_MASK, claim_ok, 0)
+
+#                 if claim_ok != 0:
+#                     final_node = (int32(SELECT_EXPAND) << int32(22)) | (cur_expanded << int32(14)) | node
+#                     final_len = depth + int32(1)
+#                 else:
+#                     _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, virtual_loss)
+#                     cuda.syncwarp(FULL_MASK)
+#                 break
+
+#             if depth >= max_edge_steps:
+#                 final_node = (int32(SELECT_DEPTH_LIMIT) << int32(22)) | node
+#                 final_len = depth + int32(1)
+#                 break
+
+#             sqrt_parent_n_eff = math.sqrt(float32(parent_n_eff))
+#             rotation = wid % cur_expanded
+#             best_score = float32(NEG_INF_F32)
+#             best_eid = int32(INT32_MAX)
+#             best_child = int32(-1)
+
+#             eid = lane
+#             while eid < cur_expanded:
+#                 child = edge_child_id[tree, node, eid]
+#                 if child >= 0 and child < n_nodes:
+#                     prior = edge_prior[tree, node, eid]
+#                     w = edge_W[tree, node, eid]
+#                     n_edge = edge_N[tree, node, eid]
+#                     old_inflight = cuda.atomic.add(edge_inflight, (tree, node, eid), virtual_loss)
+#                     score = _puct_score(cpuct, prior, w, n_edge, old_inflight, sqrt_parent_n_eff)
+
+#                     if _score_better_rotated(score, int32(eid), best_score, best_eid, rotation, cur_expanded):
+#                         best_score = score
+#                         best_eid = int32(eid)
+#                         best_child = child
+
+#                 eid += int32(WARP_SIZE)
+
+#             best_score, best_eid, best_child = _warp_reduce_best_rotated(
+#                 best_score, best_eid, best_child, rotation, cur_expanded,
+#             )
+
+#             eid = lane
+#             while eid < cur_expanded:
+#                 child = edge_child_id[tree, node, eid]
+#                 if child >= 0 and child < n_nodes and int32(eid) != best_eid:
+#                     cuda.atomic.sub(edge_inflight, (tree, node, eid), virtual_loss)
+#                 eid += int32(WARP_SIZE)
+
+#             if best_child < 0:
+#                 _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, virtual_loss)
+#                 cuda.syncwarp(FULL_MASK)
+#                 break
+
+#             parent = node
+#             if lane == 0:
+#                 out_path_eids[tree, wid, depth] = (parent << int32(8)) | best_eid
+
+#             cuda.syncwarp(FULL_MASK)
+
+#             node = best_child
+#             depth += int32(1)
+
+#         if final_node == int32(SEL_IN_PROGRESS):
+#             attempt += int32(1)
+
+#     if lane == 0:
+#         if final_node >= 0:
+#             kind = final_node >> int32(22)
+#             expand_slot = (final_node >> int32(14)) & int32(0xFF)
+#             node_id = final_node & int32(0x3FFF)
+#             out_selected_node[tree, wid] = node_id
+#             out_selected_kind[tree, wid] = kind | (expand_slot << int32(4))
+#             out_path_len[tree, wid] = final_len
+#         else:
+#             out_selected_node[tree, wid] = int32(SEL_INVALID_NODE)
+#             out_selected_kind[tree, wid] = int32(SELECT_INVALID)
+#             out_path_len[tree, wid] = int32(0)
 
 
 # ============================================================
