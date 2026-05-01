@@ -10,10 +10,19 @@
 #   bash run_puct_tests.sh --perf           # performance benchmarks + stress tests
 #   bash run_puct_tests.sh --perf --bench-only   # benchmarks only (no stress)
 #   bash run_puct_tests.sh --perf --stress-only  # stress only (no benchmarks)
+#   bash run_puct_tests.sh --v2             # puct_gpu_v2 kernel corner cases
+#   bash run_puct_tests.sh --v2-stress      # puct_gpu_v2 stress matrix
+#   bash run_puct_tests.sh --v2-bench       # puct_gpu_v2 select experiment metrics
+#   bash run_puct_tests.sh --v2-scale-bench # puct_gpu_v2 4096..16384 tree deep-wide benchmark
+#   bash run_puct_tests.sh --v2-cpu-ref     # puct_gpu_v2 CPU parallel reference comparison
+#   bash run_puct_tests.sh --v2-cpu-bench   # puct_gpu_v2 CPU sequential vs GPU select benchmark
+#   bash run_puct_tests.sh --v2-cpu-scale-bench # CPU sequential vs GPU 4096..16384 aligned subset
+#   bash run_puct_tests.sh --v2-gpu-long-stress # GPU long-run scale stress + nvidia-smi telemetry
+#   bash run_puct_tests.sh --v2-gpu-long-stress-smoke # short validation for long stress path
 #   bash run_puct_tests.sh --all            # ALL suites in sequence
 #
 # Environment:
-#   - Python   : py311_numba conda env (Numba 0.65 + torch 2.5.1 + CUDA 12.4)
+#   - Python   : set PUCT_TEST_PY to override; otherwise use py312_numba or PATH python
 #   - LD_LIBRARY_PATH : includes torch/lib for libcuda sharing
 #   - NUMBA_DISABLE_PERFORMANCE_WARNINGS=1
 #   - NUMBA_CACHE_DIR : avoids repeated JIT recompilation
@@ -22,12 +31,22 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-VENV_PY="/home/robomaster/anaconda3/envs/py311_numba/bin/python"
+DEFAULT_PY="/home/robomaster/anaconda3/envs/py312_numba/bin/python"
+if [ -n "${PUCT_TEST_PY:-}" ]; then
+    VENV_PY="$PUCT_TEST_PY"
+elif [ -x "$DEFAULT_PY" ]; then
+    VENV_PY="$DEFAULT_PY"
+else
+    VENV_PY="$(command -v python)"
+fi
 
-# Use torch lib from py311_numba env so Numba shares the same libcuda
-TORCH_LIB="/home/robomaster/anaconda3/envs/py311_numba/lib/python3.11/site-packages/torch/lib"
+# Use torch lib from the selected conda env when present so Numba shares libcuda.
+PY_PREFIX="$("$VENV_PY" -c 'import sys; print(sys.prefix)')"
+TORCH_LIB="$PY_PREFIX/lib/python$("$VENV_PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')/site-packages/torch/lib"
 
-export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH}"
+if [ -d "$TORCH_LIB" ]; then
+    export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH}"
+fi
 export NUMBA_DISABLE_PERFORMANCE_WARNINGS=1
 export NUMBA_CACHE_DIR="$PROJECT_ROOT/.numba_cache"
 
@@ -91,6 +110,51 @@ elif [ "$1" = "--perf" ]; then
         fi
     fi
 
+elif [ "$1" = "--v2" ]; then
+    echo "  Mode   : puct_gpu_v2 kernel corner cases"
+    echo "================================================================"
+    exec "$VENV_PY" "$SCRIPT_DIR/test_puct_gpu_v2.py"
+
+elif [ "$1" = "--v2-stress" ]; then
+    echo "  Mode   : puct_gpu_v2 stress matrix"
+    echo "================================================================"
+    exec "$VENV_PY" "$SCRIPT_DIR/test_puct_gpu_v2.py" --stress
+
+elif [ "$1" = "--v2-bench" ]; then
+    echo "  Mode   : puct_gpu_v2 select experiment metrics"
+    echo "================================================================"
+    exec "$VENV_PY" "$SCRIPT_DIR/test_puct_gpu_v2.py" --bench
+
+elif [ "$1" = "--v2-scale-bench" ]; then
+    echo "  Mode   : puct_gpu_v2 large-scale deep-wide benchmark"
+    echo "================================================================"
+    exec "$VENV_PY" "$SCRIPT_DIR/test_puct_gpu_v2.py" --scale-bench
+
+elif [ "$1" = "--v2-cpu-ref" ]; then
+    echo "  Mode   : puct_gpu_v2 CPU parallel reference comparison"
+    echo "================================================================"
+    exec "$VENV_PY" "$SCRIPT_DIR/test_puct_gpu_v2_cpu_ref.py"
+
+elif [ "$1" = "--v2-cpu-bench" ]; then
+    echo "  Mode   : puct_gpu_v2 CPU sequential vs GPU select benchmark"
+    echo "================================================================"
+    exec "$VENV_PY" "$SCRIPT_DIR/test_puct_gpu_v2.py" --cpu-bench
+
+elif [ "$1" = "--v2-cpu-scale-bench" ]; then
+    echo "  Mode   : puct_gpu_v2 CPU sequential vs GPU large-scale aligned benchmark"
+    echo "================================================================"
+    exec "$VENV_PY" "$SCRIPT_DIR/test_puct_gpu_v2.py" --cpu-scale-bench
+
+elif [ "$1" = "--v2-gpu-long-stress" ]; then
+    echo "  Mode   : puct_gpu_v2 GPU long-run scale stress + nvidia-smi telemetry"
+    echo "================================================================"
+    exec "$VENV_PY" "$SCRIPT_DIR/test_puct_gpu_v2.py" --gpu-long-stress
+
+elif [ "$1" = "--v2-gpu-long-stress-smoke" ]; then
+    echo "  Mode   : puct_gpu_v2 GPU long-run telemetry smoke"
+    echo "================================================================"
+    exec "$VENV_PY" "$SCRIPT_DIR/test_puct_gpu_v2.py" --gpu-long-stress-smoke
+
 elif [ "$1" = "--all" ]; then
     echo "  Mode   : ALL test suites"
     echo "================================================================"
@@ -121,7 +185,13 @@ elif [ "$1" = "--all" ]; then
 
     echo ""
     echo "════════════════════════════════════════════════════════════════"
-    echo "  [5/5] Performance Benchmarks & Stress Tests"
+    echo "  [5/6] PUCT GPU v2 Kernel Tests"
+    echo "════════════════════════════════════════════════════════════════"
+    "$VENV_PY" "$SCRIPT_DIR/test_puct_gpu_v2.py"
+
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  [6/6] Performance Benchmarks & Stress Tests"
     echo "════════════════════════════════════════════════════════════════"
     "$VENV_PY" "$SCRIPT_DIR/test_puct_gpu_perf.py"
 

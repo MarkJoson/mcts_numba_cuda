@@ -328,3 +328,5 @@ __pycache__
 
 *.pdf
 *.gif
+*.nbi
+*.nbc
