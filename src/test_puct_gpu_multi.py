@@ -33,7 +33,7 @@ try:
 except ImportError:
     pass
 
-from puct_gpu import PUCTGpu
+from puct.puct_gpu import PUCTGpu
 
 class UniformPolicyNet(nn.Module):
     """Fallback uniform policy net for benchmark."""

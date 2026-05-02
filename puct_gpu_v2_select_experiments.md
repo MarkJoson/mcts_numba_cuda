@@ -290,8 +290,15 @@ node_id     = raw & 0x3FFF
 重要约束：
 
 - `node_id < 16384`
+- `node_count[tree]` 是每棵树的有效 node 上界；合法 node 范围为
+  `[0, node_count[tree])`
+- `node_count[tree] <= node array capacity` 且 `node_count[tree] <= 16384`
 - `max_actions <= 256`
 - path edge 编码为 `(parent << 8) | slot`
+
+`node_expanded.shape[1]` 只表示数组容量，不再作为逻辑有效节点数。select、
+rollback、backup 中 child 合法性统一检查 `child < node_count[tree]`。这样动态树
+可以预分配大容量，但不会把尚未分配的 node slot 当作 fresh leaf。
 
 新增的 kernel-level 测试位于 `src/test_puct_gpu_v2.py`，运行方式：
 
@@ -312,11 +319,25 @@ bash src/run_puct_tests.sh --v2-cpu-scale-bench
 - fresh root expand claim/release
 - terminal root
 - invalid child/node rollback
+- child id 超过 per-tree `node_count` 时 invalid 且 rollback
 - progressive widening 多 warp slot claim
 - fully-expanded select + backup roundtrip
 - depth limit
-- packing boundary: 256 actions 可用，257 invalid
+- packing boundary: 256 actions 可用，257 invalid；容量可以超过 16384，但
+  `node_count > 16384` invalid
 - deep tree stress: depth 16/64/128/256/512/1024，窄树和宽树
+
+`node_count` 改动后的验证：
+
+```text
+bash src/run_puct_tests.sh --v2
+bash src/run_puct_tests.sh --v2-stress
+bash src/run_puct_tests.sh --v2-bench
+```
+
+结果均通过。性能上，每个 warp 由 lane0 读取一次 `node_count[tree]`，再用
+`shfl_sync` 广播为寄存器标量参与 child 边界判断；热路径没有为每条候选边增加
+额外全局访存。
 
 ## 已删除的 Winner-only 历史实验
 

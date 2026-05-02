@@ -26,7 +26,7 @@ except Exception:
 
 import numpy as np
 import torch.nn as nn
-from puct_gpu import PUCTGpu
+from puct.puct_gpu import PUCTGpu
 
 
 # ════════════════════════════════════════════════════════════════════════════

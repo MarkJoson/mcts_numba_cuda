@@ -58,7 +58,7 @@ except Exception:
 from numba import cuda
 from numba import int8, int16, int32, int64, float32
 
-from puct_gpu_kernels import (
+from puct.puct_gpu_kernels import (
     _reset_puct,
     _select_puct,
     _extract_leaf_states,
@@ -69,7 +69,7 @@ from puct_gpu_kernels import (
     _reduce_over_trees_puct,
     _reduce_over_actions_puct,
 )
-from puct_gpu_nn_bridge import NumbaPytorchBridge
+from puct.puct_gpu_nn_bridge import NumbaPytorchBridge
 
 __version__ = "0.1.0"
 __author__ = "Antigravity / GPU PUCT Migration"

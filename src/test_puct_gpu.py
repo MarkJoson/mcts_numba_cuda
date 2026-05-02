@@ -53,9 +53,9 @@ from numba import cuda
 import os
 sys.path.insert(0, os.path.dirname(__file__))
 
-from puct_gpu_nn_bridge import NumbaPytorchBridge
-from puct_gpu import PUCTGpu
-from puct_gpu_kernels import (
+from puct.puct_gpu_nn_bridge import NumbaPytorchBridge
+from puct.puct_gpu import PUCTGpu
+from puct.puct_gpu_kernels import (
     _reset_puct,
     _select_puct,
     _extract_leaf_states,

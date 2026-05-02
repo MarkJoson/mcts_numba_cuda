@@ -52,7 +52,7 @@ except Exception:
     pass
 
 sys.path.insert(0, os.path.dirname(__file__))
-from puct_gpu import PUCTGpu
+from puct.puct_gpu import PUCTGpu
 
 # ── Mode flags ────────────────────────────────────────────────────────────────
 BENCH_ONLY  = "--bench-only"  in sys.argv
@@ -270,7 +270,7 @@ def bench_4_phase_timing():
     print("\n  BENCH-4: Phase-level timing breakdown")
     print("  " + "-" * 62)
 
-    from puct_gpu_kernels import (
+    from puct.puct_gpu_kernels import (
         _reset_puct, _select_puct, _extract_leaf_states,
         _prepare_expansion_puct, _commit_expansion_and_backup_puct,
     )

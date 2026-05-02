@@ -57,7 +57,7 @@ from numba import cuda
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from puct_gpu import PUCTGpu
+from puct.puct_gpu import PUCTGpu
 
 # ════════════════════════════════════════════════════════════════════════════
 # Shared neural-network stubs

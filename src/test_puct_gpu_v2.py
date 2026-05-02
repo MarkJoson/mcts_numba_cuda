@@ -65,7 +65,7 @@ if getattr(config, "ENABLE_CUDASIM", False):
     skip_all("CUDA simulator does not implement the warp intrinsics used here")
 
 sys.path.insert(0, os.path.dirname(__file__))
-import puct_gpu_v2 as v2  # noqa: E402
+import puct.puct_gpu_v2 as v2  # noqa: E402
 
 
 def decode(raw: int):
@@ -83,6 +83,7 @@ def make_case(trees=1, nodes=4, actions=4, warps=1, path_depth=4):
     node_inflight = np.zeros((trees, nodes), np.int32)
     node_expand_inflight = np.zeros((trees, nodes), np.int32)
     node_expanded = np.zeros((trees, nodes), np.int32)
+    node_count = np.full((trees,), nodes, np.int32)
     out_selected = np.full((trees, warps), v2.PACKED_INVALID, np.int32)
     out_path = np.full((trees, warps, path_depth), -1, np.int32)
     out_len = np.zeros((trees, warps), np.int32)
@@ -95,6 +96,7 @@ def make_case(trees=1, nodes=4, actions=4, warps=1, path_depth=4):
         "node_inflight": node_inflight,
         "node_expand_inflight": node_expand_inflight,
         "node_expanded": node_expanded,
+        "node_count": node_count,
         "out_selected": out_selected,
         "out_path": out_path,
         "out_len": out_len,
@@ -156,6 +158,7 @@ def _init_deep_chain_edges_kernel(
     node_inflight,
     node_expand_inflight,
     node_expanded,
+    node_count,
 ):
     idx = cuda.grid(1)
     stride = cuda.gridsize(1)
@@ -176,6 +179,8 @@ def _init_deep_chain_edges_kernel(
         if action == 0:
             node_inflight[tree, node] = 0
             node_expand_inflight[tree, node] = 0
+            if node == 0:
+                node_count[tree] = nodes
             if unique_wide != 0:
                 node_expanded[tree, node] = fanout
             elif node < tree_depth:
@@ -263,6 +268,7 @@ def make_deep_chain_case_device(
         "node_inflight": cuda.device_array((trees, nodes), np.int32),
         "node_expand_inflight": cuda.device_array((trees, nodes), np.int32),
         "node_expanded": cuda.device_array((trees, nodes), np.int32),
+        "node_count": cuda.device_array((trees,), np.int32),
         "out_selected": cuda.device_array((trees, warps), np.int32),
         "out_path": cuda.device_array((trees, warps, max(1, tree_depth)), np.int32),
         "out_len": cuda.device_array((trees, warps), np.int32),
@@ -288,6 +294,7 @@ def make_deep_chain_case_device(
         d["node_inflight"],
         d["node_expand_inflight"],
         d["node_expanded"],
+        d["node_count"],
     )
     _init_select_outputs_kernel[out_blocks, threads](
         np.int32(v2.PACKED_INVALID),
@@ -320,6 +327,7 @@ def launch_select(d, cpuct=1.0, c_pw=1.0, alpha_pw=0.5, variant=VARIANT_PRECLAIM
             d["node_inflight"],
             d["node_expand_inflight"],
             d["node_expanded"],
+            d["node_count"],
             d["out_selected"],
             d["out_path"],
             d["out_len"],
@@ -336,6 +344,7 @@ def launch_select(d, cpuct=1.0, c_pw=1.0, alpha_pw=0.5, variant=VARIANT_PRECLAIM
             d["node_inflight"],
             d["node_expand_inflight"],
             d["node_expanded"],
+            d["node_count"],
             d["out_selected"],
             d["out_path"],
             d["out_len"],
@@ -497,6 +506,7 @@ def launch_backup(dcase, trees=None, warps=None, virtual_loss=1):
         dcase["edge_n"],
         dcase["node_inflight"],
         dcase["node_expand_inflight"],
+        dcase["node_count"],
         dcase["out_selected"],
         dcase["out_path"],
         dcase["out_len"],
@@ -1037,6 +1047,18 @@ def test_invalid_child_rolls_back_path():
     record("invalid child node rolls back selected path virtual loss", ok)
 
 
+def test_child_beyond_node_count_invalid():
+    case = make_case(nodes=4, actions=4, path_depth=3)
+    case["node_count"][0] = 2
+    case["node_expanded"][0, 0] = 1
+    case["edge_child"][0, 0, 0] = 3
+    case["edge_n"][0, 0, 0] = 1
+    _, h = run_select(case)
+    kind, _, _ = decode(int(h["out_selected"][0, 0]))
+    ok = kind == v2.SELECT_INVALID and host_inflight_sum(h) == 0
+    record("child id beyond per-tree node_count is invalid", ok)
+
+
 def test_progressive_widening_multi_warp_claims_unique_slots():
     case = make_case(nodes=3, actions=4, warps=4, path_depth=2)
     case["node_expanded"][0, 0] = 1
@@ -1130,12 +1152,18 @@ def test_encoding_boundaries():
     _, h_nodes = run_select(case_nodes)
     kind_nodes, _, _ = decode(int(h_nodes["out_selected"][0, 0]))
 
+    case_capacity = make_case(nodes=v2.PACKED_NODE_LIMIT + 1, actions=4, path_depth=2)
+    case_capacity["node_count"][0] = v2.PACKED_NODE_LIMIT
+    _, h_capacity = run_select(case_capacity)
+    kind_capacity, _, _ = decode(int(h_capacity["out_selected"][0, 0]))
+
     ok = (
         kind_256 == v2.SELECT_EXPAND
         and kind_257 == v2.SELECT_INVALID
         and kind_nodes == v2.SELECT_INVALID
+        and kind_capacity == v2.SELECT_EXPAND
     )
-    record("packing boundaries: 256 actions ok, larger encodings invalid", ok)
+    record("packing boundaries: 256 actions ok, node_count gates packed node ids", ok)
 
 
 def test_v2_stress():
@@ -1161,7 +1189,7 @@ def test_v2_stress():
                 launch_select(d, c_pw=1.0, variant=VARIANT_PRECLAIM)
                 v2._backup_kernel_native[trees, warps * v2.WARP_SIZE](
                     np.int32(1), d["edge_child"], d["edge_w"], d["edge_n"],
-                    d["node_inflight"], d["node_expand_inflight"],
+                    d["node_inflight"], d["node_expand_inflight"], d["node_count"],
                     d["out_selected"], d["out_path"], d["out_len"], d["path_values"],
                 )
             cuda.synchronize()
@@ -1966,6 +1994,7 @@ def main():
     test_fresh_root_expand_roundtrip()
     test_terminal_root()
     test_invalid_child_rolls_back_path()
+    test_child_beyond_node_count_invalid()
     test_progressive_widening_multi_warp_claims_unique_slots()
     test_fully_expanded_select_and_backup_roundtrip()
     test_depth_limit()
