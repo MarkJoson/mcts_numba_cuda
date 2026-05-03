@@ -1,22 +1,24 @@
 """
-Kernel-level tests and select-only experiments for puct_gpu_v2.py.
+Kernel-level tests and select-only experiments for puct_gpu_v3.py.
 
 Usage:
-    python test_puct_gpu_v2.py
-    python test_puct_gpu_v2.py --stress
-    python test_puct_gpu_v2.py --bench
-    python test_puct_gpu_v2.py --cpu-scale-bench
-    python test_puct_gpu_v2.py --gpu-long-stress
-    python test_puct_gpu_v2.py --gpu-long-stress-smoke
+    python test_puct_gpu_v3.py
+    python test_puct_gpu_v3.py --stress
+    python test_puct_gpu_v3.py --bench
+    python test_puct_gpu_v3.py --scale-bench
+    python test_puct_gpu_v3.py --cpu-bench
+    python test_puct_gpu_v3.py --cpu-scale-bench
+    python test_puct_gpu_v3.py --gpu-long-stress
+    python test_puct_gpu_v3.py --gpu-long-stress-smoke
 """
 
-import os
-import sys
 import gc
-import time
+import os
 import shutil
 import subprocess
+import sys
 import threading
+import time
 
 import numpy as np
 from numba import config
@@ -35,14 +37,11 @@ RUN_CPU_BENCH = "--cpu-bench" in sys.argv
 RUN_CPU_SCALE_BENCH = "--cpu-scale-bench" in sys.argv
 RUN_GPU_LONG_STRESS_SMOKE = "--gpu-long-stress-smoke" in sys.argv
 RUN_GPU_LONG_STRESS = "--gpu-long-stress" in sys.argv or RUN_GPU_LONG_STRESS_SMOKE
+
 results: list[tuple[str, bool]] = []
 
-VARIANT_PRECLAIM = "preclaim"
 VARIANT_WINNER_RECALC = "winner_recalc"
-SELECT_VARIANTS = [
-    VARIANT_PRECLAIM,
-    VARIANT_WINNER_RECALC,
-]
+SELECT_VARIANTS = [VARIANT_WINNER_RECALC]
 
 
 def record(name: str, ok: bool, detail: str = ""):
@@ -55,7 +54,7 @@ def record(name: str, ok: bool, detail: str = ""):
 
 
 def skip_all(reason: str):
-    print(f"{SKIP_MARK}  puct_gpu_v2 CUDA tests  ({reason})")
+    print(f"{SKIP_MARK}  puct_gpu_v3 CUDA tests  ({reason})")
     sys.exit(0)
 
 
@@ -65,13 +64,13 @@ if getattr(config, "ENABLE_CUDASIM", False):
     skip_all("CUDA simulator does not implement the warp intrinsics used here")
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-import puct.puct_gpu_v2 as v2  # noqa: E402
+import puct.puct_gpu_v3 as v3  # noqa: E402
 
 
 def decode(raw: int):
-    kind = raw >> v2.PACKED_KIND_SHIFT
-    slot = (raw >> v2.PACKED_SLOT_SHIFT) & v2.PACKED_EDGE_MASK
-    node = raw & v2.PACKED_NODE_MASK
+    kind = (raw >> v3.PACKED_KIND_SHIFT) & v3.PACKED_KIND_MASK
+    slot = (raw >> v3.PACKED_SLOT_SHIFT) & v3.PACKED_EDGE_MASK
+    node = raw & v3.PACKED_NODE_MASK
     return int(kind), int(slot), int(node)
 
 
@@ -80,27 +79,25 @@ def make_case(trees=1, nodes=4, actions=4, warps=1, path_depth=4):
     edge_prior = np.ones((trees, nodes, actions), np.float32)
     edge_w = np.zeros((trees, nodes, actions), np.float32)
     edge_n = np.zeros((trees, nodes, actions), np.int32)
-    node_inflight = np.zeros((trees, nodes), np.int32)
+    edge_inflight = np.zeros((trees, nodes, actions), np.int32)
     node_expand_inflight = np.zeros((trees, nodes), np.int32)
     node_expanded = np.zeros((trees, nodes), np.int32)
     node_count = np.full((trees,), nodes, np.int32)
-    out_selected = np.full((trees, warps), v2.PACKED_INVALID, np.int32)
-    out_path = np.full((trees, warps, path_depth), -1, np.int32)
+    out_selected = np.full((trees, warps), v3.PACKED_INVALID, np.int32)
+    out_path = np.full((trees, warps, max(1, path_depth)), -1, np.int32)
     out_len = np.zeros((trees, warps), np.int32)
-    path_values = np.zeros((trees, warps, path_depth), np.float32)
     return {
         "edge_child": edge_child,
         "edge_prior": edge_prior,
         "edge_w": edge_w,
         "edge_n": edge_n,
-        "node_inflight": node_inflight,
+        "edge_inflight": edge_inflight,
         "node_expand_inflight": node_expand_inflight,
         "node_expanded": node_expanded,
         "node_count": node_count,
         "out_selected": out_selected,
         "out_path": out_path,
         "out_len": out_len,
-        "path_values": path_values,
         "warps": warps,
         "trees": trees,
     }
@@ -155,7 +152,7 @@ def _init_deep_chain_edges_kernel(
     edge_prior,
     edge_w,
     edge_n,
-    node_inflight,
+    edge_inflight,
     node_expand_inflight,
     node_expanded,
     node_count,
@@ -176,8 +173,8 @@ def _init_deep_chain_edges_kernel(
         edge_prior[tree, node, action] = 2.0 if legal and action == 0 and prior_mode == 1 else 1.0
         edge_w[tree, node, action] = 0.0
         edge_n[tree, node, action] = 1 if legal else 0
+        edge_inflight[tree, node, action] = 0
         if action == 0:
-            node_inflight[tree, node] = 0
             node_expand_inflight[tree, node] = 0
             if node == 0:
                 node_count[tree] = nodes
@@ -193,7 +190,7 @@ def _init_deep_chain_edges_kernel(
 
 
 @cuda.jit
-def _init_select_outputs_kernel(packed_invalid, out_selected, out_path, out_len, path_values):
+def _init_select_outputs_kernel(packed_invalid, out_selected, out_path, out_len):
     idx = cuda.grid(1)
     stride = cuda.gridsize(1)
     total_path = out_path.size
@@ -203,7 +200,6 @@ def _init_select_outputs_kernel(packed_invalid, out_selected, out_path, out_len,
         warp = rem // out_path.shape[2]
         depth = rem - warp * out_path.shape[2]
         out_path[tree, warp, depth] = -1
-        path_values[tree, warp, depth] = 0.0
         idx += stride
 
     idx = cuda.grid(1)
@@ -217,7 +213,7 @@ def _init_select_outputs_kernel(packed_invalid, out_selected, out_path, out_len,
 
 
 @cuda.jit
-def _check_inflight_kernel(inflight, stats):
+def _check_inflight_2d_kernel(inflight, stats):
     idx = cuda.grid(1)
     stride = cuda.gridsize(1)
     total = inflight.size
@@ -233,6 +229,87 @@ def _check_inflight_kernel(inflight, stats):
         idx += stride
 
 
+@cuda.jit
+def _check_inflight_3d_kernel(inflight, stats):
+    idx = cuda.grid(1)
+    stride = cuda.gridsize(1)
+    total = inflight.size
+    edges = inflight.shape[2]
+    nodes = inflight.shape[1]
+    while idx < total:
+        action = idx % edges
+        rem = idx // edges
+        node = rem % nodes
+        tree = rem // nodes
+        val = inflight[tree, node, action]
+        if val < 0:
+            cuda.atomic.add(stats, 0, 1)
+        if val != 0:
+            cuda.atomic.add(stats, 1, 1)
+        idx += stride
+
+
+@cuda.jit
+def _release_claims_kernel(
+    virtual_loss,
+    edge_inflight,
+    node_expand_inflight,
+    node_count,
+    out_selected,
+    out_path,
+    out_len,
+):
+    tree = cuda.blockIdx.x
+    lane = cuda.threadIdx.x & np.int32(31)
+    wid = cuda.threadIdx.x >> np.int32(5)
+
+    if tree >= out_selected.shape[0]:
+        return
+    if wid >= min(cuda.blockDim.x >> np.int32(5), out_selected.shape[1]):
+        return
+
+    node_limit = np.int32(0)
+    if lane == np.int32(0):
+        node_limit = node_count[tree]
+    node_limit = cuda.shfl_sync(v3.FULL_MASK, node_limit, 0)
+    if node_limit <= np.int32(0) or node_limit > edge_inflight.shape[1]:
+        return
+
+    raw_selected = out_selected[tree, wid]
+    if raw_selected < np.int32(0):
+        return
+
+    kind = (raw_selected >> np.int32(v3.PACKED_KIND_SHIFT)) & np.int32(v3.PACKED_KIND_MASK)
+    if kind == np.int32(v3.SELECT_INVALID) or kind == np.int32(v3.SELECT_BUSY):
+        return
+
+    plen = out_len[tree, wid]
+    if plen <= np.int32(0):
+        return
+
+    edge_count = plen - np.int32(1)
+    max_edges = edge_inflight.shape[2]
+    d = lane
+    while d < edge_count:
+        encoded = out_path[tree, wid, d]
+        if encoded >= np.int32(0):
+            parent = encoded >> np.int32(8)
+            slot = encoded & np.int32(0xFF)
+            if (
+                parent >= np.int32(0)
+                and parent < node_limit
+                and slot >= np.int32(0)
+                and slot < max_edges
+            ):
+                cuda.atomic.sub(edge_inflight, (tree, parent, slot), virtual_loss)
+        d += np.int32(v3.WARP_SIZE)
+
+    if lane == np.int32(0) and kind == np.int32(v3.SELECT_EXPAND):
+        leaf = raw_selected & np.int32(v3.PACKED_NODE_MASK)
+        if leaf >= np.int32(0) and leaf < node_limit:
+            cuda.atomic.sub(node_expand_inflight, (tree, leaf), np.int32(1))
+
+
 def flush_cuda_deallocations():
     gc.collect()
     try:
@@ -243,9 +320,9 @@ def flush_cuda_deallocations():
 
 def estimate_deep_chain_bytes(trees, tree_depth, actions, warps):
     nodes = actions + 1
-    edge_bytes = trees * nodes * actions * 16
-    node_bytes = trees * nodes * 12
-    output_bytes = trees * warps * 8 + trees * warps * max(1, tree_depth) * 8
+    edge_bytes = trees * nodes * actions * 20
+    node_bytes = trees * nodes * 8 + trees * 4
+    output_bytes = trees * warps * 8 + trees * warps * max(1, tree_depth) * 4
     return edge_bytes + node_bytes + output_bytes
 
 
@@ -265,14 +342,13 @@ def make_deep_chain_case_device(
         "edge_prior": cuda.device_array((trees, nodes, actions), np.float32),
         "edge_w": cuda.device_array((trees, nodes, actions), np.float32),
         "edge_n": cuda.device_array((trees, nodes, actions), np.int32),
-        "node_inflight": cuda.device_array((trees, nodes), np.int32),
+        "edge_inflight": cuda.device_array((trees, nodes, actions), np.int32),
         "node_expand_inflight": cuda.device_array((trees, nodes), np.int32),
         "node_expanded": cuda.device_array((trees, nodes), np.int32),
         "node_count": cuda.device_array((trees,), np.int32),
         "out_selected": cuda.device_array((trees, warps), np.int32),
         "out_path": cuda.device_array((trees, warps, max(1, tree_depth)), np.int32),
         "out_len": cuda.device_array((trees, warps), np.int32),
-        "path_values": cuda.device_array((trees, warps, max(1, tree_depth)), np.float32),
         "warps": warps,
         "trees": trees,
     }
@@ -286,22 +362,21 @@ def make_deep_chain_case_device(
         np.int32(1 if shape != "narrow" else 0),
         np.int32(1 if prior_mode == "hot" else 0),
         np.int32(1 if terminal_leaf else 0),
-        np.int32(v2.NODE_EXPANDED_TERMINAL),
+        np.int32(v3.NODE_EXPANDED_TERMINAL),
         d["edge_child"],
         d["edge_prior"],
         d["edge_w"],
         d["edge_n"],
-        d["node_inflight"],
+        d["edge_inflight"],
         d["node_expand_inflight"],
         d["node_expanded"],
         d["node_count"],
     )
     _init_select_outputs_kernel[out_blocks, threads](
-        np.int32(v2.PACKED_INVALID),
+        np.int32(v3.PACKED_INVALID),
         d["out_selected"],
         d["out_path"],
         d["out_len"],
-        d["path_values"],
     )
     return d
 
@@ -314,54 +389,52 @@ def copy_back(dcase):
     return {k: v.copy_to_host() if hasattr(v, "copy_to_host") else v for k, v in dcase.items()}
 
 
-def launch_select(d, cpuct=1.0, c_pw=1.0, alpha_pw=0.5, variant=VARIANT_PRECLAIM):
-    if variant == VARIANT_PRECLAIM:
-        v2._select_kernel_native[d["trees"], d["warps"] * v2.WARP_SIZE](
-            np.float32(cpuct),
-            np.float32(c_pw),
-            np.float32(alpha_pw),
-            d["edge_child"],
-            d["edge_prior"],
-            d["edge_w"],
-            d["edge_n"],
-            d["node_inflight"],
-            d["node_expand_inflight"],
-            d["node_expanded"],
-            d["node_count"],
-            d["out_selected"],
-            d["out_path"],
-            d["out_len"],
-        )
-    elif variant == VARIANT_WINNER_RECALC:
-        v2._select_kernel_winner_recalc[d["trees"], d["warps"] * v2.WARP_SIZE](
-            np.float32(cpuct),
-            np.float32(c_pw),
-            np.float32(alpha_pw),
-            d["edge_child"],
-            d["edge_prior"],
-            d["edge_w"],
-            d["edge_n"],
-            d["node_inflight"],
-            d["node_expand_inflight"],
-            d["node_expanded"],
-            d["node_count"],
-            d["out_selected"],
-            d["out_path"],
-            d["out_len"],
-        )
-    else:
-        raise ValueError(f"unknown select variant: {variant}")
+def launch_select(d, cpuct=1.0, c_pw=1.0, alpha_pw=0.5, variant=VARIANT_WINNER_RECALC):
+    if variant != VARIANT_WINNER_RECALC:
+        raise ValueError(f"unknown select variant for v3: {variant}")
+    v3._select_kernel_winner_recalc[d["trees"], d["warps"] * v3.WARP_SIZE](
+        np.float32(cpuct),
+        np.float32(c_pw),
+        np.float32(alpha_pw),
+        d["edge_child"],
+        d["edge_prior"],
+        d["edge_w"],
+        d["edge_n"],
+        d["edge_inflight"],
+        d["node_expand_inflight"],
+        d["node_expanded"],
+        d["node_count"],
+        d["out_selected"],
+        d["out_path"],
+        d["out_len"],
+    )
 
 
-def run_select(case, cpuct=1.0, c_pw=1.0, alpha_pw=0.5, variant=VARIANT_PRECLAIM):
+def launch_release(dcase, trees=None, warps=None, virtual_loss=1):
+    if trees is None:
+        trees = dcase["trees"]
+    if warps is None:
+        warps = dcase["warps"]
+    _release_claims_kernel[trees, warps * v3.WARP_SIZE](
+        np.int32(virtual_loss),
+        dcase["edge_inflight"],
+        dcase["node_expand_inflight"],
+        dcase["node_count"],
+        dcase["out_selected"],
+        dcase["out_path"],
+        dcase["out_len"],
+    )
+
+
+def run_select(case, cpuct=1.0, c_pw=1.0, alpha_pw=0.5, variant=VARIANT_WINNER_RECALC):
     d = to_device(case)
     launch_select(d, cpuct=cpuct, c_pw=c_pw, alpha_pw=alpha_pw, variant=variant)
     cuda.synchronize()
     return d, copy_back(d)
 
 
-def run_backup(dcase, virtual_loss=1):
-    launch_backup(dcase, virtual_loss=virtual_loss)
+def run_release(dcase, virtual_loss=1):
+    launch_release(dcase, virtual_loss=virtual_loss)
     cuda.synchronize()
     return copy_back(dcase)
 
@@ -389,6 +462,10 @@ def _float_or_none(value):
         return float(value)
     except Exception:
         return None
+
+
+def is_valid_selection_kind(kind: int) -> bool:
+    return kind in (v3.SELECT_EXPAND, v3.SELECT_TERMINAL, v3.SELECT_DEPTH_LIMIT)
 
 
 def query_gpu_telemetry_once(gpu_index):
@@ -481,7 +558,11 @@ def summarize_gpu_telemetry(samples):
         "power_avg": avg_power,
         "power_max": peak(power),
         "power_limit_avg": avg_power_limit,
-        "power_limit_pct": (avg_power / avg_power_limit * 100.0) if power and power_limit and avg_power_limit > 0.0 else float("nan"),
+        "power_limit_pct": (
+            (avg_power / avg_power_limit * 100.0)
+            if power and power_limit and avg_power_limit > 0.0
+            else float("nan")
+        ),
         "sm_clock_avg": avg(sm_clock),
         "temp_max": peak(temp),
         "mem_used_max_gib": peak(mem_used) / 1024.0 if mem_used else float("nan"),
@@ -494,34 +575,14 @@ def fmt_float(value, digits=1):
     return f"{value:.{digits}f}"
 
 
-def launch_backup(dcase, trees=None, warps=None, virtual_loss=1):
-    if trees is None:
-        trees = dcase["trees"]
-    if warps is None:
-        warps = dcase["warps"]
-    v2._backup_kernel_native[trees, warps * v2.WARP_SIZE](
-        np.int32(virtual_loss),
-        dcase["edge_child"],
-        dcase["edge_w"],
-        dcase["edge_n"],
-        dcase["node_inflight"],
-        dcase["node_expand_inflight"],
-        dcase["node_count"],
-        dcase["out_selected"],
-        dcase["out_path"],
-        dcase["out_len"],
-        dcase["path_values"],
-    )
-
-
-def _run_select_backup_once(d, trees=None, warps=None, c_pw=1.0, variant=VARIANT_PRECLAIM):
+def _run_select_release_once(d, trees=None, warps=None, c_pw=1.0, variant=VARIANT_WINNER_RECALC):
     launch_select(d, c_pw=c_pw, variant=variant)
-    launch_backup(d, trees=trees, warps=warps)
+    launch_release(d, trees=trees, warps=warps)
 
 
 def time_select_kernel_only(d, trees, warps, c_pw, variant, warmup, iterations):
     for _ in range(warmup):
-        _run_select_backup_once(d, trees=trees, warps=warps, c_pw=c_pw, variant=variant)
+        _run_select_release_once(d, trees=trees, warps=warps, c_pw=c_pw, variant=variant)
     cuda.synchronize()
 
     events = []
@@ -531,7 +592,7 @@ def time_select_kernel_only(d, trees, warps, c_pw, variant, warmup, iterations):
         start.record()
         launch_select(d, c_pw=c_pw, variant=variant)
         end.record()
-        launch_backup(d, trees=trees, warps=warps)
+        launch_release(d, trees=trees, warps=warps)
         events.append((start, end))
     cuda.synchronize()
     elapsed_ms = 0.0
@@ -540,9 +601,11 @@ def time_select_kernel_only(d, trees, warps, c_pw, variant, warmup, iterations):
     return elapsed_ms
 
 
-def time_select_kernel_only_chunked(d, trees, warps, c_pw, variant, warmup, iterations, chunk_size, progress_every=0):
+def time_select_kernel_only_chunked(
+    d, trees, warps, c_pw, variant, warmup, iterations, chunk_size, progress_every=0
+):
     for _ in range(warmup):
-        _run_select_backup_once(d, trees=trees, warps=warps, c_pw=c_pw, variant=variant)
+        _run_select_release_once(d, trees=trees, warps=warps, c_pw=c_pw, variant=variant)
     cuda.synchronize()
 
     elapsed_ms = 0.0
@@ -557,7 +620,7 @@ def time_select_kernel_only_chunked(d, trees, warps, c_pw, variant, warmup, iter
             start.record()
             launch_select(d, c_pw=c_pw, variant=variant)
             end.record()
-            launch_backup(d, trees=trees, warps=warps)
+            launch_release(d, trees=trees, warps=warps)
             events.append((start, end))
         cuda.synchronize()
         for start, end in events:
@@ -565,7 +628,10 @@ def time_select_kernel_only_chunked(d, trees, warps, c_pw, variant, warmup, iter
         completed += cur
         if progress_every > 0 and (completed == iterations or completed % progress_every == 0):
             wall_s = time.perf_counter() - wall_start
-            print(f"    progress: {completed}/{iterations} timed select launches, wall={wall_s:.1f}s", flush=True)
+            print(
+                f"    progress: {completed}/{iterations} timed select launches, wall={wall_s:.1f}s",
+                flush=True,
+            )
 
     wall_ms = (time.perf_counter() - wall_start) * 1000.0
     return elapsed_ms, wall_ms
@@ -601,7 +667,7 @@ def intra_tree_diversity_metrics(out_path, out_len):
         for wid in range(warps):
             plen = int(out_len[tree, wid]) - 1
             if plen > 0 and int(out_path[tree, wid, 0]) >= 0:
-                first_slots.append(int(out_path[tree, wid, 0]) & v2.PACKED_EDGE_MASK)
+                first_slots.append(int(out_path[tree, wid, 0]) & v3.PACKED_EDGE_MASK)
                 paths.append(tuple(int(out_path[tree, wid, d]) for d in range(plen)))
         valid = len(first_slots)
         if valid > 1:
@@ -648,19 +714,27 @@ def selection_metrics(h, action_count):
     out_path = h["out_path"]
     out_len = h["out_len"]
     raws = h["out_selected"].reshape(-1)
-    invalid = sum(1 for raw in raws if decode(int(raw))[0] == v2.SELECT_INVALID)
+    invalid = sum(1 for raw in raws if decode(int(raw))[0] == v3.SELECT_INVALID)
+    busy = sum(1 for raw in raws if decode(int(raw))[0] == v3.SELECT_BUSY)
     invalid_pct = 100.0 * invalid / max(1, len(raws))
+    busy_pct = 100.0 * busy / max(1, len(raws))
 
-    first_edges = out_path[:, :, 0].reshape(-1)
-    valid_first = first_edges[first_edges >= 0]
-    unique_first = len(set(int(x) & v2.PACKED_EDGE_MASK for x in valid_first))
+    valid_first = []
+    for tree in range(out_path.shape[0]):
+        for wid in range(out_path.shape[1]):
+            kind = decode(int(h["out_selected"][tree, wid]))[0]
+            if is_valid_selection_kind(kind) and int(out_len[tree, wid]) > 1:
+                encoded = int(out_path[tree, wid, 0])
+                if encoded >= 0:
+                    valid_first.append(encoded)
+    unique_first = len(set(int(x) & v3.PACKED_EDGE_MASK for x in valid_first))
     collision_pct = 0.0
     if len(valid_first) > 0:
         collision_pct = 100.0 * (1.0 - float(unique_first) / float(len(valid_first)))
 
     slot_counts = [0 for _ in range(max(1, action_count))]
     for encoded in valid_first:
-        slot = int(encoded) & v2.PACKED_EDGE_MASK
+        slot = int(encoded) & v3.PACKED_EDGE_MASK
         if 0 <= slot < len(slot_counts):
             slot_counts[slot] += 1
     root_entropy = _entropy_from_counts(slot_counts)
@@ -672,7 +746,8 @@ def selection_metrics(h, action_count):
         vals = []
         for tree in range(out_path.shape[0]):
             for wid in range(out_path.shape[1]):
-                if out_len[tree, wid] > d + 1:
+                kind = decode(int(h["out_selected"][tree, wid]))[0]
+                if is_valid_selection_kind(kind) and out_len[tree, wid] > d + 1:
                     encoded = int(out_path[tree, wid, d])
                     if encoded >= 0:
                         vals.append(encoded)
@@ -683,8 +758,9 @@ def selection_metrics(h, action_count):
     path_counts = {}
     for tree in range(out_path.shape[0]):
         for wid in range(out_path.shape[1]):
+            kind = decode(int(h["out_selected"][tree, wid]))[0]
             plen = int(out_len[tree, wid]) - 1
-            if plen > 0:
+            if is_valid_selection_kind(kind) and plen > 0:
                 path = tuple(int(out_path[tree, wid, d]) for d in range(plen))
                 path_counts[path] = path_counts.get(path, 0) + 1
     path_entropy = _entropy_from_counts(path_counts.values())
@@ -695,6 +771,7 @@ def selection_metrics(h, action_count):
     intra = intra_tree_diversity_metrics(out_path, out_len)
     metrics = {
         "invalid_pct": invalid_pct,
+        "busy_pct": busy_pct,
         "collision_pct": collision_pct,
         "unique_first": unique_first,
         "root_kl": float(root_kl_uniform),
@@ -709,19 +786,27 @@ def selection_metrics_scale(h, action_count, max_path_samples=2048, max_depth_sa
     out_path = h["out_path"]
     out_len = h["out_len"]
     raws = h["out_selected"].reshape(-1)
-    invalid = sum(1 for raw in raws if decode(int(raw))[0] == v2.SELECT_INVALID)
+    invalid = sum(1 for raw in raws if decode(int(raw))[0] == v3.SELECT_INVALID)
+    busy = sum(1 for raw in raws if decode(int(raw))[0] == v3.SELECT_BUSY)
     invalid_pct = 100.0 * invalid / max(1, len(raws))
+    busy_pct = 100.0 * busy / max(1, len(raws))
 
-    first_edges = out_path[:, :, 0].reshape(-1)
-    valid_first = first_edges[first_edges >= 0]
-    unique_first = len(set(int(x) & v2.PACKED_EDGE_MASK for x in valid_first))
+    valid_first = []
+    for tree in range(out_path.shape[0]):
+        for wid in range(out_path.shape[1]):
+            kind = decode(int(h["out_selected"][tree, wid]))[0]
+            if is_valid_selection_kind(kind) and int(out_len[tree, wid]) > 1:
+                encoded = int(out_path[tree, wid, 0])
+                if encoded >= 0:
+                    valid_first.append(encoded)
+    unique_first = len(set(int(x) & v3.PACKED_EDGE_MASK for x in valid_first))
     collision_pct = 0.0
     if len(valid_first) > 0:
         collision_pct = 100.0 * (1.0 - float(unique_first) / float(len(valid_first)))
 
     slot_counts = [0 for _ in range(max(1, action_count))]
     for encoded in valid_first:
-        slot = int(encoded) & v2.PACKED_EDGE_MASK
+        slot = int(encoded) & v3.PACKED_EDGE_MASK
         if 0 <= slot < len(slot_counts):
             slot_counts[slot] += 1
     root_entropy = _entropy_from_counts(slot_counts)
@@ -737,7 +822,8 @@ def selection_metrics_scale(h, action_count, max_path_samples=2048, max_depth_sa
         vals = []
         for tree in range(trees):
             for wid in range(warps):
-                if out_len[tree, wid] > d + 1:
+                kind = decode(int(h["out_selected"][tree, wid]))[0]
+                if is_valid_selection_kind(kind) and out_len[tree, wid] > d + 1:
                     encoded = int(out_path[tree, wid, d])
                     if encoded >= 0:
                         vals.append(encoded)
@@ -755,8 +841,9 @@ def selection_metrics_scale(h, action_count, max_path_samples=2048, max_depth_sa
     while flat_index < trees * warps and used < sample_count:
         tree = flat_index // warps
         wid = flat_index - tree * warps
+        kind = decode(int(h["out_selected"][tree, wid]))[0]
         plen = int(out_len[tree, wid]) - 1
-        if plen > 0:
+        if is_valid_selection_kind(kind) and plen > 0:
             path = tuple(int(out_path[tree, wid, d]) for d in range(plen))
             path_counts[path] = path_counts.get(path, 0) + 1
             used += 1
@@ -769,6 +856,7 @@ def selection_metrics_scale(h, action_count, max_path_samples=2048, max_depth_sa
     intra = intra_tree_diversity_metrics(out_path, out_len)
     metrics = {
         "invalid_pct": invalid_pct,
+        "busy_pct": busy_pct,
         "collision_pct": collision_pct,
         "unique_first": unique_first,
         "root_kl": float(root_kl_uniform),
@@ -790,9 +878,13 @@ def copy_selection_outputs(dcase):
 def check_inflight_empty(dcase):
     stats = cuda.to_device(np.zeros(2, np.int32))
     threads = 256
-    for key in ("node_inflight", "node_expand_inflight"):
-        blocks = min(65535, max(1, (dcase[key].size + threads - 1) // threads))
-        _check_inflight_kernel[blocks, threads](dcase[key], stats)
+
+    edge_blocks = min(65535, max(1, (dcase["edge_inflight"].size + threads - 1) // threads))
+    _check_inflight_3d_kernel[edge_blocks, threads](dcase["edge_inflight"], stats)
+
+    node_blocks = min(65535, max(1, (dcase["node_expand_inflight"].size + threads - 1) // threads))
+    _check_inflight_2d_kernel[node_blocks, threads](dcase["node_expand_inflight"], stats)
+
     cuda.synchronize()
     h = stats.copy_to_host()
     return int(h[0]) == 0 and int(h[1]) == 0, int(h[0]), int(h[1])
@@ -829,7 +921,7 @@ def _cpu_select_sequential_no_vloss(
                     break
 
                 node_info = node_expanded[tree, node]
-                if node_info == v2.NODE_EXPANDED_TERMINAL:
+                if node_info == v3.NODE_EXPANDED_TERMINAL:
                     total_path_len += depth + 1
                     valid += 1
                     checksum += node + 17
@@ -945,7 +1037,11 @@ def _cpu_select_deep_wide_procedural(
 
                 if best_eid < 0:
                     break
-                checksum += np.int64((node << 8) | best_eid) + np.int64(tree & 7) + np.int64(traversal & 3)
+                checksum += (
+                    np.int64((node << 8) | best_eid)
+                    + np.int64(tree & 7)
+                    + np.int64(traversal & 3)
+                )
                 node = best_eid + 1
                 depth += 1
 
@@ -996,11 +1092,11 @@ def time_cpu_deep_wide_procedural(
 
 
 def host_inflight_sum(h):
-    return int(h["node_inflight"].sum()) + int(h["node_expand_inflight"].sum())
+    return int(h["edge_inflight"].sum()) + int(h["node_expand_inflight"].sum())
 
 
 def host_inflight_nonnegative(h):
-    return not np.any(h["node_inflight"] < 0) and not np.any(h["node_expand_inflight"] < 0)
+    return not np.any(h["edge_inflight"] < 0) and not np.any(h["node_expand_inflight"] < 0)
 
 
 def test_fresh_root_expand_roundtrip():
@@ -1008,9 +1104,9 @@ def test_fresh_root_expand_roundtrip():
     d, h = run_select(case)
     kind, slot, node = decode(int(h["out_selected"][0, 0]))
     inflight_after_select = int(h["node_expand_inflight"][0, 0])
-    h2 = run_backup(d)
+    h2 = run_release(d)
     ok = (
-        kind == v2.SELECT_EXPAND
+        kind == v3.SELECT_EXPAND
         and slot == 0
         and node == 0
         and int(h["out_len"][0, 0]) == 1
@@ -1022,11 +1118,11 @@ def test_fresh_root_expand_roundtrip():
 
 def test_terminal_root():
     case = make_case(nodes=2, actions=4, path_depth=2)
-    case["node_expanded"][0, 0] = v2.NODE_EXPANDED_TERMINAL
+    case["node_expanded"][0, 0] = v3.NODE_EXPANDED_TERMINAL
     _, h = run_select(case)
     kind, _, node = decode(int(h["out_selected"][0, 0]))
     ok = (
-        kind == v2.SELECT_TERMINAL
+        kind == v3.SELECT_TERMINAL
         and node == 0
         and int(h["out_len"][0, 0]) == 1
         and host_inflight_sum(h) == 0
@@ -1043,7 +1139,7 @@ def test_invalid_child_rolls_back_path():
     case["edge_n"][0, 0, 0] = 1
     _, h = run_select(case)
     kind, _, _ = decode(int(h["out_selected"][0, 0]))
-    ok = kind == v2.SELECT_INVALID and host_inflight_sum(h) == 0
+    ok = kind == v3.SELECT_INVALID and host_inflight_sum(h) == 0
     record("invalid child node rolls back selected path virtual loss", ok)
 
 
@@ -1055,7 +1151,7 @@ def test_child_beyond_node_count_invalid():
     case["edge_n"][0, 0, 0] = 1
     _, h = run_select(case)
     kind, _, _ = decode(int(h["out_selected"][0, 0]))
-    ok = kind == v2.SELECT_INVALID and host_inflight_sum(h) == 0
+    ok = kind == v3.SELECT_INVALID and host_inflight_sum(h) == 0
     record("child id beyond per-tree node_count is invalid", ok)
 
 
@@ -1067,28 +1163,81 @@ def test_progressive_widening_multi_warp_claims_unique_slots():
     d, h = run_select(case, c_pw=1.0, alpha_pw=0.5)
 
     slots = []
+    root_slots = []
+    child_expands = 0
     for wid in range(4):
         kind, slot, node = decode(int(h["out_selected"][0, wid]))
-        if kind == v2.SELECT_EXPAND:
+        if kind == v3.SELECT_EXPAND:
             slots.append(slot)
-            ok_node = node == 0
+            if node == 0:
+                root_slots.append(slot)
+            elif node == 1:
+                child_expands += 1
+            ok_node = node == 0 or node == 1
         else:
-            ok_node = kind == v2.SELECT_INVALID
+            ok_node = kind == v3.SELECT_BUSY
         if not ok_node:
             record("progressive widening multi-warp claims unique slots", False, f"bad wid={wid}")
             return
 
-    h2 = run_backup(d)
+    h2 = run_release(d)
     ok = (
-        sorted(slots) == [1, 2, 3]
-        and len(set(slots)) == len(slots)
+        sorted(root_slots) == [1, 2, 3]
+        and child_expands <= 1
         and int(h["node_expand_inflight"][0, 0]) == 3
         and host_inflight_sum(h2) == 0
     )
-    record("progressive widening multi-warp claims unique slots", ok, f"slots={slots}")
+    record(
+        "progressive widening multi-warp claims unique slots",
+        ok,
+        f"root_slots={root_slots}, child_expands={child_expands}, slots={slots}",
+    )
 
 
-def test_fully_expanded_select_and_backup_roundtrip():
+def test_single_edge_contention_keeps_all_warps_valid():
+    case = make_case(nodes=2, actions=4, warps=8, path_depth=2)
+    case["node_expanded"][0, 0] = 1
+    case["edge_child"][0, 0, 0] = 1
+    case["edge_prior"][0, 0, 0] = 1.0
+    case["edge_n"][0, 0, 0] = 1
+    case["node_expanded"][0, 1] = v3.NODE_EXPANDED_TERMINAL
+    d, h = run_select(case, c_pw=0.0)
+
+    kinds = [decode(int(h["out_selected"][0, wid]))[0] for wid in range(case["warps"])]
+    h2 = run_release(d)
+    ok = (
+        all(kind == v3.SELECT_TERMINAL for kind in kinds)
+        and int(h["edge_inflight"][0, 0, 0]) == case["warps"]
+        and host_inflight_sum(h2) == 0
+    )
+    record("single-edge contention remains valid via soft virtual visits", ok, f"kinds={kinds}")
+
+
+def test_pw_ticket_full_falls_through_to_existing_child():
+    case = make_case(nodes=3, actions=4, warps=2, path_depth=2)
+    case["node_expanded"][0, 0] = 1
+    case["node_expand_inflight"][0, 0] = 3
+    case["edge_child"][0, 0, 0] = 1
+    case["edge_prior"][0, 0, 0] = 1.0
+    case["edge_n"][0, 0, 0] = 16
+    case["node_expanded"][0, 1] = v3.NODE_EXPANDED_TERMINAL
+    d, h = run_select(case, c_pw=1.0, alpha_pw=0.5)
+
+    kinds = [decode(int(h["out_selected"][0, wid]))[0] for wid in range(case["warps"])]
+    selected_nodes = [decode(int(h["out_selected"][0, wid]))[2] for wid in range(case["warps"])]
+    h2 = run_release(d)
+    ok = (
+        all(kind == v3.SELECT_TERMINAL for kind in kinds)
+        and selected_nodes == [1, 1]
+        and int(h["edge_inflight"][0, 0, 0]) == case["warps"]
+        and int(h["node_expand_inflight"][0, 0]) == 3
+        and int(h2["node_expand_inflight"][0, 0]) == 3
+        and int(h2["edge_inflight"][0, 0, 0]) == 0
+    )
+    record("full PW ticket quota falls through to existing child", ok, f"kinds={kinds}, nodes={selected_nodes}")
+
+
+def test_fully_expanded_select_and_release_roundtrip():
     case = make_case(nodes=3, actions=4, path_depth=4)
     case["node_expanded"][0, 0] = 2
     case["edge_child"][0, 0, 0] = 1
@@ -1098,25 +1247,19 @@ def test_fully_expanded_select_and_backup_roundtrip():
     case["edge_n"][0, 0, 0] = 1
     case["edge_n"][0, 0, 1] = 1
     d, h = run_select(case)
-    raw = int(h["out_selected"][0, 0])
-    kind, slot, node = decode(raw)
-    path_values = d["path_values"].copy_to_host()
-    path_values[0, 0, 0] = np.float32(0.7)
-    d["path_values"] = cuda.to_device(path_values)
-    h2 = run_backup(d)
+    kind, slot, node = decode(int(h["out_selected"][0, 0]))
+    h2 = run_release(d)
     ok = (
-        kind == v2.SELECT_EXPAND
+        kind == v3.SELECT_EXPAND
         and node == 2
         and slot == 0
         and int(h["out_path"][0, 0, 0]) == 1
         and int(h["out_len"][0, 0]) == 2
-        and int(h["node_inflight"][0, 2]) == 1
+        and int(h["edge_inflight"][0, 0, 1]) == 1
         and int(h["node_expand_inflight"][0, 2]) == 1
         and host_inflight_sum(h2) == 0
-        and int(h2["edge_n"][0, 0, 1]) == 2
-        and abs(float(h2["edge_w"][0, 0, 1]) - 0.7) < 1e-6
     )
-    record("fully expanded select picks high PUCT edge and backup roundtrips", ok)
+    record("fully expanded select picks high PUCT edge and release roundtrips", ok)
 
 
 def test_depth_limit():
@@ -1129,14 +1272,27 @@ def test_depth_limit():
     case["edge_n"][0, 1, 0] = 1
     d, h = run_select(case)
     kind, _, node = decode(int(h["out_selected"][0, 0]))
-    h2 = run_backup(d)
+    h2 = run_release(d)
     ok = (
-        kind == v2.SELECT_DEPTH_LIMIT
+        kind == v3.SELECT_DEPTH_LIMIT
         and node == 1
         and int(h["out_len"][0, 0]) == 2
+        and int(h["edge_inflight"][0, 0, 0]) == 1
         and host_inflight_sum(h2) == 0
     )
     record("depth limit returns packed depth-limit leaf", ok)
+
+
+def test_n_zero_edge_is_still_selectable():
+    case = make_case(nodes=3, actions=4, path_depth=3)
+    case["node_expanded"][0, 0] = 1
+    case["edge_child"][0, 0, 0] = 1
+    case["edge_prior"][0, 0, 0] = 1.0
+    case["edge_n"][0, 0, 0] = 0
+    _, h = run_select(case)
+    kind, _, node = decode(int(h["out_selected"][0, 0]))
+    ok = kind == v3.SELECT_EXPAND and node == 1 and int(h["out_len"][0, 0]) == 2
+    record("zero-N edge remains selectable (q=0 fallback)", ok)
 
 
 def test_encoding_boundaries():
@@ -1148,25 +1304,25 @@ def test_encoding_boundaries():
     _, h_257 = run_select(case_257)
     kind_257, _, _ = decode(int(h_257["out_selected"][0, 0]))
 
-    case_nodes = make_case(nodes=v2.PACKED_NODE_LIMIT + 1, actions=4, path_depth=2)
+    case_nodes = make_case(nodes=v3.PACKED_NODE_LIMIT + 1, actions=4, path_depth=2)
     _, h_nodes = run_select(case_nodes)
     kind_nodes, _, _ = decode(int(h_nodes["out_selected"][0, 0]))
 
-    case_capacity = make_case(nodes=v2.PACKED_NODE_LIMIT + 1, actions=4, path_depth=2)
-    case_capacity["node_count"][0] = v2.PACKED_NODE_LIMIT
+    case_capacity = make_case(nodes=v3.PACKED_NODE_LIMIT + 1, actions=4, path_depth=2)
+    case_capacity["node_count"][0] = v3.PACKED_NODE_LIMIT
     _, h_capacity = run_select(case_capacity)
     kind_capacity, _, _ = decode(int(h_capacity["out_selected"][0, 0]))
 
     ok = (
-        kind_256 == v2.SELECT_EXPAND
-        and kind_257 == v2.SELECT_INVALID
-        and kind_nodes == v2.SELECT_INVALID
-        and kind_capacity == v2.SELECT_EXPAND
+        kind_256 == v3.SELECT_EXPAND
+        and kind_257 == v3.SELECT_INVALID
+        and kind_nodes == v3.SELECT_INVALID
+        and kind_capacity == v3.SELECT_EXPAND
     )
     record("packing boundaries: 256 actions ok, node_count gates packed node ids", ok)
 
 
-def test_v2_stress():
+def test_v3_stress():
     configs = []
     for trees in [1, 16, 128]:
         for warps in [1, 2, 4, 8]:
@@ -1186,17 +1342,13 @@ def test_v2_stress():
             valid = 0
             loops = 10000 if (trees, warps, actions, depth) == (1, 8, 256, 64) else 10
             for _ in range(loops):
-                launch_select(d, c_pw=1.0, variant=VARIANT_PRECLAIM)
-                v2._backup_kernel_native[trees, warps * v2.WARP_SIZE](
-                    np.int32(1), d["edge_child"], d["edge_w"], d["edge_n"],
-                    d["node_inflight"], d["node_expand_inflight"], d["node_count"],
-                    d["out_selected"], d["out_path"], d["out_len"], d["path_values"],
-                )
+                launch_select(d, c_pw=1.0, variant=VARIANT_WINNER_RECALC)
+                launch_release(d, trees=trees, warps=warps)
             cuda.synchronize()
             h = copy_back(d)
             raws = h["out_selected"].reshape(-1)
             for raw in raws:
-                if decode(int(raw))[0] != v2.SELECT_INVALID:
+                if is_valid_selection_kind(decode(int(raw))[0]):
                     valid += 1
             if not host_inflight_nonnegative(h) or host_inflight_sum(h) != 0 or valid == 0:
                 all_ok = False
@@ -1208,11 +1360,11 @@ def test_v2_stress():
     record("stress matrix keeps inflight non-negative and produces valid selections", all_ok, f"failed={failed[:3]}")
 
 
-def _run_deep_select_backup(d, trees, warps, c_pw=0.0, variant=VARIANT_PRECLAIM):
-    _run_select_backup_once(d, trees=trees, warps=warps, c_pw=c_pw, variant=variant)
+def _run_deep_select_release(d, trees, warps, c_pw=0.0, variant=VARIANT_WINNER_RECALC):
+    _run_select_release_once(d, trees=trees, warps=warps, c_pw=c_pw, variant=variant)
 
 
-def test_v2_deep_tree_stress():
+def test_v3_deep_tree_stress():
     depths = [16, 64, 128, 256, 512, 1024]
     configs = []
     for depth in depths:
@@ -1220,9 +1372,11 @@ def test_v2_deep_tree_stress():
         configs.append(("wide64", 4, 2, 64, depth))
         configs.append(("wide256", 1, 2, 256, depth))
 
-    print("\n  V2 deep-tree stress")
+    print("\n  V3 deep-tree stress")
     print("  " + "-" * 82)
-    print(f"  {'shape':>8} | {'depth':>5} | {'trees':>5} | {'warps':>5} | {'acts':>5} | {'loops':>5} | {'max_len':>7} | result")
+    print(
+        f"  {'shape':>8} | {'depth':>5} | {'trees':>5} | {'warps':>5} | {'acts':>5} | {'loops':>5} | {'max_len':>7} | result"
+    )
     print("  " + "-" * 82)
 
     all_ok = True
@@ -1240,11 +1394,11 @@ def test_v2_deep_tree_stress():
             )
             d = to_device(case)
             for _ in range(loops):
-                _run_deep_select_backup(d, trees, warps, c_pw=0.0)
+                _run_deep_select_release(d, trees, warps, c_pw=0.0)
             cuda.synchronize()
             h = copy_back(d)
             kinds = [decode(int(raw))[0] for raw in h["out_selected"].reshape(-1)]
-            valid = sum(1 for kind in kinds if kind != v2.SELECT_INVALID)
+            valid = sum(1 for kind in kinds if is_valid_selection_kind(kind))
             max_len = int(h["out_len"].max())
             ok = (
                 valid > 0
@@ -1262,30 +1416,35 @@ def test_v2_deep_tree_stress():
         except Exception as exc:
             all_ok = False
             failed.append((shape_name, depth, repr(exc)))
-            print(f"  {shape_name:>8} | {depth:5d} | {trees:5d} | {warps:5d} | {actions:5d} | {'-':>5} | {'-':>7} | FAIL: {exc}")
+            print(
+                f"  {shape_name:>8} | {depth:5d} | {trees:5d} | {warps:5d} | "
+                f"{actions:5d} | {'-':>5} | {'-':>7} | FAIL: {exc}"
+            )
             break
 
     record("deep-tree stress across depth 16..1024 and narrow/wide shapes", all_ok, f"failed={failed[:3]}")
 
 
 def bench_select_only():
-    warmup = _env_int("PUCT_V2_BENCH_WARMUP", 10)
-    iterations = _env_int("PUCT_V2_BENCH_ITERS", 100)
+    warmup = _env_int("PUCT_V3_BENCH_WARMUP", 10)
+    iterations = _env_int("PUCT_V3_BENCH_ITERS", 100)
     scenarios = [
         ("high_contention_equal_prior", 1, 8, 256, 2),
         ("low_contention_few_warps", 128, 1, 128, 16),
         ("wide_node", 16, 4, 256, 16),
         ("biased_prior", 16, 4, 128, 16),
     ]
-    print("\n  V2 select-only benchmark")
-    print(f"  timing: warmup={warmup} timed_select_launches={iterations} untimed_backup_launches={warmup + iterations}")
+    print("\n  V3 select-only benchmark")
+    print(
+        f"  timing: warmup={warmup} timed_select_launches={iterations} untimed_release_launches={warmup + iterations}"
+    )
     print("  " + "-" * 230)
     print(
         f"  {'variant':>15} | {'scenario':>28} | {'trees':>5} | {'warps':>5} | {'acts':>5} | "
         f"{'sel/s':>12} | {'ns/edge':>10} | {'atomics/sel':>11} | "
         f"{'collision%':>10} | {'unique_first':>12} | {'root_kl':>8} | "
         f"{'depth_unique%':>13} | {'path_H':>7} | {'max1/tree%':>10} | "
-        f"{'maxpath%':>8} | {'path75%':>7} | {'invalid%':>8}"
+        f"{'maxpath%':>8} | {'path75%':>7} | {'invalid%':>8} | {'busy%':>7}"
     )
     print("  " + "-" * 230)
 
@@ -1304,8 +1463,13 @@ def bench_select_only():
             d = to_device(case)
 
             elapsed_ms = time_select_kernel_only(
-                d, trees=trees, warps=warps, c_pw=1.0, variant=variant,
-                warmup=warmup, iterations=iterations,
+                d,
+                trees=trees,
+                warps=warps,
+                c_pw=1.0,
+                variant=variant,
+                warmup=warmup,
+                iterations=iterations,
             )
 
             h = copy_back(d)
@@ -1314,12 +1478,7 @@ def bench_select_only():
             selections = iterations * trees * warps
             sps = selections / max(elapsed_ms / 1000.0, 1e-9)
             ns_per_edge = elapsed_ms * 1.0e6 / max(1, selections * expanded)
-            if variant == VARIANT_PRECLAIM:
-                atomics_per_selection = 2 * expanded
-            elif variant == VARIANT_WINNER_RECALC:
-                atomics_per_selection = 3
-            else:
-                atomics_per_selection = 1
+            atomics_per_selection = 3
             print(
                 f"  {variant:>15} | {name:>28} | {trees:5d} | {warps:5d} | {actions:5d} | "
                 f"{sps:12.1f} | {ns_per_edge:10.2f} | {atomics_per_selection:11d} | "
@@ -1327,17 +1486,18 @@ def bench_select_only():
                 f"{metrics['root_kl']:8.3f} | {metrics['depth_unique_pct']:12.2f}% | "
                 f"{metrics['path_entropy_norm']:7.3f} | {metrics['tree_dominant_first_pct']:9.2f}% | "
                 f"{metrics['tree_dominant_path_pct']:7.2f}% | "
-                f"{metrics['tree_dominant_path_75_pct']:6.2f}% | {metrics['invalid_pct']:7.2f}%"
+                f"{metrics['tree_dominant_path_75_pct']:6.2f}% | "
+                f"{metrics['invalid_pct']:7.2f}% | {metrics['busy_pct']:6.2f}%"
             )
             all_ok = all_ok and metrics["invalid_pct"] < 100.0 and inflight_ok
 
-    record("select-only benchmark completed", all_ok, "preclaim vs winner_recalc")
+    record("select-only benchmark completed", all_ok, "winner_recalc")
 
 
 def bench_deep_tree_depths():
-    warmup = _env_int("PUCT_V2_DEEP_WARMUP", 5)
-    short_iterations = _env_int("PUCT_V2_DEEP_ITERS_SHORT", 20)
-    long_iterations = _env_int("PUCT_V2_DEEP_ITERS_LONG", 8)
+    warmup = _env_int("PUCT_V3_DEEP_WARMUP", 5)
+    short_iterations = _env_int("PUCT_V3_DEEP_ITERS_SHORT", 20)
+    long_iterations = _env_int("PUCT_V3_DEEP_ITERS_LONG", 8)
     depths = [16, 64, 128, 256, 512, 1024]
     configs = []
     for depth in depths:
@@ -1345,17 +1505,17 @@ def bench_deep_tree_depths():
         configs.append(("wide64", 4, 2, 64, depth))
         configs.append(("wide256", 1, 2, 256, depth))
 
-    print("\n  V2 deep-tree select benchmark")
+    print("\n  V3 deep-tree select benchmark")
     print(
         f"  timing: warmup={warmup} timed_select_launches={short_iterations} for depth<=128, "
-        f"{long_iterations} for depth>128; untimed backup after every select"
+        f"{long_iterations} for depth>128; untimed release after every select"
     )
     print("  " + "-" * 220)
     print(
         f"  {'variant':>15} | {'shape':>8} | {'depth':>5} | {'trees':>5} | {'warps':>5} | {'acts':>5} | "
         f"{'path_len':>8} | {'sel/s':>12} | {'ns/edge':>10} | {'atomics/sel':>11} | "
         f"{'root_kl':>8} | {'depth_unique%':>13} | {'path_H':>7} | "
-        f"{'max1/tree%':>10} | {'maxpath%':>8} | {'path75%':>7} | {'invalid%':>8}"
+        f"{'max1/tree%':>10} | {'maxpath%':>8} | {'path75%':>7} | {'invalid%':>8} | {'busy%':>7}"
     )
     print("  " + "-" * 220)
 
@@ -1373,8 +1533,13 @@ def bench_deep_tree_depths():
             d = to_device(case)
             iterations = short_iterations if depth <= 128 else long_iterations
             elapsed_ms = time_select_kernel_only(
-                d, trees=trees, warps=warps, c_pw=0.0, variant=variant,
-                warmup=warmup, iterations=iterations,
+                d,
+                trees=trees,
+                warps=warps,
+                c_pw=0.0,
+                variant=variant,
+                warmup=warmup,
+                iterations=iterations,
             )
 
             h = copy_back(d)
@@ -1386,12 +1551,7 @@ def bench_deep_tree_depths():
             traversed_edges = max(1, path_len - 1)
             sps = selections / max(elapsed_ms / 1000.0, 1e-9)
             ns_per_edge = elapsed_ms * 1.0e6 / max(1, selections * traversed_edges * fanout)
-            if variant == VARIANT_PRECLAIM:
-                atomics_per_selection = traversed_edges * (2 * fanout - 1)
-            elif variant == VARIANT_WINNER_RECALC:
-                atomics_per_selection = traversed_edges * 3
-            else:
-                atomics_per_selection = traversed_edges
+            atomics_per_selection = traversed_edges * 3
             all_ok = all_ok and metrics["invalid_pct"] < 100.0 and path_len == depth + 1 and inflight_ok
             print(
                 f"  {variant:>15} | {shape_name:>8} | {depth:5d} | {trees:5d} | {warps:5d} | {actions:5d} | "
@@ -1400,17 +1560,18 @@ def bench_deep_tree_depths():
                 f"{metrics['depth_unique_pct']:12.2f}% | {metrics['path_entropy_norm']:7.3f} | "
                 f"{metrics['tree_dominant_first_pct']:9.2f}% | "
                 f"{metrics['tree_dominant_path_pct']:7.2f}% | "
-                f"{metrics['tree_dominant_path_75_pct']:6.2f}% | {metrics['invalid_pct']:7.2f}%"
+                f"{metrics['tree_dominant_path_75_pct']:6.2f}% | "
+                f"{metrics['invalid_pct']:7.2f}% | {metrics['busy_pct']:6.2f}%"
             )
 
-    record("deep-tree select benchmark completed", all_ok, "preclaim vs winner_recalc")
+    record("deep-tree select benchmark completed", all_ok, "winner_recalc")
 
 
 def bench_cpu_vs_gpu_sequential():
-    warmup = _env_int("PUCT_V2_CPU_BENCH_WARMUP", 2)
-    cpu_repeats = _env_int("PUCT_V2_CPU_BENCH_REPEATS", 3)
-    gpu_iterations_default = _env_int("PUCT_V2_CPU_BENCH_GPU_ITERS", 10)
-    warps = _env_int("PUCT_V2_CPU_BENCH_WARPS", 8)
+    warmup = _env_int("PUCT_V3_CPU_BENCH_WARMUP", 2)
+    cpu_repeats = _env_int("PUCT_V3_CPU_BENCH_REPEATS", 3)
+    gpu_iterations_default = _env_int("PUCT_V3_CPU_BENCH_GPU_ITERS", 10)
+    warps = _env_int("PUCT_V3_CPU_BENCH_WARPS", 8)
     configs = [
         ("narrow_d64", 1024, warps, 4, 64, "narrow", gpu_iterations_default),
         ("wide32_d64", 512, warps, 32, 64, "wide", gpu_iterations_default),
@@ -1418,13 +1579,13 @@ def bench_cpu_vs_gpu_sequential():
         ("wide256_d256", 64, warps, 256, 256, "wide", max(1, gpu_iterations_default // 2)),
     ]
 
-    print("\n  V2 CPU sequential no-vloss vs GPU select benchmark")
+    print("\n  V3 CPU sequential no-vloss vs GPU select benchmark")
     print(
         f"  cpu: numba njit(cache=True, fastmath=True), sequential, no virtual loss; "
         f"warmup={warmup} repeats={cpu_repeats}"
     )
     print(
-        f"  gpu: select-only CUDA event, backup launch after each select is untimed; "
+        f"  gpu: select-only CUDA event, release launch after each select is untimed; "
         f"default_timed_select_launches={gpu_iterations_default}"
     )
     print("  " + "-" * 170)
@@ -1514,35 +1675,35 @@ def cpu_scale_configs(warps, full_matrix):
 
 
 def bench_cpu_vs_gpu_scale_aligned():
-    budget_gib = float(os.environ.get("PUCT_V2_CPU_SCALE_BUDGET_GB", "24.0"))
-    budget_bytes = int(budget_gib * (1024 ** 3))
+    budget_gib = float(os.environ.get("PUCT_V3_CPU_SCALE_BUDGET_GB", "24.0"))
+    budget_bytes = int(budget_gib * (1024**3))
     try:
         free_bytes, total_bytes = cuda.current_context().get_memory_info()
     except Exception:
         free_bytes, total_bytes = budget_bytes, budget_bytes
-    reserve_gib = float(os.environ.get("PUCT_V2_CPU_SCALE_RESERVE_GB", "0.50"))
-    reserve_bytes = int(reserve_gib * (1024 ** 3))
+    reserve_gib = float(os.environ.get("PUCT_V3_CPU_SCALE_RESERVE_GB", "0.50"))
+    reserve_bytes = int(reserve_gib * (1024**3))
     usable_bytes = min(budget_bytes, max(0, free_bytes - reserve_bytes))
-    warps = _env_int("PUCT_V2_CPU_SCALE_WARPS", 8)
-    cpu_warmup = _env_int("PUCT_V2_CPU_SCALE_CPU_WARMUP", 1)
-    cpu_repeats = _env_int("PUCT_V2_CPU_SCALE_CPU_REPEATS", 1)
-    gpu_warmup = _env_int("PUCT_V2_CPU_SCALE_GPU_WARMUP", 2)
-    gpu_iterations = _env_int("PUCT_V2_CPU_SCALE_GPU_ITERS", 1)
-    full_matrix = os.environ.get("PUCT_V2_CPU_SCALE_FULL", "0") == "1"
+    warps = _env_int("PUCT_V3_CPU_SCALE_WARPS", 8)
+    cpu_warmup = _env_int("PUCT_V3_CPU_SCALE_CPU_WARMUP", 1)
+    cpu_repeats = _env_int("PUCT_V3_CPU_SCALE_CPU_REPEATS", 1)
+    gpu_warmup = _env_int("PUCT_V3_CPU_SCALE_GPU_WARMUP", 2)
+    gpu_iterations = _env_int("PUCT_V3_CPU_SCALE_GPU_ITERS", 1)
+    full_matrix = os.environ.get("PUCT_V3_CPU_SCALE_FULL", "0") == "1"
     variants = parse_scale_variants()
     configs = cpu_scale_configs(warps, full_matrix)
 
-    print("\n  V2 CPU sequential no-vloss vs GPU large-scale aligned benchmark")
+    print("\n  V3 CPU sequential no-vloss vs GPU large-scale aligned benchmark")
     print(
-        f"  memory: free={free_bytes / (1024 ** 3):.2f}GiB total={total_bytes / (1024 ** 3):.2f}GiB "
-        f"budget={budget_gib:.2f}GiB reserve={reserve_gib:.2f}GiB usable={usable_bytes / (1024 ** 3):.2f}GiB"
+        f"  memory: free={free_bytes / (1024**3):.2f}GiB total={total_bytes / (1024**3):.2f}GiB "
+        f"budget={budget_gib:.2f}GiB reserve={reserve_gib:.2f}GiB usable={usable_bytes / (1024**3):.2f}GiB"
     )
     print(
         f"  cpu: procedural deep-wide tree, numba njit(cache=True, fastmath=True), sequential, no virtual loss; "
         f"warmup={cpu_warmup} repeats={cpu_repeats}"
     )
     print(
-        f"  gpu: same device tree generator as --v2-scale-bench; variants={','.join(variants)} "
+        f"  gpu: same device tree generator as --scale-bench; variants={','.join(variants)} "
         f"warmup={gpu_warmup} timed_select_launches={gpu_iterations} warps_per_tree={warps} "
         f"matrix={'full' if full_matrix else 'default-subset'}"
     )
@@ -1558,7 +1719,7 @@ def bench_cpu_vs_gpu_scale_aligned():
     all_ok = True
     for name, trees, cfg_warps, actions, depth, prior_mode in configs:
         estimated = estimate_deep_chain_bytes(trees, depth, actions, cfg_warps)
-        estimated_gib = estimated / float(1024 ** 3)
+        estimated_gib = estimated / float(1024**3)
         traversals_per_tree = cfg_warps * gpu_iterations
         total_selects = trees * traversals_per_tree
         visited_edges = max(1, total_selects * depth * actions)
@@ -1641,14 +1802,14 @@ def bench_cpu_vs_gpu_scale_aligned():
 
 
 def parse_scale_variants():
-    raw = os.environ.get("PUCT_V2_SCALE_VARIANTS", "preclaim,winner_recalc")
+    raw = os.environ.get("PUCT_V3_SCALE_VARIANTS", "winner_recalc")
     valid = set(SELECT_VARIANTS)
     variants = []
     for name in raw.split(","):
         name = name.strip()
         if name in valid and name not in variants:
             variants.append(name)
-    return variants if variants else [VARIANT_PRECLAIM]
+    return variants if variants else [VARIANT_WINNER_RECALC]
 
 
 def select_named_scale_configs(configs, env_name, default_names):
@@ -1666,33 +1827,33 @@ def select_named_scale_configs(configs, env_name, default_names):
 
 def bench_gpu_long_stress():
     smoke = RUN_GPU_LONG_STRESS_SMOKE
-    budget_gib = float(os.environ.get("PUCT_V2_LONG_STRESS_BUDGET_GB", "24.0"))
-    budget_bytes = int(budget_gib * (1024 ** 3))
+    budget_gib = float(os.environ.get("PUCT_V3_LONG_STRESS_BUDGET_GB", "24.0"))
+    budget_bytes = int(budget_gib * (1024**3))
     try:
         free_bytes, total_bytes = cuda.current_context().get_memory_info()
     except Exception:
         free_bytes, total_bytes = budget_bytes, budget_bytes
-    reserve_gib = float(os.environ.get("PUCT_V2_LONG_STRESS_RESERVE_GB", "0.50"))
-    reserve_bytes = int(reserve_gib * (1024 ** 3))
+    reserve_gib = float(os.environ.get("PUCT_V3_LONG_STRESS_RESERVE_GB", "0.50"))
+    reserve_bytes = int(reserve_gib * (1024**3))
     usable_bytes = min(budget_bytes, max(0, free_bytes - reserve_bytes))
-    gpu_index = _env_int("PUCT_V2_LONG_STRESS_GPU", 0, minimum=0)
-    warps = _env_int("PUCT_V2_LONG_STRESS_WARPS", 8)
-    warmup = 1 if smoke else _env_int("PUCT_V2_LONG_STRESS_WARMUP", 3)
-    iterations = 4 if smoke else _env_int("PUCT_V2_LONG_STRESS_ITERS", 128)
-    chunk_size = 2 if smoke else _env_int("PUCT_V2_LONG_STRESS_CHUNK", 8)
-    progress_every = 2 if smoke else _env_int("PUCT_V2_LONG_STRESS_PROGRESS", 16)
-    sample_interval = _env_float("PUCT_V2_LONG_STRESS_SAMPLE_SEC", 0.5, minimum=0.1)
-    variants = [VARIANT_PRECLAIM] if smoke else parse_scale_variants()
+    gpu_index = _env_int("PUCT_V3_LONG_STRESS_GPU", 0, minimum=0)
+    warps = _env_int("PUCT_V3_LONG_STRESS_WARPS", 8)
+    warmup = 1 if smoke else _env_int("PUCT_V3_LONG_STRESS_WARMUP", 3)
+    iterations = 4 if smoke else _env_int("PUCT_V3_LONG_STRESS_ITERS", 128)
+    chunk_size = 2 if smoke else _env_int("PUCT_V3_LONG_STRESS_CHUNK", 8)
+    progress_every = 2 if smoke else _env_int("PUCT_V3_LONG_STRESS_PROGRESS", 16)
+    sample_interval = _env_float("PUCT_V3_LONG_STRESS_SAMPLE_SEC", 0.5, minimum=0.1)
+    variants = parse_scale_variants()
     configs = select_named_scale_configs(
         cpu_scale_configs(warps, True),
-        "PUCT_V2_LONG_STRESS_SCENARIOS",
+        "PUCT_V3_LONG_STRESS_SCENARIOS",
         "eq64_d512" if smoke else "eq256_d512",
     )
 
-    print("\n  V2 GPU long-run large-scale stress benchmark")
+    print("\n  V3 GPU long-run large-scale stress benchmark")
     print(
-        f"  memory: free={free_bytes / (1024 ** 3):.2f}GiB total={total_bytes / (1024 ** 3):.2f}GiB "
-        f"budget={budget_gib:.2f}GiB reserve={reserve_gib:.2f}GiB usable={usable_bytes / (1024 ** 3):.2f}GiB"
+        f"  memory: free={free_bytes / (1024**3):.2f}GiB total={total_bytes / (1024**3):.2f}GiB "
+        f"budget={budget_gib:.2f}GiB reserve={reserve_gib:.2f}GiB usable={usable_bytes / (1024**3):.2f}GiB"
     )
     print(
         f"  variants={','.join(variants)} scenarios={','.join(cfg[0] for cfg in configs)} "
@@ -1714,7 +1875,7 @@ def bench_gpu_long_stress():
     for variant in variants:
         for name, trees, cfg_warps, actions, depth, prior_mode in configs:
             estimated = estimate_deep_chain_bytes(trees, depth, actions, cfg_warps)
-            estimated_gib = estimated / float(1024 ** 3)
+            estimated_gib = estimated / float(1024**3)
             if estimated > usable_bytes:
                 print(
                     f"  {variant:>13} | {name:>12} | {trees:6d} | {depth:5d} | {actions:5d} | {estimated_gib:7.2f} | "
@@ -1800,18 +1961,18 @@ def bench_gpu_long_stress():
 
 
 def bench_large_scale_deep_wide():
-    budget_gib = float(os.environ.get("PUCT_V2_SCALE_BUDGET_GB", "24.0"))
-    budget_bytes = int(budget_gib * (1024 ** 3))
+    budget_gib = float(os.environ.get("PUCT_V3_SCALE_BUDGET_GB", "24.0"))
+    budget_bytes = int(budget_gib * (1024**3))
     try:
         free_bytes, total_bytes = cuda.current_context().get_memory_info()
     except Exception:
         free_bytes, total_bytes = budget_bytes, budget_bytes
-    reserve_gib = float(os.environ.get("PUCT_V2_SCALE_RESERVE_GB", "0.50"))
-    reserve_bytes = int(reserve_gib * (1024 ** 3))
+    reserve_gib = float(os.environ.get("PUCT_V3_SCALE_RESERVE_GB", "0.50"))
+    reserve_bytes = int(reserve_gib * (1024**3))
     usable_bytes = min(budget_bytes, max(0, free_bytes - reserve_bytes))
-    warps = int(os.environ.get("PUCT_V2_SCALE_WARPS", "8"))
-    warmup = _env_int("PUCT_V2_SCALE_WARMUP", 5)
-    iterations = _env_int("PUCT_V2_SCALE_ITERS", 5)
+    warps = int(os.environ.get("PUCT_V3_SCALE_WARPS", "8"))
+    warmup = _env_int("PUCT_V3_SCALE_WARMUP", 5)
+    iterations = _env_int("PUCT_V3_SCALE_ITERS", 5)
     variants = parse_scale_variants()
 
     configs = [
@@ -1829,21 +1990,21 @@ def bench_large_scale_deep_wide():
         ("hot64_d1024", 16384, warps, 64, 1024, "hot"),
     ]
 
-    print("\n  V2 large-scale deep-wide select benchmark")
+    print("\n  V3 large-scale deep-wide select benchmark")
     print(
-        f"  memory: free={free_bytes / (1024 ** 3):.2f}GiB total={total_bytes / (1024 ** 3):.2f}GiB "
-        f"budget={budget_gib:.2f}GiB reserve={reserve_gib:.2f}GiB usable={usable_bytes / (1024 ** 3):.2f}GiB"
+        f"  memory: free={free_bytes / (1024**3):.2f}GiB total={total_bytes / (1024**3):.2f}GiB "
+        f"budget={budget_gib:.2f}GiB reserve={reserve_gib:.2f}GiB usable={usable_bytes / (1024**3):.2f}GiB"
     )
     print(
         f"  variants={','.join(variants)} warmup={warmup} timed_select_launches={iterations} "
-        f"untimed_backup_launches={warmup + iterations} warps_per_tree={warps}"
+        f"untimed_release_launches={warmup + iterations} warps_per_tree={warps}"
     )
     print("  " + "-" * 190)
     print(
         f"  {'variant':>15} | {'scenario':>14} | {'trees':>6} | {'warps':>5} | {'depth':>5} | {'acts':>5} | "
         f"{'estGiB':>7} | {'path_len':>8} | {'sel/s':>12} | {'ns/edge':>10} | "
         f"{'root_kl':>8} | {'max1/tree%':>10} | {'maxpath%':>8} | "
-        f"{'path75%':>7} | {'samepath%':>9} | {'invalid%':>8} | {'inflight':>10}"
+        f"{'path75%':>7} | {'samepath%':>9} | {'invalid%':>8} | {'busy%':>7} | {'inflight':>10}"
     )
     print("  " + "-" * 190)
 
@@ -1852,7 +2013,7 @@ def bench_large_scale_deep_wide():
     for variant in variants:
         for name, trees, cfg_warps, actions, depth, prior_mode in configs:
             estimated = estimate_deep_chain_bytes(trees, depth, actions, cfg_warps)
-            estimated_gib = estimated / float(1024 ** 3)
+            estimated_gib = estimated / float(1024**3)
             if estimated > usable_bytes:
                 print(
                     f"  {variant:>15} | {name:>14} | {trees:6d} | {cfg_warps:5d} | {depth:5d} | {actions:5d} | "
@@ -1875,8 +2036,13 @@ def bench_large_scale_deep_wide():
                 )
                 cuda.synchronize()
                 elapsed_ms = time_select_kernel_only(
-                    d, trees=trees, warps=cfg_warps, c_pw=0.0, variant=variant,
-                    warmup=warmup, iterations=iterations,
+                    d,
+                    trees=trees,
+                    warps=cfg_warps,
+                    c_pw=0.0,
+                    variant=variant,
+                    warmup=warmup,
+                    iterations=iterations,
                 )
 
                 h = copy_selection_outputs(d)
@@ -1896,7 +2062,8 @@ def bench_large_scale_deep_wide():
                     f"{metrics['root_kl']:8.3f} | {metrics['tree_dominant_first_pct']:9.2f}% | "
                     f"{metrics['tree_dominant_path_pct']:7.2f}% | "
                     f"{metrics['tree_dominant_path_75_pct']:6.2f}% | "
-                    f"{metrics['tree_same_path_pct']:8.2f}% | {metrics['invalid_pct']:7.2f}% | "
+                    f"{metrics['tree_same_path_pct']:8.2f}% | "
+                    f"{metrics['invalid_pct']:7.2f}% | {metrics['busy_pct']:6.2f}% | "
                     f"{inflight_label:>10}"
                 )
             except Exception as exc:
@@ -1915,6 +2082,18 @@ def bench_large_scale_deep_wide():
     record("large-scale deep-wide benchmark completed", any_ran and all_ok, "4096..16384 trees within memory budget")
 
 
+def summarize_results_and_exit():
+    failed = [name for name, ok in results if not ok]
+    print("\n================================================================")
+    if failed:
+        print(f"  FAILED: {len(failed)} test(s)")
+        for name in failed:
+            print(f"    - {name}")
+        sys.exit(1)
+    print(f"  ALL PASSED: {len(results)} test(s)")
+    print("================================================================")
+
+
 def main():
     if (
         RUN_CPU_BENCH
@@ -1925,15 +2104,7 @@ def main():
         and not RUN_BENCH
     ):
         bench_cpu_vs_gpu_sequential()
-        failed = [name for name, ok in results if not ok]
-        print("\n================================================================")
-        if failed:
-            print(f"  FAILED: {len(failed)} test(s)")
-            for name in failed:
-                print(f"    - {name}")
-            sys.exit(1)
-        print(f"  ALL PASSED: {len(results)} test(s)")
-        print("================================================================")
+        summarize_results_and_exit()
         return
 
     if (
@@ -1945,15 +2116,7 @@ def main():
         and not RUN_BENCH
     ):
         bench_cpu_vs_gpu_scale_aligned()
-        failed = [name for name, ok in results if not ok]
-        print("\n================================================================")
-        if failed:
-            print(f"  FAILED: {len(failed)} test(s)")
-            for name in failed:
-                print(f"    - {name}")
-            sys.exit(1)
-        print(f"  ALL PASSED: {len(results)} test(s)")
-        print("================================================================")
+        summarize_results_and_exit()
         return
 
     if (
@@ -1965,15 +2128,7 @@ def main():
         and not RUN_BENCH
     ):
         bench_gpu_long_stress()
-        failed = [name for name, ok in results if not ok]
-        print("\n================================================================")
-        if failed:
-            print(f"  FAILED: {len(failed)} test(s)")
-            for name in failed:
-                print(f"    - {name}")
-            sys.exit(1)
-        print(f"  ALL PASSED: {len(results)} test(s)")
-        print("================================================================")
+        summarize_results_and_exit()
         return
 
     if (
@@ -1985,15 +2140,7 @@ def main():
         and not RUN_BENCH
     ):
         bench_large_scale_deep_wide()
-        failed = [name for name, ok in results if not ok]
-        print("\n================================================================")
-        if failed:
-            print(f"  FAILED: {len(failed)} test(s)")
-            for name in failed:
-                print(f"    - {name}")
-            sys.exit(1)
-        print(f"  ALL PASSED: {len(results)} test(s)")
-        print("================================================================")
+        summarize_results_and_exit()
         return
 
     test_fresh_root_expand_roundtrip()
@@ -2001,12 +2148,15 @@ def main():
     test_invalid_child_rolls_back_path()
     test_child_beyond_node_count_invalid()
     test_progressive_widening_multi_warp_claims_unique_slots()
-    test_fully_expanded_select_and_backup_roundtrip()
+    test_single_edge_contention_keeps_all_warps_valid()
+    test_pw_ticket_full_falls_through_to_existing_child()
+    test_fully_expanded_select_and_release_roundtrip()
     test_depth_limit()
+    test_n_zero_edge_is_still_selectable()
     test_encoding_boundaries()
     if RUN_STRESS:
-        test_v2_stress()
-        test_v2_deep_tree_stress()
+        test_v3_stress()
+        test_v3_deep_tree_stress()
     if RUN_BENCH:
         bench_select_only()
         bench_deep_tree_depths()
@@ -2019,15 +2169,7 @@ def main():
     if RUN_GPU_LONG_STRESS:
         bench_gpu_long_stress()
 
-    failed = [name for name, ok in results if not ok]
-    print("\n================================================================")
-    if failed:
-        print(f"  FAILED: {len(failed)} test(s)")
-        for name in failed:
-            print(f"    - {name}")
-        sys.exit(1)
-    print(f"  ALL PASSED: {len(results)} test(s)")
-    print("================================================================")
+    summarize_results_and_exit()
 
 
 if __name__ == "__main__":

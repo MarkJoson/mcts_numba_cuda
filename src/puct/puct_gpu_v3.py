@@ -19,15 +19,31 @@ PACKED_NODE_MASK = 0x3FFF
 PACKED_EDGE_MASK = 0xFF
 PACKED_KIND_SHIFT = 22
 PACKED_SLOT_SHIFT = 14
+PACKED_KIND_MASK = 0x7
+PACKED_REASON_SHIFT = 25
+PACKED_REASON_MASK = 0x7F
 
 # Selection result kinds
 SELECT_INVALID = 0      # No valid selection; virtual loss already rolled back
 SELECT_EXPAND = 1       # Node needs expansion (PW not saturated); CAS lock held
 SELECT_TERMINAL = 2     # Traversal hit a terminal node
 SELECT_DEPTH_LIMIT = 3  # Hit path capacity limit; treat as evaluation leaf
+SELECT_BUSY = 4         # Temporary contention; no virtual loss is held
 
-SEL_IN_PROGRESS = -2    # final_node: selection still in progress (replaces done flag)
-SEL_INVALID_NODE = -1   # final_node / output: no valid node selected
+# Per-warp exit reason codes (debug)
+REASON_UNSET = 0
+REASON_OK_EXPAND = 1
+REASON_OK_TERMINAL = 2
+REASON_OK_DEPTH_LIMIT = 3
+REASON_BUSY_EXPAND_INFLIGHT = 4
+REASON_INVALID_SHAPE = 10
+REASON_INVALID_NODE_INFO = 11
+REASON_INVALID_EXPAND_TICKET = 12
+REASON_INVALID_WINNER_CAS = 13
+REASON_INVALID_NO_VALID_EDGE = 14
+REASON_INVALID_CHILD_OOB = 15
+REASON_INVALID_UNKNOWN = 16
+
 PACKED_INVALID = (SELECT_INVALID << PACKED_KIND_SHIFT) | PACKED_NODE_MASK
 
 MAX_SELECT_RETRY = 8
@@ -78,11 +94,33 @@ def _score_better(score, eid, best_score, best_eid):
 
 
 @cuda.jit(device=True, inline=True)
-def _warp_reduce_best_eid(score, eid, inflight):
+def _tie_key_block_local(eid, tie_offset, span):
+    key = eid - tie_offset
+    if key < int32(0):
+        key += span
+    return key
+
+
+@cuda.jit(device=True, inline=True)
+def _score_better_block_local(score, eid, best_score, best_eid, tie_offset, span):
+    if score > best_score:
+        return True
+    if score == best_score:
+        if best_eid == int32(INT32_MAX):
+            return True
+        return (
+            _tie_key_block_local(eid, tie_offset, span) <
+            _tie_key_block_local(best_eid, tie_offset, span)
+        )
+    return False
+
+
+@cuda.jit(device=True, inline=True)
+def _warp_reduce_best_eid(score, eid, inflight, tie_offset, span):
     other_score = cuda.shfl_down_sync(FULL_MASK, score, 16)
     other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 16)
     other_inflight = cuda.shfl_down_sync(FULL_MASK, inflight, 16)
-    if _score_better(other_score, other_eid, score, eid):
+    if _score_better_block_local(other_score, other_eid, score, eid, tie_offset, span):
         score = other_score
         eid = other_eid
         inflight = other_inflight
@@ -90,7 +128,7 @@ def _warp_reduce_best_eid(score, eid, inflight):
     other_score = cuda.shfl_down_sync(FULL_MASK, score, 8)
     other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 8)
     other_inflight = cuda.shfl_down_sync(FULL_MASK, inflight, 8)
-    if _score_better(other_score, other_eid, score, eid):
+    if _score_better_block_local(other_score, other_eid, score, eid, tie_offset, span):
         score = other_score
         eid = other_eid
         inflight = other_inflight
@@ -98,7 +136,7 @@ def _warp_reduce_best_eid(score, eid, inflight):
     other_score = cuda.shfl_down_sync(FULL_MASK, score, 4)
     other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 4)
     other_inflight = cuda.shfl_down_sync(FULL_MASK, inflight, 4)
-    if _score_better(other_score, other_eid, score, eid):
+    if _score_better_block_local(other_score, other_eid, score, eid, tie_offset, span):
         score = other_score
         eid = other_eid
         inflight = other_inflight
@@ -106,7 +144,7 @@ def _warp_reduce_best_eid(score, eid, inflight):
     other_score = cuda.shfl_down_sync(FULL_MASK, score, 2)
     other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 2)
     other_inflight = cuda.shfl_down_sync(FULL_MASK, inflight, 2)
-    if _score_better(other_score, other_eid, score, eid):
+    if _score_better_block_local(other_score, other_eid, score, eid, tie_offset, span):
         score = other_score
         eid = other_eid
         inflight = other_inflight
@@ -114,7 +152,7 @@ def _warp_reduce_best_eid(score, eid, inflight):
     other_score = cuda.shfl_down_sync(FULL_MASK, score, 1)
     other_eid = cuda.shfl_down_sync(FULL_MASK, eid, 1)
     other_inflight = cuda.shfl_down_sync(FULL_MASK, inflight, 1)
-    if _score_better(other_score, other_eid, score, eid):
+    if _score_better_block_local(other_score, other_eid, score, eid, tie_offset, span):
         score = other_score
         eid = other_eid
         inflight = other_inflight
@@ -202,8 +240,13 @@ def _rollback_vloss_path(tree, wid, depth, lane,
 
 
 @cuda.jit(device=True, inline=True)
-def _pack_selection(kind, node, expand_slot):
-    return (kind << int32(PACKED_KIND_SHIFT)) | (expand_slot << int32(PACKED_SLOT_SHIFT)) | node
+def _pack_selection(kind, node, expand_slot, reason):
+    return (
+        (reason << int32(PACKED_REASON_SHIFT))
+        | (kind << int32(PACKED_KIND_SHIFT))
+        | (expand_slot << int32(PACKED_SLOT_SHIFT))
+        | node
+    )
 
 
 @cuda.jit(device=True, inline=True)
@@ -221,20 +264,21 @@ def _valid_select_shape(max_edge_steps, node_capacity, node_cnt, max_edges):
 @cuda.jit(device=True, inline=True)
 def _init_select_output(tree, wid, lane, out_selected_node, out_path_len):
     if lane == int32(0):
-        out_selected_node[tree, wid] = int32(PACKED_INVALID)
+        out_selected_node[tree, wid] = _pack_selection(
+            int32(SELECT_INVALID),
+            int32(PACKED_NODE_MASK),
+            int32(0),
+            int32(REASON_UNSET),
+        )
         out_path_len[tree, wid] = int32(0)
 
 
 @cuda.jit(device=True, inline=True)
-def _write_select_output(tree, wid, lane, final_node, final_len,
+def _write_select_output(tree, wid, lane, packed_selected, final_len,
                          out_selected_node, out_path_len):
     if lane == int32(0):
-        if final_node >= int32(0):
-            out_selected_node[tree, wid] = final_node
-            out_path_len[tree, wid] = final_len
-        else:
-            out_selected_node[tree, wid] = int32(PACKED_INVALID)
-            out_path_len[tree, wid] = int32(0)
+        out_selected_node[tree, wid] = packed_selected
+        out_path_len[tree, wid] = final_len
 
 
 @cuda.jit(device=True, inline=True)
@@ -278,7 +322,7 @@ def _parent_n_eff(edge_N, edge_inflight,
 @cuda.jit(device=True, inline=True)
 def _reduce_best_edge(cpuct, edge_prior, edge_W, edge_N, edge_inflight,
                         tree, node, cur_expanded, lane,
-                        sqrt_parent_n_eff):
+                        sqrt_parent_n_eff, tie_offset):
     ''' 并行读取并Reduce, 得到最优的动作。
     输入:
         cur_expanded: [1, ...)
@@ -305,20 +349,23 @@ def _reduce_best_edge(cpuct, edge_prior, edge_W, edge_N, edge_inflight,
             inflight,
             sqrt_parent_n_eff,
         )
-        if _score_better(score, int32(eid), best_score, best_eid):
+        if _score_better_block_local(score, int32(eid), best_score, best_eid,
+                                     tie_offset, cur_expanded):
             best_score = score
             best_eid = int32(eid)
             best_inflight = inflight
         eid += int32(WARP_SIZE)
 
-    best_score, best_eid, best_inflight = _warp_reduce_best_eid(best_score, best_eid, best_inflight)
+    best_score, best_eid, best_inflight = _warp_reduce_best_eid(
+        best_score, best_eid, best_inflight, tie_offset, cur_expanded,
+    )
     return best_eid, best_inflight
 
 
 @cuda.jit(device=True, inline=True)
 def _best_edge_winner_recalc(cpuct, edge_prior, edge_W, edge_N,
                              edge_inflight, tree, node, cur_expanded, n_nodes,
-                             lane, sqrt_parent_n_eff):
+                             lane, sqrt_parent_n_eff, tie_offset):
     '''多次重试选择下一个最优的孩子节点
     返回:
         best_eid>=0, INT32_MAX
@@ -336,7 +383,7 @@ def _best_edge_winner_recalc(cpuct, edge_prior, edge_W, edge_N,
         #* 选择最优动作，得到对应的 eid 与 inflight
         best_eid, best_inflight = _reduce_best_edge(                    #& 当前节点扩展边所有指向的节点是无效节点时, 返回INT32_MAX; 否则一定有效，且不为 INT_MAX
             cpuct, edge_prior, edge_W, edge_N, edge_inflight,
-            tree, node, cur_expanded, lane, sqrt_parent_n_eff,
+            tree, node, cur_expanded, lane, sqrt_parent_n_eff, tie_offset,
         )
         
         #* 上一步出现异常，当前节点扩展边所有指向的节点是无效节点
@@ -354,6 +401,15 @@ def _best_edge_winner_recalc(cpuct, edge_prior, edge_W, edge_N,
             break
 
         retry += int32(1)
+
+    # CAS churn is contention, not selection failure. Keep the traversal
+    # work-conserving by taking a soft virtual visit when the bounded
+    # winner-recalc loop cannot win the exact counter value.
+    if held == int32(0) and best_eid != int32(INT32_MAX):
+        if lane == int32(0):
+            cuda.atomic.add(edge_inflight, (tree, node, best_eid), int32(1))
+        held = int32(1)
+    held = cuda.shfl_sync(FULL_MASK, held, 0)
 
     return best_eid, held
 
@@ -407,29 +463,57 @@ def _select_kernel_winner_recalc(cpuct, c_pw, alpha_pw,
     node_cnt = cuda.shfl_sync(FULL_MASK, node_cnt, 0)
 
     if not _valid_select_shape(max_edge_steps, node_capacity, node_cnt, max_edges):
+        if lane == int32(0):
+            out_selected_node[tree, wid] = _pack_selection(
+                int32(SELECT_INVALID),
+                int32(PACKED_NODE_MASK),
+                int32(0),
+                int32(REASON_INVALID_SHAPE),
+            )
         return
 
-    final_node = int32(SEL_IN_PROGRESS)
+    final_packed = _pack_selection(
+        int32(SELECT_INVALID),
+        int32(PACKED_NODE_MASK),
+        int32(0),
+        int32(REASON_INVALID_UNKNOWN),
+    )
     final_len = int32(0)
     node = int32(0)
     depth = int32(0)
 
     while True:
         node_info = node_expanded[tree, node]               # &当前扩展节点的动作个数，范围 [0, max_edges) 
+        if node_info == int32(NODE_EXPANDED_TERMINAL):
+            final_packed = _pack_selection(
+                int32(SELECT_TERMINAL),
+                node,
+                int32(0),
+                int32(REASON_OK_TERMINAL),
+            )
+            final_len = depth + int32(1)
+            break
+
         #* 非 terminal 的负数或超过动作数的 expanded 计数都是非法状态。
         if node_info < int32(0) or node_info > max_edges:
             _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, int32(1), node_cnt, max_edges)
             cuda.syncwarp(FULL_MASK)
+            final_packed = _pack_selection(
+                int32(SELECT_INVALID),
+                int32(PACKED_NODE_MASK),
+                int32(0),
+                int32(REASON_INVALID_NODE_INFO),
+            )
             break
         
         #* 超过最大rollout长度，直接截断；终止态的节点。node_expanded 使用负数 sentinel 表示 terminal。需要考虑用 Value 网络重新估计节点价值
         if depth >= max_edge_steps:
-            final_node = _pack_selection(int32(SELECT_DEPTH_LIMIT), node, int32(0))
-            final_len = depth + int32(1)
-            break
-
-        if node_info == int32(NODE_EXPANDED_TERMINAL):
-            final_node = _pack_selection(int32(SELECT_TERMINAL), node, int32(0))
+            final_packed = _pack_selection(
+                int32(SELECT_DEPTH_LIMIT),
+                node,
+                int32(0),
+                int32(REASON_OK_DEPTH_LIMIT),
+            )
             final_len = depth + int32(1)
             break
 
@@ -441,38 +525,88 @@ def _select_kernel_winner_recalc(cpuct, c_pw, alpha_pw,
         )
         allowed = _allowed_children(c_pw, alpha_pw, parent_n_eff, max_edges)    #& 允许的最大节点数，返回值范围 [1, ...)
         if allowed > cur_expanded:
-            #* 用 node_expand_inflight ticket 给同一父节点分配不同 expand slot。
-            expand_slot = _claim_expand_slot(                                   #& 输出: -1(失败), 其他(成功, 指示slot存放位置)
-                node_expand_inflight, tree, node, cur_expanded, allowed, lane,
-            )
+            expand_inflight = int32(0)
+            if lane == int32(0):
+                expand_inflight = node_expand_inflight[tree, node]
+            expand_inflight = cuda.shfl_sync(FULL_MASK, expand_inflight, 0)
+
+            expand_slot = int32(-1)
+            if cur_expanded + expand_inflight < allowed:
+                #* 用 node_expand_inflight ticket 给同一父节点分配不同 expand slot。
+                expand_slot = _claim_expand_slot(                               #& 输出: -1(失败), 其他(成功, 指示slot存放位置)
+                    node_expand_inflight, tree, node, cur_expanded, allowed, lane,
+                )
             if expand_slot >= int32(0):     # 成功处理
-                final_node = _pack_selection(int32(SELECT_EXPAND), node, expand_slot)
+                final_packed = _pack_selection(
+                    int32(SELECT_EXPAND),
+                    node,
+                    expand_slot,
+                    int32(REASON_OK_EXPAND),
+                )
                 final_len = depth + int32(1)
-            else:                           # 失败处理, 当前节点未扩展完成，不能继续处理子节点
+                break
+
+            # Expansion quota can be temporarily occupied by sibling warps. If
+            # this node already has mature children, keep the traversal useful
+            # by selecting one of them instead of turning contention into skip.
+            if cur_expanded == int32(0):
                 _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, int32(1), node_cnt, max_edges)
                 cuda.syncwarp(FULL_MASK)
-            break
+                final_packed = _pack_selection(
+                    int32(SELECT_BUSY),
+                    node,
+                    int32(0),
+                    int32(REASON_BUSY_EXPAND_INFLIGHT),
+                )
+                final_len = int32(0)
+                break
         
         #~~~~~~~~ allowed <= cur_expanded ~~~~~~~~
 
         #* 在已完全展开的孩子边中选择 PUCT 最优边。
         #* 只在 winner 边上保留 virtual loss。使用 compare and set 原子操作进行处理
         sqrt_parent_n_eff = math.sqrt(float32(parent_n_eff))
+        tie_offset = wid
+        if tie_offset >= cur_expanded:
+            tie_offset = tie_offset % cur_expanded
         best_eid, claim_held = _best_edge_winner_recalc(
             cpuct, edge_prior, edge_W, edge_N, edge_inflight,
-            tree, node, cur_expanded, node_cnt, lane, sqrt_parent_n_eff,
+            tree, node, cur_expanded, node_cnt, lane, sqrt_parent_n_eff, tie_offset,
         )
 
         #* 当未取得 held 机会时直接回滚；拿到 held 后再校验 child 合法性。
         if claim_held == int32(0):
             _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, int32(1), node_cnt, max_edges)
             cuda.syncwarp(FULL_MASK)
+            if best_eid == int32(INT32_MAX):
+                final_packed = _pack_selection(
+                    int32(SELECT_INVALID),
+                    int32(PACKED_NODE_MASK),
+                    int32(0),
+                    int32(REASON_INVALID_NO_VALID_EDGE),
+                )
+            else:
+                final_packed = _pack_selection(
+                    int32(SELECT_INVALID),
+                    int32(PACKED_NODE_MASK),
+                    int32(0),
+                    int32(REASON_INVALID_WINNER_CAS),
+                )
             break
 
         best_child = edge_child_id[tree, node, best_eid]
         if best_child < int32(0) or best_child >= node_cnt:
+            if lane == int32(0):
+                cuda.atomic.sub(edge_inflight, (tree, node, best_eid), int32(1))
+            cuda.syncwarp(FULL_MASK)
             _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, int32(1), node_cnt, max_edges)
             cuda.syncwarp(FULL_MASK)
+            final_packed = _pack_selection(
+                int32(SELECT_INVALID),
+                int32(PACKED_NODE_MASK),
+                int32(0),
+                int32(REASON_INVALID_CHILD_OOB),
+            )
             break
         
         #* Path 编码格式为 (parent_node << 8) | edge_slot。backup 时直接解码。
@@ -482,4 +616,5 @@ def _select_kernel_winner_recalc(cpuct, c_pw, alpha_pw,
         node = best_child
         depth += int32(1)
 
-    _write_select_output(tree, wid, lane, final_node, final_len, out_selected_node, out_path_len)
+    _write_select_output(tree, wid, lane, final_packed, final_len,
+                         out_selected_node, out_path_len)
