@@ -436,6 +436,7 @@ def _select_kernel_winner_recalc(cpuct, c_pw, alpha_pw, soft_winner,
     """
     每个 warp 独立遍历树，选出待扩展节点。1 block = 1 tree; 1 warp = 1 条遍历路径。
 
+    # TODO. 这个soft_winner不是这样作为标志位的...，是类似宏定义的存在；或者如果要作为参数，可以考虑做自适应的根据某些信息进行开关，这个作为自适应算法的超参数存在
     输出：
       out_selected_node[tree, wid]  — SELECT_EXPAND / SELECT_TERMINAL / SELECT_DEPTH_LIMIT / SELECT_INVALID + 被选中的节点 id
       out_path_eids[tree, wid, :]   — 路径上的边 id
@@ -520,12 +521,13 @@ def _select_kernel_winner_recalc(cpuct, c_pw, alpha_pw, soft_winner,
         cur_expanded = node_info
         parent_n_eff = int32(1)
         allowed = int32(1)
-        if cur_expanded != int32(1) or c_pw != float32(0.0):
+        if cur_expanded != int32(1) or c_pw != float32(0.0):        #* fast-path 在 cur_expanded=1 时 bypass 计算
             parent_n_eff = _parent_n_eff(                                       #& 父节点的遍历次数，返回值范围 [1, ...)
                 edge_N, edge_inflight, tree, node, cur_expanded, lane,
             )
             allowed = _allowed_children(c_pw, alpha_pw, parent_n_eff, max_edges)#& 允许的最大节点数，返回值范围 [1, ...)
         if allowed > cur_expanded:
+            #* fast-path，先看看这个节点有多少 inflight 在执行创建任务
             expand_inflight = int32(0)
             if lane == int32(0):
                 expand_inflight = node_expand_inflight[tree, node]
@@ -537,19 +539,12 @@ def _select_kernel_winner_recalc(cpuct, c_pw, alpha_pw, soft_winner,
                 expand_slot = _claim_expand_slot(                               #& 输出: -1(失败), 其他(成功, 指示slot存放位置)
                     node_expand_inflight, tree, node, cur_expanded, allowed, lane,
                 )
-            if expand_slot >= int32(0):     # 成功处理
-                final_packed = _pack_selection(
-                    int32(SELECT_EXPAND),
-                    node,
-                    expand_slot,
-                    int32(REASON_OK_EXPAND),
-                )
+            if expand_slot >= int32(0):
+                final_packed = _pack_selection(int32(SELECT_EXPAND), node, expand_slot, int32(REASON_OK_EXPAND))
                 final_len = depth + int32(1)
                 break
 
-            # Expansion quota can be temporarily occupied by sibling warps. If
-            # this node already has mature children, keep the traversal useful
-            # by selecting one of them instead of turning contention into skip.
+            #* 当前节点是叶子节点，且已经有其他warp做扩展时，无法继续往下探索了，直接退出
             if cur_expanded == int32(0):
                 _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, int32(1), node_cnt, max_edges)
                 cuda.syncwarp(FULL_MASK)
@@ -571,7 +566,7 @@ def _select_kernel_winner_recalc(cpuct, c_pw, alpha_pw, soft_winner,
             tie_offset = tie_offset % cur_expanded
         best_eid = int32(0)
         claim_held = int32(0)
-        if cur_expanded == int32(1):
+        if cur_expanded == int32(1):        #* fast-path 只有一个节点扩展就别争了，继续往下吧，没必要卡一边瓶颈
             if lane == int32(0):
                 cuda.atomic.add(edge_inflight, (tree, node, int32(0)), int32(1))
                 claim_held = int32(1)
