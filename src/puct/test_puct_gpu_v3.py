@@ -41,7 +41,8 @@ RUN_GPU_LONG_STRESS = "--gpu-long-stress" in sys.argv or RUN_GPU_LONG_STRESS_SMO
 results: list[tuple[str, bool]] = []
 
 VARIANT_WINNER_RECALC = "winner_recalc"
-SELECT_VARIANTS = [VARIANT_WINNER_RECALC]
+VARIANT_WINNER_SOFT = "winner_soft"
+SELECT_VARIANTS = [VARIANT_WINNER_RECALC, VARIANT_WINNER_SOFT]
 
 
 def record(name: str, ok: bool, detail: str = ""):
@@ -65,6 +66,13 @@ if getattr(config, "ENABLE_CUDASIM", False):
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import puct.puct_gpu_v3 as v3  # noqa: E402
+try:
+    import puct.puct_gpu_v3_cpp as v3_cpp  # noqa: E402
+except Exception:
+    v3_cpp = None
+
+
+SELECT_BACKEND = os.environ.get("PUCT_V3_BACKEND", "numba").strip().lower()
 
 
 def decode(raw: int):
@@ -145,6 +153,7 @@ def _init_deep_chain_edges_kernel(
     actions,
     fanout,
     unique_wide,
+    layered_wide,
     prior_mode,
     terminal_leaf,
     terminal_value,
@@ -166,9 +175,19 @@ def _init_deep_chain_edges_kernel(
         node = (idx // actions) % nodes
         tree = idx // (actions * nodes)
         legal = action < fanout
-        if unique_wide == 0:
+        if layered_wide != 0:
+            level = node // actions
+            pos = node - level * actions
+            if node == 0:
+                level = np.int32(0)
+                pos = np.int32(0)
+            legal = level < tree_depth and action < fanout
+            child = (level + np.int32(1)) * actions + action
+        elif unique_wide == 0:
             legal = node < tree_depth and action < fanout
-        child = action + 1 if unique_wide != 0 else node + 1
+            child = node + 1
+        else:
+            child = action + 1
         edge_child[tree, node, action] = child if legal else -1
         edge_prior[tree, node, action] = 2.0 if legal and action == 0 and prior_mode == 1 else 1.0
         edge_w[tree, node, action] = 0.0
@@ -178,7 +197,10 @@ def _init_deep_chain_edges_kernel(
             node_expand_inflight[tree, node] = 0
             if node == 0:
                 node_count[tree] = nodes
-            if unique_wide != 0:
+            if layered_wide != 0:
+                level = node // actions
+                node_expanded[tree, node] = fanout if level < tree_depth else terminal_value
+            elif unique_wide != 0:
                 node_expanded[tree, node] = fanout
             elif node < tree_depth:
                 node_expanded[tree, node] = fanout
@@ -326,6 +348,16 @@ def estimate_deep_chain_bytes(trees, tree_depth, actions, warps):
     return edge_bytes + node_bytes + output_bytes
 
 
+def estimate_deep_case_bytes(trees, tree_depth, actions, warps, shape):
+    nodes = tree_depth + 1 if shape == "narrow" else actions + 1
+    if shape == "layered":
+        nodes = (tree_depth + 1) * actions
+    edge_bytes = trees * nodes * actions * 20
+    node_bytes = trees * nodes * 8 + trees * 4
+    output_bytes = trees * warps * 8 + trees * warps * max(1, tree_depth) * 4
+    return edge_bytes + node_bytes + output_bytes
+
+
 def make_deep_chain_case_device(
     trees=1,
     tree_depth=64,
@@ -336,6 +368,8 @@ def make_deep_chain_case_device(
     terminal_leaf=False,
 ):
     nodes = tree_depth + 1 if shape == "narrow" else actions + 1
+    if shape == "layered":
+        nodes = (tree_depth + 1) * actions
     fanout = 1 if shape == "narrow" else actions
     d = {
         "edge_child": cuda.device_array((trees, nodes, actions), np.int32),
@@ -360,6 +394,7 @@ def make_deep_chain_case_device(
         np.int32(actions),
         np.int32(fanout),
         np.int32(1 if shape != "narrow" else 0),
+        np.int32(1 if shape == "layered" else 0),
         np.int32(1 if prior_mode == "hot" else 0),
         np.int32(1 if terminal_leaf else 0),
         np.int32(v3.NODE_EXPANDED_TERMINAL),
@@ -390,12 +425,26 @@ def copy_back(dcase):
 
 
 def launch_select(d, cpuct=1.0, c_pw=1.0, alpha_pw=0.5, variant=VARIANT_WINNER_RECALC):
-    if variant != VARIANT_WINNER_RECALC:
+    if variant not in SELECT_VARIANTS:
         raise ValueError(f"unknown select variant for v3: {variant}")
+    if SELECT_BACKEND == "cpp":
+        if v3_cpp is None:
+            raise RuntimeError("PUCT_V3_BACKEND=cpp requested but puct_gpu_v3_cpp could not be imported")
+        v3_cpp.launch_select(
+            d,
+            cpuct=cpuct,
+            c_pw=c_pw,
+            alpha_pw=alpha_pw,
+            soft_winner=1 if variant == VARIANT_WINNER_SOFT else 0,
+        )
+        return
+    if SELECT_BACKEND != "numba":
+        raise ValueError(f"unknown PUCT_V3_BACKEND: {SELECT_BACKEND}")
     v3._select_kernel_winner_recalc[d["trees"], d["warps"] * v3.WARP_SIZE](
         np.float32(cpuct),
         np.float32(c_pw),
         np.float32(alpha_pw),
+        np.int32(1 if variant == VARIANT_WINNER_SOFT else 0),
         d["edge_child"],
         d["edge_prior"],
         d["edge_w"],
@@ -1096,7 +1145,10 @@ def host_inflight_sum(h):
 
 
 def host_inflight_nonnegative(h):
-    return not np.any(h["edge_inflight"] < 0) and not np.any(h["node_expand_inflight"] < 0)
+    return (
+        not np.any(h["edge_inflight"] < 0)
+        and not np.any(h["node_expand_inflight"] < 0)
+    )
 
 
 def test_fresh_root_expand_roundtrip():
@@ -1194,7 +1246,7 @@ def test_progressive_widening_multi_warp_claims_unique_slots():
     )
 
 
-def test_single_edge_contention_keeps_all_warps_valid():
+def test_single_edge_contention_allows_singleton_claims():
     case = make_case(nodes=2, actions=4, warps=8, path_depth=2)
     case["node_expanded"][0, 0] = 1
     case["edge_child"][0, 0, 0] = 1
@@ -1204,13 +1256,16 @@ def test_single_edge_contention_keeps_all_warps_valid():
     d, h = run_select(case, c_pw=0.0)
 
     kinds = [decode(int(h["out_selected"][0, wid]))[0] for wid in range(case["warps"])]
+    valid_count = sum(1 for kind in kinds if kind == v3.SELECT_TERMINAL)
+    busy_count = sum(1 for kind in kinds if kind == v3.SELECT_BUSY)
     h2 = run_release(d)
     ok = (
-        all(kind == v3.SELECT_TERMINAL for kind in kinds)
-        and int(h["edge_inflight"][0, 0, 0]) == case["warps"]
+        valid_count > 0
+        and valid_count + busy_count == case["warps"]
+        and int(h["edge_inflight"][0, 0, 0]) == valid_count
         and host_inflight_sum(h2) == 0
     )
-    record("single-edge contention remains valid via soft virtual visits", ok, f"kinds={kinds}")
+    record("single-edge contention allows singleton claims", ok, f"kinds={kinds}")
 
 
 def test_pw_ticket_full_falls_through_to_existing_child():
@@ -1225,16 +1280,55 @@ def test_pw_ticket_full_falls_through_to_existing_child():
 
     kinds = [decode(int(h["out_selected"][0, wid]))[0] for wid in range(case["warps"])]
     selected_nodes = [decode(int(h["out_selected"][0, wid]))[2] for wid in range(case["warps"])]
+    valid_count = sum(1 for kind in kinds if kind == v3.SELECT_TERMINAL)
+    busy_count = sum(1 for kind in kinds if kind == v3.SELECT_BUSY)
     h2 = run_release(d)
     ok = (
-        all(kind == v3.SELECT_TERMINAL for kind in kinds)
-        and selected_nodes == [1, 1]
-        and int(h["edge_inflight"][0, 0, 0]) == case["warps"]
+        valid_count > 0
+        and valid_count + busy_count == case["warps"]
+        and all(node in (0, 1) for node in selected_nodes)
+        and int(h["edge_inflight"][0, 0, 0]) == valid_count
         and int(h["node_expand_inflight"][0, 0]) == 3
         and int(h2["node_expand_inflight"][0, 0]) == 3
         and int(h2["edge_inflight"][0, 0, 0]) == 0
     )
     record("full PW ticket quota falls through to existing child", ok, f"kinds={kinds}, nodes={selected_nodes}")
+
+
+def test_winner_soft_is_explicit_fake_claim_option():
+    case = make_case(nodes=4, actions=4, warps=8, path_depth=2)
+    case["node_expanded"][0, 0] = 2
+    for slot, child in enumerate((1, 2)):
+        case["edge_child"][0, 0, slot] = child
+        case["edge_prior"][0, 0, slot] = 1.0
+        case["edge_n"][0, 0, slot] = 1
+        case["node_expanded"][0, child] = v3.NODE_EXPANDED_TERMINAL
+
+    d_strict, h_strict = run_select(case, c_pw=0.0, variant=VARIANT_WINNER_RECALC)
+    strict_kinds = [decode(int(h_strict["out_selected"][0, wid]))[0] for wid in range(case["warps"])]
+    strict_valid = sum(1 for kind in strict_kinds if kind == v3.SELECT_TERMINAL)
+    strict_busy = sum(1 for kind in strict_kinds if kind == v3.SELECT_BUSY)
+    h_strict_released = run_release(d_strict)
+
+    d_soft, h_soft = run_select(case, c_pw=0.0, variant=VARIANT_WINNER_SOFT)
+    soft_kinds = [decode(int(h_soft["out_selected"][0, wid]))[0] for wid in range(case["warps"])]
+    soft_valid = sum(1 for kind in soft_kinds if kind == v3.SELECT_TERMINAL)
+    soft_busy = sum(1 for kind in soft_kinds if kind == v3.SELECT_BUSY)
+    h_soft_released = run_release(d_soft)
+
+    ok = (
+        strict_valid > 0
+        and strict_busy > 0
+        and soft_valid == case["warps"]
+        and soft_busy == 0
+        and host_inflight_sum(h_strict_released) == 0
+        and host_inflight_sum(h_soft_released) == 0
+    )
+    record(
+        "winner_soft explicitly enables fake winner claims",
+        ok,
+        f"strict={strict_kinds}, soft={soft_kinds}",
+    )
 
 
 def test_fully_expanded_select_and_release_roundtrip():
@@ -1684,7 +1778,7 @@ def bench_cpu_vs_gpu_scale_aligned():
     reserve_gib = float(os.environ.get("PUCT_V3_CPU_SCALE_RESERVE_GB", "0.50"))
     reserve_bytes = int(reserve_gib * (1024**3))
     usable_bytes = min(budget_bytes, max(0, free_bytes - reserve_bytes))
-    warps = _env_int("PUCT_V3_CPU_SCALE_WARPS", 8)
+    warps = _env_int("PUCT_V3_CPU_SCALE_WARPS", 4)
     cpu_warmup = _env_int("PUCT_V3_CPU_SCALE_CPU_WARMUP", 1)
     cpu_repeats = _env_int("PUCT_V3_CPU_SCALE_CPU_REPEATS", 1)
     gpu_warmup = _env_int("PUCT_V3_CPU_SCALE_GPU_WARMUP", 2)
@@ -1837,7 +1931,7 @@ def bench_gpu_long_stress():
     reserve_bytes = int(reserve_gib * (1024**3))
     usable_bytes = min(budget_bytes, max(0, free_bytes - reserve_bytes))
     gpu_index = _env_int("PUCT_V3_LONG_STRESS_GPU", 0, minimum=0)
-    warps = _env_int("PUCT_V3_LONG_STRESS_WARPS", 8)
+    warps = _env_int("PUCT_V3_LONG_STRESS_WARPS", 4)
     warmup = 1 if smoke else _env_int("PUCT_V3_LONG_STRESS_WARMUP", 3)
     iterations = 4 if smoke else _env_int("PUCT_V3_LONG_STRESS_ITERS", 128)
     chunk_size = 2 if smoke else _env_int("PUCT_V3_LONG_STRESS_CHUNK", 8)
@@ -1970,7 +2064,7 @@ def bench_large_scale_deep_wide():
     reserve_gib = float(os.environ.get("PUCT_V3_SCALE_RESERVE_GB", "0.50"))
     reserve_bytes = int(reserve_gib * (1024**3))
     usable_bytes = min(budget_bytes, max(0, free_bytes - reserve_bytes))
-    warps = int(os.environ.get("PUCT_V3_SCALE_WARPS", "8"))
+    warps = int(os.environ.get("PUCT_V3_SCALE_WARPS", "4"))
     warmup = _env_int("PUCT_V3_SCALE_WARMUP", 5)
     iterations = _env_int("PUCT_V3_SCALE_ITERS", 5)
     variants = parse_scale_variants()
@@ -2148,8 +2242,9 @@ def main():
     test_invalid_child_rolls_back_path()
     test_child_beyond_node_count_invalid()
     test_progressive_widening_multi_warp_claims_unique_slots()
-    test_single_edge_contention_keeps_all_warps_valid()
+    test_single_edge_contention_allows_singleton_claims()
     test_pw_ticket_full_falls_through_to_existing_child()
+    test_winner_soft_is_explicit_fake_claim_option()
     test_fully_expanded_select_and_release_roundtrip()
     test_depth_limit()
     test_n_zero_edge_is_still_selectable()

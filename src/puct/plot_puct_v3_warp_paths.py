@@ -62,6 +62,7 @@ def reason_name(reason: int) -> str:
         v3.REASON_OK_TERMINAL: "OK_TERMINAL",
         v3.REASON_OK_DEPTH_LIMIT: "OK_DEPTH_LIMIT",
         v3.REASON_BUSY_EXPAND_INFLIGHT: "BUSY_EXPAND_INFLIGHT",
+        v3.REASON_BUSY_WINNER_RECALC: "BUSY_WINNER_RECALC",
         v3.REASON_INVALID_SHAPE: "INVALID_SHAPE",
         v3.REASON_INVALID_NODE_INFO: "INVALID_NODE_INFO",
         v3.REASON_INVALID_EXPAND_TICKET: "INVALID_EXPAND_TICKET",
@@ -299,10 +300,12 @@ def compute_expected_expand(case: dict, host: dict, c_pw: float, alpha_pw: float
 
 def run_select(case: dict, cpuct: float, c_pw: float, alpha_pw: float):
     d = {k: cuda.to_device(v) if isinstance(v, np.ndarray) else v for k, v in case.items()}
+    soft_winner = np.int32(1 if os.environ.get("PUCT_V3_SELECT_VARIANT", "winner_recalc") == "winner_soft" else 0)
     v3._select_kernel_winner_recalc[d["trees"], d["warps"] * v3.WARP_SIZE](
         np.float32(cpuct),
         np.float32(c_pw),
         np.float32(alpha_pw),
+        soft_winner,
         d["edge_child"],
         d["edge_prior"],
         d["edge_w"],
