@@ -174,7 +174,9 @@ def _puct_score(cpuct, prior, w, n_edge, n_edge_inflight, sqrt_parent_n_eff):
     for sibling warps, discouraging duplicate selection of the same edge.
     """
     n_edge_eff = n_edge + n_edge_inflight
-    q = w / float32(n_edge)
+    q = float32(0.0)
+    if n_edge > int32(0):
+        q = w / float32(n_edge)
     u = cpuct * prior * sqrt_parent_n_eff / float32(n_edge_eff + int32(1))
     return q + u
 
@@ -314,7 +316,7 @@ def _reduce_best_edge(cpuct, edge_prior, edge_W, edge_N, edge_inflight,
 
 
 @cuda.jit(device=True, inline=True)
-def _best_edge_winner_recalc(cpuct, edge_child_id, edge_prior, edge_W, edge_N,
+def _best_edge_winner_recalc(cpuct, edge_prior, edge_W, edge_N,
                              edge_inflight, tree, node, cur_expanded, n_nodes,
                              lane, sqrt_parent_n_eff):
     '''多次重试选择下一个最优的孩子节点
@@ -327,7 +329,7 @@ def _best_edge_winner_recalc(cpuct, edge_child_id, edge_prior, edge_W, edge_N,
     '''
     
     best_eid = int32(INT32_MAX)
-    held = False
+    held = int32(0)
     retry = int32(0)
 
     while retry < int32(MAX_RECALC_RETRY):
@@ -344,7 +346,7 @@ def _best_edge_winner_recalc(cpuct, edge_child_id, edge_prior, edge_W, edge_N,
         #* 对 inflight 进行 CAS，并检查是否成功 Hold
         if lane == int32(0):
             prev_inflight = cuda.atomic.cas(edge_inflight, (tree, node, best_eid), best_inflight, best_inflight + int32(1))
-            held = (prev_inflight == best_inflight) # 说明成功持有
+            held = int32(1) if prev_inflight == best_inflight else int32(0) # 说明成功持有
         held = cuda.shfl_sync(FULL_MASK, held, 0)   # 同步给所有线程
         
         #* 成功，或超过最大重试次数时退出
@@ -369,7 +371,7 @@ def _write_path_edge(out_path_eids, tree, wid, depth, lane, node, eid):
 @cuda.jit(void(
     float32, float32, float32,
     int32[:, :, :], float32[:, :, :], float32[:, :, :], int32[:, :, :],
-    int32[:, :], int32[:, :], int32[:, :], int32[:],
+    int32[:, :, :], int32[:, :], int32[:, :], int32[:],
     int32[:, :], int32[:, :, :], int32[:, :]),
     fastmath=True)
 def _select_kernel_winner_recalc(cpuct, c_pw, alpha_pw,
@@ -421,7 +423,12 @@ def _select_kernel_winner_recalc(cpuct, c_pw, alpha_pw,
             break
         
         #* 超过最大rollout长度，直接截断；终止态的节点。node_expanded 使用负数 sentinel 表示 terminal。需要考虑用 Value 网络重新估计节点价值
-        if depth >= max_edge_steps or node_info == int32(NODE_EXPANDED_TERMINAL):
+        if depth >= max_edge_steps:
+            final_node = _pack_selection(int32(SELECT_DEPTH_LIMIT), node, int32(0))
+            final_len = depth + int32(1)
+            break
+
+        if node_info == int32(NODE_EXPANDED_TERMINAL):
             final_node = _pack_selection(int32(SELECT_TERMINAL), node, int32(0))
             final_len = depth + int32(1)
             break
@@ -452,12 +459,18 @@ def _select_kernel_winner_recalc(cpuct, c_pw, alpha_pw,
         #* 只在 winner 边上保留 virtual loss。使用 compare and set 原子操作进行处理
         sqrt_parent_n_eff = math.sqrt(float32(parent_n_eff))
         best_eid, claim_held = _best_edge_winner_recalc(
-            cpuct, edge_child_id, edge_prior, edge_W, edge_N, edge_inflight,
+            cpuct, edge_prior, edge_W, edge_N, edge_inflight,
             tree, node, cur_expanded, node_cnt, lane, sqrt_parent_n_eff,
         )
 
-        #* 当未取得 held 机会 / 结果不合法时, claim_held=False; 换言之, 该函数在 claim_held 时保证结果时合法的, 不需要二次检查
+        #* 当未取得 held 机会时直接回滚；拿到 held 后再校验 child 合法性。
         if claim_held == int32(0):
+            _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, int32(1), node_cnt, max_edges)
+            cuda.syncwarp(FULL_MASK)
+            break
+
+        best_child = edge_child_id[tree, node, best_eid]
+        if best_child < int32(0) or best_child >= node_cnt:
             _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, int32(1), node_cnt, max_edges)
             cuda.syncwarp(FULL_MASK)
             break
@@ -466,7 +479,6 @@ def _select_kernel_winner_recalc(cpuct, c_pw, alpha_pw,
         _write_path_edge(out_path_eids, tree, wid, depth, lane, node, best_eid)
         cuda.syncwarp(FULL_MASK)
 
-        best_child = edge_child_id[tree, node, best_eid]
         node = best_child
         depth += int32(1)
 
