@@ -437,6 +437,7 @@ def _select_kernel_winner_recalc(cpuct, c_pw, alpha_pw, soft_winner,
     每个 warp 独立遍历树，选出待扩展节点。1 block = 1 tree; 1 warp = 1 条遍历路径。
 
     # TODO. 这个soft_winner不是这样作为标志位的...，是类似宏定义的存在；或者如果要作为参数，可以考虑做自适应的根据某些信息进行开关，这个作为自适应算法的超参数存在
+    # TODO. 考虑到节点扩展阶段是调用神经网络获得分布后进行反复采样的过程，因此应该一次性填充所有的有效动作。在 expand 阶段，按需调用环境的状态转移接口、与价值评估接口。
     输出：
       out_selected_node[tree, wid]  — SELECT_EXPAND / SELECT_TERMINAL / SELECT_DEPTH_LIMIT / SELECT_INVALID + 被选中的节点 id
       out_path_eids[tree, wid, :]   — 路径上的边 id
@@ -494,7 +495,7 @@ def _select_kernel_winner_recalc(cpuct, c_pw, alpha_pw, soft_winner,
             final_len = depth + int32(1)
             break
 
-        #* 非 terminal 的负数或超过动作数的 expanded 计数都是非法状态。
+        #* 检查node_expanded数组的数据，边个数是否超标。非 terminal 的负数或超过动作数的 expanded 计数都是非法状态。
         if node_info < int32(0) or node_info > max_edges:
             _rollback_vloss_path(tree, wid, depth, lane, out_path_eids, edge_inflight, int32(1), node_cnt, max_edges)
             cuda.syncwarp(FULL_MASK)
