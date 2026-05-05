@@ -28,7 +28,7 @@ class MincoPointEnvTransition(torch.nn.Module):
         piece_t: float = 0.1,
         dt: float | None = None,
         ratio: float = DEFAULT_RATIO,
-        n_checkpoints: int = 20,
+        n_checkpoints: int = 8,
         velocity_limit: float = 2.0,
         acceleration_limit: float = 3.0,
         collision_radius: float = 1.0,

@@ -286,7 +286,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--agents", type=int, default=4)
-    parser.add_argument("--checkpoints", type=int, default=20)
+    parser.add_argument("--checkpoints", type=int, default=8)
     parser.add_argument("--return-info", action="store_true")
     args = parser.parse_args()
 

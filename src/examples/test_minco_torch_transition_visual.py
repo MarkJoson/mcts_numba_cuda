@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from shutil import copyfile
 import time
@@ -88,12 +89,13 @@ def _save(fig: plt.Figure, out_dir: Path, filename: str) -> Path:
 def _make_env(
     device: torch.device,
     *,
+    num_agents: int = 4,
     obstacle_vertices: Sequence[Sequence[Sequence[float]]] | torch.Tensor | None = None,
     dtype: torch.dtype = torch.float32,
     **kwargs,
 ) -> MincoPointEnvTransition:
     env = MincoPointEnvTransition(
-        num_agents=4,
+        num_agents=num_agents,
         piece_t=0.1,
         dt=0.1,
         dtype=dtype,
@@ -141,6 +143,7 @@ def _simulate(
     time0: float = 0.0,
     clamp_target: bool = True,
     target_is_delta: bool = False,
+    display_projected_target: bool = True,
     freeze_after_done: int = 4,
     note_fn: Callable[[int, torch.Tensor | bool, MincoPointEnvStep | None], str] | None = None,
 ) -> list[SceneFrame]:
@@ -190,7 +193,11 @@ def _simulate(
             _unpack_frame(
                 env,
                 next_flat,
-                targets=info.projected_targets if clamp_target else target,
+                targets=(
+                    info.projected_targets
+                    if (clamp_target and display_projected_target)
+                    else target
+                ),
                 info=info,
                 done=done,
                 note=note,
@@ -264,6 +271,7 @@ def _draw_scene(
     obstacles: Sequence[Sequence[Sequence[float]]] = (),
     title: str,
     show_targets: bool = True,
+    fixed_goal: Sequence[float] | np.ndarray | None = None,
     legend: bool = True,
 ) -> None:
     frame = frames[frame_idx]
@@ -288,6 +296,18 @@ def _draw_scene(
         )
     )
     _draw_obstacles(ax, obstacles)
+    if fixed_goal is not None:
+        fg = np.asarray(fixed_goal, dtype=np.float32).reshape(2)
+        ax.scatter(
+            fg[0],
+            fg[1],
+            s=160,
+            color="#ffbf00",
+            marker="*",
+            edgecolors="#111111",
+            linewidths=1.2,
+            zorder=7,
+        )
 
     history = np.stack([f.positions for f in frames[: frame_idx + 1]], axis=0)
     for agent_idx in range(frame.positions.shape[0]):
@@ -369,6 +389,8 @@ def _write_scene_animation(
     obstacles: Sequence[Sequence[Sequence[float]]] = (),
     title: str,
     fps: int = 8,
+    show_targets: bool = True,
+    fixed_goal: Sequence[float] | np.ndarray | None = None,
 ) -> Path:
     fig, ax = plt.subplots(figsize=(7.2, 6.6))
     path = out_dir / filename
@@ -382,6 +404,8 @@ def _write_scene_animation(
                 bounds=bounds,
                 obstacles=obstacles,
                 title=title,
+                show_targets=show_targets,
+                fixed_goal=fixed_goal,
             )
             writer.grab_frame()
     plt.close(fig)
@@ -397,6 +421,8 @@ def _write_keyframes(
     obstacles: Sequence[Sequence[Sequence[float]]] = (),
     title: str,
     key_indices: Sequence[int] | None = None,
+    show_targets: bool = True,
+    fixed_goal: Sequence[float] | np.ndarray | None = None,
 ) -> Path:
     if key_indices is None:
         key_indices = [0, len(frames) // 2, len(frames) - 1]
@@ -412,6 +438,8 @@ def _write_keyframes(
             bounds=bounds,
             obstacles=obstacles,
             title=title,
+            show_targets=show_targets,
+            fixed_goal=fixed_goal,
             legend=False,
         )
     return _save(fig, out_dir, filename)
@@ -804,6 +832,366 @@ def visual_collision_matrix(out_dir: Path, device: torch.device) -> dict:
     }
 
 
+def visual_single_robot_obstacle_cruise(out_dir: Path, device: torch.device) -> dict:
+    """单机器人在复杂障碍区连续运动的功能回归可视化。"""
+    bounds = ((-6.0, 6.0), (-4.0, 4.0))
+    obstacles = [
+        [[-4.8, -3.0], [-3.7, -3.3], [-3.4, -2.2], [-4.5, -1.9]],
+        [[-2.8, -2.7], [-1.8, -3.0], [-1.5, -2.1], [-2.4, -1.7]],
+        [[-1.6, -0.8], [-0.6, -0.8], [-0.4, 0.2], [-1.0, 0.8], [-1.8, 0.2]],
+        [[0.3, -3.2], [1.1, -3.5], [1.6, -2.7], [1.1, -2.0], [0.1, -2.3]],
+        [[2.2, -1.1], [3.4, -1.2], [3.2, -0.1], [2.0, 0.1]],
+        [[3.6, 1.5], [4.8, 1.2], [5.1, 2.0], [4.4, 2.8], [3.5, 2.3]],
+        [[0.8, 1.9], [1.9, 1.6], [2.2, 2.5], [1.1, 2.9]],
+        [[-3.9, 1.6], [-2.7, 1.5], [-2.5, 2.4], [-3.3, 3.0], [-4.1, 2.5]],
+        [[-0.2, -2.0], [0.8, -1.7], [0.6, -0.8], [-0.4, -1.0]],
+        [[-5.4, -0.4], [-4.9, -1.1], [-4.2, -0.7], [-4.5, 0.2], [-5.2, 0.3]],
+        [[4.3, -3.3], [5.2, -3.0], [5.0, -2.2], [4.1, -2.4]],
+    ]
+    def build_env(*, mode: str) -> MincoPointEnvTransition:
+        env = _make_env(
+            device,
+            num_agents=1,
+            collision_radius=0.0,
+            obstacle_vertices=obstacles,
+            obstacle_collision_margin=0.06,
+            obstacle_target_projection=True,
+            obstacle_projection_iters=3,
+            obstacle_projection_extra_margin=0.02,
+            obstacle_projection_topk=8,
+            obstacle_projection_fixes_per_iter=2,
+            position_bounds=bounds,
+            done_on_team_eliminated=False,
+            done_on_obstacle_collision=False,
+            done_on_out_of_bounds=False,
+            tf=16.0,
+        )
+        env.projection_ops.set_iter_update_mode(mode)
+        env.projection_ops.set_jacobi_relax(0.5)
+        return env
+
+    env_filter = build_env(mode="filter")
+    env_jac_eager = build_env(mode="jacobi")
+    env_jac_comp = build_env(mode="jacobi")
+
+    waypoints = torch.tensor(
+        [[-5.2, -3.2], [-3.0, -2.8], [-1.2, -1.8], [0.5, -2.8], [2.8, -0.6], [4.6, 2.2]],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    def target_fn(step_idx: int, pos: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        idx = min(step_idx // 14 + 1, waypoints.shape[0] - 1)
+        return waypoints[idx].view(1, 2)
+
+    final_goal = waypoints[-1].detach().cpu().numpy()
+
+    frames_filter = _simulate(
+        env_filter,
+        [[waypoints[0, 0].item(), waypoints[0, 1].item()]],
+        target_fn,
+        steps=84,
+        display_projected_target=False,
+        freeze_after_done=6,
+        note_fn=lambda step, done, info: "single robot + convex obstacles + filter update",
+    )
+    frames_jac_eager = _simulate(
+        env_jac_eager,
+        [[waypoints[0, 0].item(), waypoints[0, 1].item()]],
+        target_fn,
+        steps=84,
+        display_projected_target=False,
+        freeze_after_done=6,
+        note_fn=lambda step, done, info: "single robot + convex obstacles + projected target (eager)",
+    )
+    frames_jac_comp = _simulate(
+        env_jac_comp,
+        [[waypoints[0, 0].item(), waypoints[0, 1].item()]],
+        target_fn,
+        steps=84,
+        display_projected_target=False,
+        freeze_after_done=6,
+        note_fn=lambda step, done, info: "single robot + convex obstacles + projected target (compile)",
+    )
+    history_filter = np.stack([f.positions for f in frames_filter], axis=0)[:, 0, :]
+    history_jac_eager = np.stack([f.positions for f in frames_jac_eager], axis=0)[:, 0, :]
+    history_jac_comp = np.stack([f.positions for f in frames_jac_comp], axis=0)[:, 0, :]
+    traj_dev = np.linalg.norm(history_jac_eager - history_jac_comp, axis=-1)
+    max_traj_dev = float(traj_dev.max())
+    displacement = float(np.linalg.norm(history_jac_comp[-1] - history_jac_comp[0]))
+    min_clearance = float(
+        env_jac_comp.obstacle_clearance(
+            torch.tensor(history_jac_comp, dtype=torch.float32, device=device).view(1, -1, 1, 2)
+        ).amin().detach().cpu()
+    )
+    obstacle_hits = [idx for idx, frame in enumerate(frames_jac_comp) if frame.obstacle_collision.any()]
+    done_indices = [idx for idx, frame in enumerate(frames_jac_comp) if frame.done]
+    _assert("single robot cruise has visible movement", displacement > 1.5)
+    _assert("single robot cruise keeps finite states", bool(np.isfinite(history_jac_comp).all()))
+    _assert("single robot eager/compile trajectory stays close", max_traj_dev < 0.25)
+    _assert("single robot cruise keeps obstacle hits limited", len(obstacle_hits) <= 2)
+
+    gif = _write_scene_animation(
+        out_dir,
+        "08_single_robot_obstacle_cruise.gif",
+        frames_jac_comp,
+        bounds=bounds,
+        obstacles=obstacles,
+        title="Single Robot Cruise In Dense Convex Obstacles (Jacobi)",
+        fps=10,
+    )
+    png = _write_keyframes(
+        out_dir,
+        "08_single_robot_obstacle_cruise_keyframes.png",
+        frames_jac_comp,
+        bounds=bounds,
+        obstacles=obstacles,
+        title="Single Robot Cruise In Dense Convex Obstacles (Jacobi)",
+        key_indices=[0, 21, 42, 63, len(frames_jac_comp) - 1],
+    )
+
+    fig, ax = plt.subplots(figsize=(8.2, 6.2))
+    _draw_obstacles(ax, obstacles)
+    ax.plot(history_jac_eager[:, 0], history_jac_eager[:, 1], color="#1f77b4", linewidth=2.0, label="jacobi eager path")
+    ax.plot(history_jac_comp[:, 0], history_jac_comp[:, 1], color="#d62728", linewidth=1.8, linestyle="--", label="jacobi compile path")
+    ax.scatter(history_jac_comp[0, 0], history_jac_comp[0, 1], s=80, color="#2ca02c", marker="o", label="start")
+    ax.scatter(history_jac_comp[-1, 0], history_jac_comp[-1, 1], s=90, color="#111111", marker="*", label="end")
+    ax.scatter(final_goal[0], final_goal[1], s=130, color="#ffbf00", marker="*", edgecolors="#111111", linewidths=1.0, label="final goal")
+    ax.set_xlim(bounds[0][0] - 0.4, bounds[0][1] + 0.4)
+    ax.set_ylim(bounds[1][0] - 0.4, bounds[1][1] + 0.4)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.22)
+    ax.set_title("Single Robot Obstacle Cruise: Jacobi Eager vs Compile")
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.92)
+    cmp_path = _save(fig, out_dir, "08_single_robot_obstacle_cruise_compare.png")
+
+    fig2, ax2 = plt.subplots(figsize=(8.2, 6.2))
+    _draw_obstacles(ax2, obstacles)
+    ax2.plot(history_filter[:, 0], history_filter[:, 1], color="#6a4c93", linewidth=2.0, label="filter path")
+    ax2.plot(history_jac_comp[:, 0], history_jac_comp[:, 1], color="#1982c4", linewidth=2.0, label="jacobi path")
+    ax2.scatter(history_jac_comp[0, 0], history_jac_comp[0, 1], s=80, color="#2ca02c", marker="o", label="start")
+    ax2.scatter(final_goal[0], final_goal[1], s=130, color="#ffbf00", marker="*", edgecolors="#111111", linewidths=1.0, label="final goal")
+    ax2.scatter(history_filter[-1, 0], history_filter[-1, 1], s=75, color="#6a4c93", marker="s", label="filter end")
+    ax2.scatter(history_jac_comp[-1, 0], history_jac_comp[-1, 1], s=75, color="#1982c4", marker="D", label="jacobi end")
+    ax2.set_xlim(bounds[0][0] - 0.4, bounds[0][1] + 0.4)
+    ax2.set_ylim(bounds[1][0] - 0.4, bounds[1][1] + 0.4)
+    ax2.set_aspect("equal")
+    ax2.grid(True, alpha=0.22)
+    ax2.set_title("Single Robot Obstacle Cruise: Filter vs Jacobi")
+    ax2.legend(loc="upper right", fontsize=9, framealpha=0.92)
+    mode_cmp_path = _save(fig2, out_dir, "08_single_robot_filter_vs_jacobi_compare.png")
+
+    mode_dev = np.linalg.norm(history_filter - history_jac_comp, axis=-1)
+    max_mode_dev = float(mode_dev.max())
+
+    return {
+        "animation": str(gif),
+        "keyframes": str(png),
+        "compare": str(cmp_path),
+        "mode_compare": str(mode_cmp_path),
+        "frames": len(frames_jac_comp),
+        "obstacles": len(obstacles),
+        "displacement": displacement,
+        "min_clearance": min_clearance,
+        "obstacle_hits": len(obstacle_hits),
+        "done_frames": len(done_indices),
+        "max_traj_dev_eager_vs_compile": max_traj_dev,
+        "max_traj_dev_filter_vs_jacobi": max_mode_dev,
+        "final_goal": [float(final_goal[0]), float(final_goal[1])],
+    }
+
+
+def visual_single_robot_jacobi_param_sweep(out_dir: Path, device: torch.device) -> dict:
+    """单机器人 Jacobi 参数扫图：3组参数同场景对比轨迹与指标。"""
+    bounds = ((-6.0, 6.0), (-4.0, 4.0))
+    obstacles = [
+        [[-4.8, -3.0], [-3.7, -3.3], [-3.4, -2.2], [-4.5, -1.9]],
+        [[-2.8, -2.7], [-1.8, -3.0], [-1.5, -2.1], [-2.4, -1.7]],
+        # [[-1.6, -0.8], [-0.6, -0.8], [-0.4, 0.2], [-1.0, 0.8], [-1.8, 0.2]],
+        # [[0.3, -3.2], [1.1, -3.5], [1.6, -2.7], [1.1, -2.0], [0.1, -2.3]],
+        # [[2.2, -1.1], [3.4, -1.2], [3.2, -0.1], [2.0, 0.1]],
+        # [[3.6, 1.5], [4.8, 1.2], [5.1, 2.0], [4.4, 2.8], [3.5, 2.3]],
+        [[0.8, 1.9], [1.9, 1.6], [2.2, 2.5], [1.1, 2.9]],
+        [[-3.9, 1.6], [-2.7, 1.5], [-2.5, 2.4], [-3.3, 3.0], [-4.1, 2.5]],
+        [[-0.2, -2.0], [0.8, -1.7], [0.6, -0.8], [-0.4, -1.0]],
+        # [[-5.4, -0.4], [-4.9, -1.1], [-4.2, -0.7], [-4.5, 0.2], [-5.2, 0.3]],
+        [[4.3, -3.3], [5.2, -3.0], [5.0, -2.2], [4.1, -2.4]],
+    ]
+    params = [
+        {"name": "stable", "relax": 0.25, "iters": 3, "extra": 0.01, "topk": 8, "color": "#2a9d8f"},
+        {"name": "balanced", "relax": 0.30, "iters": 3, "extra": 0.01, "topk": 8, "color": "#1d3557"},
+        {"name": "aggressive", "relax": 0.60, "iters": 3, "extra": 0.01, "topk": 10, "color": "#e76f51"},
+    ]
+    waypoints = torch.tensor(
+        [[-5.2, -3.2], [-3.0, -2.8], [-1.2, -1.8], [0.5, -2.8], [2.8, -0.6], [4.6, 2.2]],
+        dtype=torch.float32,
+        device=device,
+    )
+    final_goal = waypoints[-1].detach().cpu().numpy()
+
+    def target_fn(step_idx: int, pos: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        idx = min(step_idx // 14 + 1, waypoints.shape[0] - 1)
+        return waypoints[idx].view(1, 2)
+
+    sweep_rows: list[dict] = []
+    base_frames: list[SceneFrame] | None = None
+    base_name = "balanced"
+
+    for cfg in params:
+        env = _make_env(
+            device,
+            num_agents=1,
+            collision_radius=0.0,
+            obstacle_vertices=obstacles,
+            obstacle_collision_margin=0.06,
+            obstacle_target_projection=True,
+            obstacle_projection_iters=int(cfg["iters"]),
+            obstacle_projection_extra_margin=float(cfg["extra"]),
+            obstacle_projection_topk=int(cfg["topk"]),
+            obstacle_projection_fixes_per_iter=2,
+            position_bounds=bounds,
+            done_on_team_eliminated=False,
+            done_on_obstacle_collision=False,
+            done_on_out_of_bounds=False,
+            tf=16.0,
+        )
+        env.projection_ops.set_iter_update_mode("jacobi")
+        env.projection_ops.set_jacobi_relax(float(cfg["relax"]))
+
+        t0 = time.perf_counter()
+        frames = _simulate(
+            env,
+            [[waypoints[0, 0].item(), waypoints[0, 1].item()]],
+            target_fn,
+            steps=84,
+            display_projected_target=False,
+            freeze_after_done=6,
+            note_fn=lambda step, done, info, n=cfg["name"]: f"jacobi={n}",
+        )
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        sim_ms = (time.perf_counter() - t0) * 1000.0
+        hist = np.stack([f.positions for f in frames], axis=0)[:, 0, :]
+        disp = float(np.linalg.norm(hist[-1] - hist[0]))
+        goal_err = float(np.linalg.norm(hist[-1] - final_goal))
+        obs_hits = int(sum(1 for f in frames if f.obstacle_collision.any()))
+        done_cnt = int(sum(1 for f in frames if f.done))
+        min_clearance = float(
+            env.obstacle_clearance(
+                torch.tensor(hist, dtype=torch.float32, device=device).view(1, -1, 1, 2)
+            ).amin().detach().cpu()
+        )
+        sweep_rows.append(
+            {
+                "name": cfg["name"],
+                "relax": float(cfg["relax"]),
+                "iters": int(cfg["iters"]),
+                "extra_margin": float(cfg["extra"]),
+                "topk": int(cfg["topk"]),
+                "color": cfg["color"],
+                "frames": frames,
+                "history": hist,
+                "displacement": disp,
+                "goal_error": goal_err,
+                "obstacle_hits": obs_hits,
+                "done_frames": done_cnt,
+                "min_clearance": min_clearance,
+                "sim_ms": sim_ms,
+            }
+        )
+        if cfg["name"] == base_name:
+            base_frames = frames
+
+    _assert("jacobi sweep has 3 configs", len(sweep_rows) == 3)
+    _assert("jacobi sweep finite trajectories", bool(np.isfinite(np.stack([r["history"] for r in sweep_rows], axis=0)).all()))
+
+    if base_frames is None:
+        base_frames = sweep_rows[1]["frames"]
+    gif = _write_scene_animation(
+        out_dir,
+        "09_single_robot_jacobi_sweep_balanced.gif",
+        base_frames,
+        bounds=bounds,
+        obstacles=obstacles,
+        title="Single Robot Jacobi Sweep (balanced config animation)",
+        fps=10,
+        show_targets=False,
+        fixed_goal=final_goal,
+    )
+
+    fig, ax = plt.subplots(figsize=(8.5, 6.4))
+    _draw_obstacles(ax, obstacles)
+    for row in sweep_rows:
+        h = row["history"]
+        ax.plot(h[:, 0], h[:, 1], color=row["color"], linewidth=2.1, label=row["name"])
+        ax.scatter(h[-1, 0], h[-1, 1], s=70, color=row["color"], marker="o")
+    start = sweep_rows[0]["history"][0]
+    ax.scatter(start[0], start[1], s=90, color="#2ca02c", marker="o", label="start")
+    ax.scatter(final_goal[0], final_goal[1], s=140, color="#ffbf00", marker="*", edgecolors="#111111", linewidths=1.0, label="final goal")
+    ax.set_xlim(bounds[0][0] - 0.4, bounds[0][1] + 0.4)
+    ax.set_ylim(bounds[1][0] - 0.4, bounds[1][1] + 0.4)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.22)
+    ax.set_title("Single Robot Trajectory: Jacobi Parameter Sweep")
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.92)
+    traj_path = _save(fig, out_dir, "09_single_robot_jacobi_sweep_paths.png")
+
+    names = [row["name"] for row in sweep_rows]
+    goal_errors = [row["goal_error"] for row in sweep_rows]
+    clearances = [row["min_clearance"] for row in sweep_rows]
+    hits = [row["obstacle_hits"] for row in sweep_rows]
+    sim_ms = [row["sim_ms"] for row in sweep_rows]
+    x = np.arange(len(names))
+    fig2, axes = plt.subplots(2, 2, figsize=(10.5, 7.4))
+    axes = axes.reshape(-1)
+    axes[0].bar(x, goal_errors, color=[row["color"] for row in sweep_rows])
+    axes[0].set_title("Final Goal Error")
+    axes[0].set_xticks(x, names)
+    axes[0].grid(True, axis="y", alpha=0.25)
+    axes[1].bar(x, clearances, color=[row["color"] for row in sweep_rows])
+    axes[1].set_title("Min Clearance (higher safer)")
+    axes[1].set_xticks(x, names)
+    axes[1].grid(True, axis="y", alpha=0.25)
+    axes[2].bar(x, hits, color=[row["color"] for row in sweep_rows])
+    axes[2].set_title("Obstacle Collision Frames")
+    axes[2].set_xticks(x, names)
+    axes[2].grid(True, axis="y", alpha=0.25)
+    axes[3].bar(x, sim_ms, color=[row["color"] for row in sweep_rows])
+    axes[3].set_title("Simulation Time (ms)")
+    axes[3].set_xticks(x, names)
+    axes[3].grid(True, axis="y", alpha=0.25)
+    metric_path = _save(fig2, out_dir, "09_single_robot_jacobi_sweep_metrics.png")
+
+    out_rows = []
+    for row in sweep_rows:
+        out_rows.append(
+            {
+                "name": row["name"],
+                "relax": row["relax"],
+                "iters": row["iters"],
+                "extra_margin": row["extra_margin"],
+                "topk": row["topk"],
+                "displacement": row["displacement"],
+                "goal_error": row["goal_error"],
+                "obstacle_hits": row["obstacle_hits"],
+                "done_frames": row["done_frames"],
+                "min_clearance": row["min_clearance"],
+                "sim_ms": row["sim_ms"],
+            }
+        )
+    metric_json = out_dir / "09_single_robot_jacobi_sweep_metrics.json"
+    metric_json.write_text(json.dumps(out_rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {
+        "animation": str(gif),
+        "paths_figure": str(traj_path),
+        "metrics_figure": str(metric_path),
+        "metrics_json": str(metric_json),
+        "configs": out_rows,
+        "final_goal": [float(final_goal[0]), float(final_goal[1])],
+    }
+
+
 def visual_performance(out_dir: Path, device: torch.device) -> dict:
     obstacles = [
         [[-2.0, -2.0], [-1.0, -2.0], [-1.0, -1.0], [-2.0, -1.0]],
@@ -926,6 +1314,8 @@ def main() -> None:
         "done_time_horizon": visual_done_time_dynamic(out_dir, device),
         "done_out_of_bounds": visual_done_bounds_dynamic(out_dir, device),
         "obstacle_distance_matrix": visual_collision_matrix(out_dir, device),
+        "single_robot_obstacle_cruise": visual_single_robot_obstacle_cruise(out_dir, device),
+        "single_robot_jacobi_sweep": visual_single_robot_jacobi_param_sweep(out_dir, device),
         "performance": visual_performance(out_dir, device),
     }
     report = write_report(out_dir, results)

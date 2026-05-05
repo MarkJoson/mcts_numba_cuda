@@ -63,7 +63,7 @@ class MincoTorchTransition(torch.nn.Module):
         piece_t: float,                             # 每段真实执行时间，scalar
         *,
         ratio: float = DEFAULT_RATIO,               # 真实执行时间 / planner 前瞻时间比例
-        n_checkpoints: int = 20,                    # 每种约束的 checkpoint 数；C=2*n_checkpoints
+        n_checkpoints: int = 8,                     # 每种约束的 checkpoint 数；C=2*n_checkpoints
         velocity_limit: float = 2.0,                # 速度限幅
         acceleration_limit: float = 3.0,            # 加速度限幅
         dtype: torch.dtype | None = torch.float32,  # runtime buffer dtype
