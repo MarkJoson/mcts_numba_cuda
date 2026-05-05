@@ -45,7 +45,15 @@ DUCT_EDGE_UNEXPANDED = -1
 DUCT_EDGE_EXPANDING = -2
 DUCT_PLAYER0_MASK = 0x0000FFFF
 DUCT_PLAYER1_MASK = 0xFFFF0000
+DUCT_EXPAND_TOPK = 4
+DUCT_EXPAND_TOPK_BITS = 2
+DUCT_EXPAND_TOPK_MASK = DUCT_EXPAND_TOPK - 1
+DUCT_EXPAND_CANDIDATES = DUCT_EXPAND_TOPK * DUCT_EXPAND_TOPK
 DUCT_SOFT_WINNER = int(os.environ.get("PUCT_DUCT_SOFT_WINNER", "0") == "1")
+DUCT_SOFT_EXPAND = int(os.environ.get(
+    "PUCT_DUCT_SOFT_EXPAND",
+    os.environ.get("PUCT_DUCT_SOFT_WINNER", "0"),
+) == "1")
 
 
 # ============================================================
@@ -261,6 +269,72 @@ def _duct_reduce_best_action_halfwarp(c_uct, action_W, action_N, action_inflight
 
 
 @cuda.jit(device=True, inline=True)
+def _duct_sort_actions_halfwarp(c_uct, action_W, action_N, action_inflight,
+                                tree, node, action_count, lane,
+                                log_parent_n_eff, tie_offset):
+    #& DUCT expand: half-warp bitonic sort。排序后 lane 0..3/16..19 分别持有两个玩家 top-4。
+    #& 理由: 每个 lane 持有一个动作并并行 compare-exchange，不再把 top4 聚合到每个 lane。
+    player = int32(0)
+    half_lane = lane
+    mask = int32(DUCT_PLAYER0_MASK)
+
+    if lane >= int32(DUCT_MARGINAL_ACTIONS):
+        player = int32(1)
+        half_lane = lane - int32(DUCT_MARGINAL_ACTIONS)
+        mask = int32(DUCT_PLAYER1_MASK)
+        tie_offset += int32(17)
+    if tie_offset >= action_count:
+        tie_offset = tie_offset % action_count
+
+    score = float32(NEG_INF_F32)
+    action = int32(INT32_MAX)
+    if half_lane < action_count:
+        action = half_lane
+        score = _duct_ucb_score(
+            c_uct,
+            action_W[tree, node, player, half_lane],
+            action_N[tree, node, player, half_lane],
+            action_inflight[tree, node, player, half_lane],
+            log_parent_n_eff,
+        )
+
+    size = int32(2)
+    while size <= int32(DUCT_MARGINAL_ACTIONS):
+        stride = size >> int32(1)
+        while stride > int32(0):
+            other_score = cuda.shfl_xor_sync(mask, score, stride)
+            other_action = cuda.shfl_xor_sync(mask, action, stride)
+            want_desc = int32(0)
+            if (half_lane & size) == int32(0):
+                want_desc = int32(1)
+            lower = int32(0)
+            if (half_lane & stride) == int32(0):
+                lower = int32(1)
+            other_better = _score_better_block_local(
+                other_score, other_action, score, action,
+                tie_offset, action_count,
+            )
+            self_better = _score_better_block_local(
+                score, action, other_score, other_action,
+                tie_offset, action_count,
+            )
+
+            if want_desc == lower:
+                if other_better:
+                    score = other_score
+                    action = other_action
+            else:
+                if self_better:
+                    score = other_score
+                    action = other_action
+
+            stride >>= int32(1)
+        size <<= int32(1)
+
+    return action, score
+
+
+@cuda.jit(device=True, inline=True)
 def _duct_release_joint_slot(action_inflight, tree, node, joint_slot, lane):
     #& DUCT新增: 回滚/释放两个玩家各自动作上的 virtual loss。
     #& 理由: DUCT 的并发占用在 action_inflight[player, action]，不是 edge_inflight。
@@ -274,18 +348,35 @@ def _duct_release_joint_slot(action_inflight, tree, node, joint_slot, lane):
 
 
 @cuda.jit(device=True, inline=True)
-def _duct_claim_two_actions(action_inflight, tree, node, action, inflight, lane):
+def _duct_add_joint_slot_inflight(action_inflight, tree, node, joint_slot, lane):
+    #& DUCT soft-expand: fallback 到另一条 joint edge 后，把 virtual loss 挪到新动作上。
+    if lane == int32(0) or lane == int32(DUCT_MARGINAL_ACTIONS):
+        if joint_slot >= int32(0):
+            action0 = joint_slot >> int32(DUCT_ACTION_BITS)
+            action1 = joint_slot & int32(DUCT_ACTION_MASK)
+            player = int32(lane != int32(0))
+            action = action0 + (action1 - action0) * player
+            cuda.atomic.add(action_inflight, (tree, node, player, action), int32(1))
+
+
+@cuda.jit(device=True, inline=True)
+def _duct_claim_two_actions(action_inflight, tree, node, action, inflight, lane,
+                            action_count):
     #& DUCT新增: 两个玩家动作必须同时 claim 成功；任一侧失败时回滚已成功的一侧。
     #& 理由: 一个 select warp 持有的是 joint move，不能留下半个玩家动作的虚拟访问。
     held_local = int32(0)
     if lane == int32(0) or lane == int32(DUCT_MARGINAL_ACTIONS):
         player = int32(lane != int32(0))
-        prev = cuda.atomic.cas(
-            action_inflight, (tree, node, player, action),
-            inflight, inflight + int32(1),
-        )
-        if prev == inflight:
+        if action_count <= int32(1):
+            cuda.atomic.add(action_inflight, (tree, node, player, action), int32(1))
             held_local = int32(1)
+        else:
+            prev = cuda.atomic.cas(
+                action_inflight, (tree, node, player, action),
+                inflight, inflight + int32(1),
+            )
+            if prev == inflight:
+                held_local = int32(1)
 
     held0 = cuda.shfl_sync(FULL_MASK, held_local, 0)
     held1 = cuda.shfl_sync(FULL_MASK, held_local, DUCT_MARGINAL_ACTIONS)
@@ -335,6 +426,7 @@ def _duct_best_actions_winner_recalc(c_uct, action_W, action_N, action_inflight,
         #* 对 inflight 进行 CAS，并检查是否成功 Hold
         held = _duct_claim_two_actions(
             action_inflight, tree, node, best_action, best_inflight, lane,
+            action_count,
         )
         #* 成功，或超过最大重试次数时退出
         if held == int32(1) or retry + int32(1) >= int32(MAX_RECALC_RETRY):
@@ -379,6 +471,145 @@ def _duct_claim_joint_expand(edge_tgt_node, edge_actions, node_expand_inflight,
             cuda.atomic.add(node_expand_inflight, (tree, node), int32(1))
             held = int32(1)
     return cuda.shfl_sync(FULL_MASK, held, 0)
+
+
+@cuda.jit(device=True, inline=True)
+def _duct_best_top4_joint_slot(edge_tgt_node, tree, node, avoid_slot, lane,
+                               start_offset,
+                               sorted_action, sorted_score):
+    #& DUCT soft-expand: lane 0..15 分别评估 top4(player0) x top4(player1) 的 joint 候选。
+    #& 理由: expand 只需要找可建 child 的高价值 joint edge；16 个候选正好铺满 half-warp。
+    best_score = float32(NEG_INF_F32)
+    best_key = int32(INT32_MAX)
+    best_slot = int32(-1)
+    pair_key = lane & int32(DUCT_ACTION_MASK)
+    row = pair_key >> int32(DUCT_EXPAND_TOPK_BITS)
+    col = pair_key & int32(DUCT_EXPAND_TOPK_MASK)
+
+    action0 = cuda.shfl_sync(FULL_MASK, sorted_action, row)
+    score0 = cuda.shfl_sync(FULL_MASK, sorted_score, row)
+    action1 = cuda.shfl_sync(
+        FULL_MASK,
+        sorted_action,
+        int32(DUCT_MARGINAL_ACTIONS) + col,
+    )
+    score1 = cuda.shfl_sync(
+        FULL_MASK,
+        sorted_score,
+        int32(DUCT_MARGINAL_ACTIONS) + col,
+    )
+
+    if lane < int32(DUCT_EXPAND_CANDIDATES):
+        if action0 != int32(INT32_MAX) and action1 != int32(INT32_MAX):
+            slot = _duct_joint_slot(action0, action1)
+            if slot != avoid_slot:
+                child = edge_tgt_node[tree, node, slot]
+                if child == int32(DUCT_EDGE_UNEXPANDED):
+                    best_score = score0 + score1
+                    best_key = pair_key
+                    best_slot = slot
+
+    if lane < int32(DUCT_EXPAND_CANDIDATES):
+        other_score = cuda.shfl_xor_sync(DUCT_PLAYER0_MASK, best_score, 8)
+        other_key = cuda.shfl_xor_sync(DUCT_PLAYER0_MASK, best_key, 8)
+        other_slot = cuda.shfl_xor_sync(DUCT_PLAYER0_MASK, best_slot, 8)
+        if other_slot >= int32(0) and (
+            best_slot < int32(0) or
+            _score_better_block_local(
+                other_score, other_key, best_score, best_key,
+                start_offset, int32(DUCT_MARGINAL_ACTIONS),
+            )
+        ):
+            best_score = other_score
+            best_key = other_key
+            best_slot = other_slot
+
+        other_score = cuda.shfl_xor_sync(DUCT_PLAYER0_MASK, best_score, 4)
+        other_key = cuda.shfl_xor_sync(DUCT_PLAYER0_MASK, best_key, 4)
+        other_slot = cuda.shfl_xor_sync(DUCT_PLAYER0_MASK, best_slot, 4)
+        if other_slot >= int32(0) and (
+            best_slot < int32(0) or
+            _score_better_block_local(
+                other_score, other_key, best_score, best_key,
+                start_offset, int32(DUCT_MARGINAL_ACTIONS),
+            )
+        ):
+            best_score = other_score
+            best_key = other_key
+            best_slot = other_slot
+
+        other_score = cuda.shfl_xor_sync(DUCT_PLAYER0_MASK, best_score, 2)
+        other_key = cuda.shfl_xor_sync(DUCT_PLAYER0_MASK, best_key, 2)
+        other_slot = cuda.shfl_xor_sync(DUCT_PLAYER0_MASK, best_slot, 2)
+        if other_slot >= int32(0) and (
+            best_slot < int32(0) or
+            _score_better_block_local(
+                other_score, other_key, best_score, best_key,
+                start_offset, int32(DUCT_MARGINAL_ACTIONS),
+            )
+        ):
+            best_score = other_score
+            best_key = other_key
+            best_slot = other_slot
+
+        other_score = cuda.shfl_xor_sync(DUCT_PLAYER0_MASK, best_score, 1)
+        other_key = cuda.shfl_xor_sync(DUCT_PLAYER0_MASK, best_key, 1)
+        other_slot = cuda.shfl_xor_sync(DUCT_PLAYER0_MASK, best_slot, 1)
+        if other_slot >= int32(0) and (
+            best_slot < int32(0) or
+            _score_better_block_local(
+                other_score, other_key, best_score, best_key,
+                start_offset, int32(DUCT_MARGINAL_ACTIONS),
+            )
+        ):
+            best_slot = other_slot
+
+    return cuda.shfl_sync(FULL_MASK, best_slot, 0)
+
+
+@cuda.jit(device=True, inline=True)
+def _duct_claim_soft_expand_fallback(edge_tgt_node, edge_actions,
+                                     node_expand_inflight,
+                                     tree, node, avoid_slot, lane, tie_offset,
+                                     sorted_action, sorted_score):
+    held = int32(0)
+    fallback_slot = int32(-1)
+    retry = int32(0)
+
+    while retry < int32(MAX_RECALC_RETRY):
+        start = (tie_offset + retry * int32(5)) & int32(15)
+        candidate = _duct_best_top4_joint_slot(
+            edge_tgt_node, tree, node, avoid_slot, lane, start,
+            sorted_action, sorted_score,
+        )
+
+        if candidate < int32(0):
+            break
+
+        if lane == int32(0):
+            prev = cuda.atomic.cas(
+                edge_tgt_node,
+                (tree, node, candidate),
+                int32(DUCT_EDGE_UNEXPANDED),
+                int32(DUCT_EDGE_EXPANDING),
+            )
+            if prev == int32(DUCT_EDGE_UNEXPANDED):
+                action0 = candidate >> int32(DUCT_ACTION_BITS)
+                action1 = candidate & int32(DUCT_ACTION_MASK)
+                edge_actions[tree, node, candidate, int32(0)] = action0
+                edge_actions[tree, node, candidate, int32(1)] = action1
+                cuda.atomic.add(node_expand_inflight, (tree, node), int32(1))
+                fallback_slot = candidate
+                held = int32(1)
+
+        held = cuda.shfl_sync(FULL_MASK, held, 0)
+        fallback_slot = cuda.shfl_sync(FULL_MASK, fallback_slot, 0)
+        if held != int32(0):
+            break
+
+        retry += int32(1)
+
+    return fallback_slot, held
 
 
 @cuda.jit(device=True, inline=True)
@@ -466,8 +697,10 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
     node_expanded 只保留 terminal sentinel 和基本状态检查用途，不参与决定
     当前可访问多少 joint action。
 
-    DUCT_SOFT_WINNER 是编译期常量，由导入模块时的环境变量
-    PUCT_DUCT_SOFT_WINNER=1 打开；kernel 本身不接收 soft_winner 参数。
+    DUCT_SOFT_WINNER / DUCT_SOFT_EXPAND 是导入模块时确定的编译期常量。
+    前者允许 winner CAS 失败后保留重复选择；后者在选中边正在扩展时，
+    用两个玩家各自的 top-4 动作并行组成 16 个候选，改抢其中最优的
+    未扩展 joint edge。
 
     关键输入：
         edge_tgt_node: [tree, node, 256]，child node id；-1 未扩展，-2 正在扩展。
@@ -601,9 +834,9 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
         )
         allowed = _allowed_children(c_pw, alpha_pw, parent_n_eff, local_action_count)
         log_parent_n_eff = math.log(float32(parent_n_eff))
+        tie_offset = wid
 
         #& DUCT新增: 每个玩家独立用 DUCT UCB 选择动作，再组合成 joint move。这是 DUCT 和单人 PUCT select 的核心差异；
-        tie_offset = wid
         local_best_action, pair_valid, claim_held = _duct_best_actions_winner_recalc(
             c_uct, action_W, action_N, action_inflight,
             tree, node, allowed, lane, log_parent_n_eff, tie_offset,
@@ -671,6 +904,40 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
             expand_busy = int32(1)
 
         if expand_busy != int32(0) or joint_child < int32(0) or joint_child >= node_cnt:
+            if (
+                int32(DUCT_SOFT_EXPAND) != int32(0) and
+                expand_busy != int32(0)
+            ):
+                sorted_action, sorted_score = _duct_sort_actions_halfwarp(
+                    c_uct, action_W, action_N, action_inflight,
+                    tree, node, allowed, lane, log_parent_n_eff, tie_offset,
+                )
+                fallback_slot, fallback_held = _duct_claim_soft_expand_fallback(
+                    edge_tgt_node, edge_actions, node_expand_inflight,
+                    tree, node, joint_slot, lane, wid,
+                    sorted_action, sorted_score,
+                )
+                if fallback_held != int32(0):
+                    _duct_release_joint_slot(
+                        action_inflight, tree, node, joint_slot, lane,
+                    )
+                    _duct_add_joint_slot_inflight(
+                        action_inflight, tree, node, fallback_slot, lane,
+                    )
+                    cuda.syncwarp(FULL_MASK)
+                    _write_duct_path_step(
+                        out_path_eids, out_path_actions,
+                        tree, wid, depth, lane, node, fallback_slot,
+                    )
+                    final_packed = _pack_selection(
+                        int32(SELECT_EXPAND),
+                        node,
+                        fallback_slot,
+                        int32(REASON_OK_EXPAND),
+                    )
+                    final_len = depth + int32(1)
+                    break
+
             _duct_release_joint_slot(
                 action_inflight, tree, node, joint_slot, lane,
             )

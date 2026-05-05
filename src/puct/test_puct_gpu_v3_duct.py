@@ -262,6 +262,7 @@ def _claim_two_actions_partial_cas_kernel(action_inflight, out_held):
             np.int32(0),
             np.int32(0),
             lane,
+            np.int32(16),
         )
     elif scenario == np.int32(1):
         held = duct._duct_claim_two_actions(
@@ -271,10 +272,34 @@ def _claim_two_actions_partial_cas_kernel(action_inflight, out_held):
             np.int32(0),
             np.int32(0),
             lane,
+            np.int32(16),
         )
 
     if lane == np.int32(0):
         out_held[scenario] = held
+
+
+@cuda.jit
+def _sort_actions_halfwarp_probe_kernel(
+    action_w,
+    action_n,
+    action_inflight,
+    out_actions,
+):
+    lane = cuda.threadIdx.x & np.int32(31)
+    sorted_action, _ = duct._duct_sort_actions_halfwarp(
+        np.float32(0.0),
+        action_w,
+        action_n,
+        action_inflight,
+        np.int32(0),
+        np.int32(0),
+        np.int32(16),
+        lane,
+        np.float32(0.0),
+        np.int32(0),
+    )
+    out_actions[lane] = sorted_action
 
 
 def host_duct_inflight_sum(h):
@@ -400,6 +425,41 @@ def test_multi_warp_claims_unique_pw_slots():
         and host_duct_inflight_sum(h2) == 0
     )
     record("multi-warp PW claims unique joint slots", ok, f"slots={slots}")
+
+
+def test_multi_warp_spreads_when_one_player_pw_has_multiple_actions():
+    case = make_duct_case(nodes=2, actions=16, warps=4, path_depth=2)
+    case["node_n"][0, 0] = 16
+    case["action_counts"][0, 0, 1] = 1
+    d, h = run_select_duct(case, c_pw=1.0, alpha_pw=0.5)
+    slots = []
+    expand_count = 0
+    for wid in range(case["warps"]):
+        kind, slot, node = decode(int(h["out_selected"][0, wid]))
+        if kind == v3.SELECT_EXPAND:
+            expand_count += 1
+            slots.append(slot)
+            if node != 0:
+                record(
+                    "multi-warp spreads when one player PW has multiple actions",
+                    False,
+                    f"bad node={node}",
+                )
+                return
+
+    h2 = run_release_duct(d)
+    ok = (
+        sorted(slots) == [joint_slot(0, 0), joint_slot(1, 0), joint_slot(2, 0), joint_slot(3, 0)]
+        and expand_count == 4
+        and int(h["node_expand_inflight"][0, 0]) == 4
+        and host_duct_inflight_nonnegative(h)
+        and host_duct_inflight_sum(h2) == 0
+    )
+    record(
+        "multi-warp spreads when one player PW has multiple actions",
+        ok,
+        f"slots={slots}",
+    )
 
 
 def test_terminal_root_returns_without_claims():
@@ -587,6 +647,41 @@ def test_claim_two_actions_rolls_back_partial_cas():
     record("two-action claim rolls back either partial CAS", ok, f"held={held.tolist()}")
 
 
+def test_soft_expand_halfwarp_sort_keeps_ranked_lanes():
+    case = make_duct_case(nodes=2, actions=16, path_depth=1)
+    case["node_n"][0, 0] = 16
+    case["action_n"][0, 0, :, :] = 1
+    case["action_w"][0, 0, 0] = np.asarray(
+        [1, 40, 3, 20, 60, 8, 2, 80, 10, 5, 90, 7, 30, 6, 50, 4],
+        dtype=np.float32,
+    )
+    case["action_w"][0, 0, 1] = np.asarray(
+        [11, 12, 70, 14, 45, 16, 65, 18, 19, 95, 21, 55, 23, 35, 25, 85],
+        dtype=np.float32,
+    )
+    d = to_device(case)
+    out_actions = cuda.to_device(np.full((v3.WARP_SIZE,), -1, np.int32))
+
+    _sort_actions_halfwarp_probe_kernel[1, v3.WARP_SIZE](
+        d["action_w"],
+        d["action_n"],
+        d["action_inflight"],
+        out_actions,
+    )
+    cuda.synchronize()
+
+    actions = out_actions.copy_to_host()
+    ok = (
+        tuple(int(x) for x in actions[:4]) == (10, 7, 4, 14)
+        and tuple(int(x) for x in actions[16:20]) == (9, 15, 2, 6)
+    )
+    record(
+        "soft expand half-warp sort leaves top ranks in lanes",
+        ok,
+        f"p0={actions[:4].tolist()} p1={actions[16:20].tolist()}",
+    )
+
+
 def test_soft_winner_keeps_busy_claim():
     if duct.DUCT_SOFT_WINNER == 0:
         record("soft winner keeps busy duplicate claim", True, "skipped: PUCT_DUCT_SOFT_WINNER=0")
@@ -610,6 +705,79 @@ def test_soft_winner_keeps_busy_claim():
     record("soft winner keeps busy duplicate claim", ok, f"kinds={kinds}")
 
 
+def test_soft_expand_fallback_avoids_expanding_joint_edge():
+    if duct.DUCT_SOFT_EXPAND == 0:
+        record("soft expand falls back from busy joint edge", True, "skipped: PUCT_DUCT_SOFT_EXPAND=0")
+        return
+
+    case = make_duct_case(nodes=3, actions=16, path_depth=2)
+    busy_slot = joint_slot(0, 0)
+    case["edge_child"][0, 0, busy_slot] = duct.DUCT_EDGE_EXPANDING
+    case["node_n"][0, 0] = 16
+    case["action_n"][0, 0, :, :] = 1
+    case["action_w"][0, 0, 0, 0] = 16.0
+    case["action_w"][0, 0, 0, 1] = 8.0
+    case["action_w"][0, 0, 1, 0] = 16.0
+    case["action_w"][0, 0, 1, 1] = 7.0
+    d, h = run_select_duct(case, c_pw=4.0, alpha_pw=0.5, c_uct=0.0)
+    raw = int(h["out_selected"][0, 0])
+    kind, slot, node = decode(raw)
+    h2 = run_release_duct(d)
+    fallback_actions = tuple(int(x) for x in h["out_path_actions"][0, 0, 0])
+    ok = (
+        kind == v3.SELECT_EXPAND
+        and node == 0
+        and slot != busy_slot
+        and int(h["edge_child"][0, 0, busy_slot]) == duct.DUCT_EDGE_EXPANDING
+        and int(h["edge_child"][0, 0, slot]) == duct.DUCT_EDGE_EXPANDING
+        and fallback_actions == (1, 0)
+        and int(h["action_inflight"][0, 0, 0, 1]) == 1
+        and int(h["action_inflight"][0, 0, 1, 0]) == 1
+        and int(h["node_expand_inflight"][0, 0]) == 1
+        and host_duct_inflight_sum(h2) == 0
+    )
+    record("soft expand falls back from busy joint edge", ok, f"slot={slot}")
+
+
+def test_soft_expand_fallback_uses_ranked_top4_candidates():
+    if duct.DUCT_SOFT_EXPAND == 0:
+        record("soft expand uses ranked top4 candidates", True, "skipped: PUCT_DUCT_SOFT_EXPAND=0")
+        return
+
+    case = make_duct_case(nodes=3, actions=16, path_depth=2)
+    case["node_n"][0, 0] = 16
+    case["action_n"][0, 0, :, :] = 1
+    case["action_w"][0, 0, 0] = np.asarray(
+        [1, 40, 3, 20, 60, 8, 2, 80, 10, 5, 90, 7, 30, 6, 50, 4],
+        dtype=np.float32,
+    )
+    case["action_w"][0, 0, 1] = np.asarray(
+        [11, 12, 70, 14, 45, 16, 65, 18, 19, 95, 21, 55, 23, 35, 25, 85],
+        dtype=np.float32,
+    )
+    busy_slot = joint_slot(10, 9)
+    expected_slot = joint_slot(10, 15)
+    prefix_scan_slot = joint_slot(0, 0)
+    case["edge_child"][0, 0, busy_slot] = duct.DUCT_EDGE_EXPANDING
+    d, h = run_select_duct(case, c_pw=4.0, alpha_pw=0.5, c_uct=0.0)
+    raw = int(h["out_selected"][0, 0])
+    kind, slot, node = decode(raw)
+    h2 = run_release_duct(d)
+    ok = (
+        kind == v3.SELECT_EXPAND
+        and node == 0
+        and slot == expected_slot
+        and slot != prefix_scan_slot
+        and int(h["edge_child"][0, 0, busy_slot]) == duct.DUCT_EDGE_EXPANDING
+        and int(h["edge_child"][0, 0, expected_slot]) == duct.DUCT_EDGE_EXPANDING
+        and tuple(int(x) for x in h["out_path_actions"][0, 0, 0]) == (10, 15)
+        and int(h["action_inflight"][0, 0, 0, 10]) == 1
+        and int(h["action_inflight"][0, 0, 1, 15]) == 1
+        and host_duct_inflight_sum(h2) == 0
+    )
+    record("soft expand uses ranked top4 candidates", ok, f"slot={slot}")
+
+
 def summarize_results_and_exit():
     failed = [name for name, ok in results if not ok]
     print("================================================================")
@@ -627,6 +795,7 @@ def main():
     test_independent_ucb_existing_joint_edge()
     test_selected_unexpanded_joint_action_expands()
     test_multi_warp_claims_unique_pw_slots()
+    test_multi_warp_spreads_when_one_player_pw_has_multiple_actions()
     test_terminal_root_returns_without_claims()
     test_expanding_joint_edge_returns_busy_and_rolls_back()
     test_invalid_child_oob_rolls_back_actions()
@@ -636,7 +805,10 @@ def main():
     test_pw_window_hides_high_value_actions()
     test_variable_action_counts_selects_valid_prefix_actions()
     test_claim_two_actions_rolls_back_partial_cas()
+    test_soft_expand_halfwarp_sort_keeps_ranked_lanes()
     test_soft_winner_keeps_busy_claim()
+    test_soft_expand_fallback_avoids_expanding_joint_edge()
+    test_soft_expand_fallback_uses_ranked_top4_candidates()
     summarize_results_and_exit()
 
 

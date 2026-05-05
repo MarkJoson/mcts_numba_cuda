@@ -649,7 +649,7 @@ def parse_args():
     p.add_argument(
         "--soft-winner",
         action="store_true",
-        help="Require PUCT_DUCT_SOFT_WINNER=1; soft winner is a compile-time macro.",
+        help="Require PUCT_DUCT_SOFT_WINNER=1; soft modes are compile-time macros.",
     )
     p.add_argument("--output-prefix", type=str, default="outputs/puct_v3_duct_warp_paths", help="Output file prefix.")
     p.add_argument("--formats", type=str, default="png,svg", help="Comma-separated formats rendered by dot.")
@@ -664,6 +664,10 @@ def main():
     if args.soft_winner and duct.DUCT_SOFT_WINNER == 0:
         raise RuntimeError(
             "--soft-winner requires running with PUCT_DUCT_SOFT_WINNER=1 before module import."
+        )
+    if args.soft_winner and duct.DUCT_SOFT_EXPAND == 0:
+        raise RuntimeError(
+            "--soft-winner requires PUCT_DUCT_SOFT_EXPAND=1 or the default soft-expand macro."
         )
 
     if args.actions < 1 or args.actions > duct.DUCT_MARGINAL_ACTIONS:
@@ -709,7 +713,8 @@ def main():
 
     title = (
         f"DUCT warp paths | mode={args.mode} tree=1 actions={args.actions} "
-        f"joint=256 depth={args.depth} warps={args.warps} soft={duct.DUCT_SOFT_WINNER}"
+        f"joint=256 depth={args.depth} warps={args.warps} "
+        f"soft_winner={duct.DUCT_SOFT_WINNER} soft_expand={duct.DUCT_SOFT_EXPAND}"
     )
     dot_text = make_dot(case, host, infos, title=title, expected=expected)
 
