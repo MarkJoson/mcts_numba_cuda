@@ -42,8 +42,8 @@ class DuctBenchResult:
 
 def _make_deep_duct_case(trees: int, warps: int, actions: int, depth: int) -> dict:
     nodes = depth + 1
-    edge_child = np.full((trees, nodes, actions), -1, np.int32)
-    edge_actions = np.full((trees, nodes, actions, duct.DUCT_PLAYERS), -1, np.int32)
+    edge_child = np.full((trees, nodes, duct.DUCT_JOINT_ACTIONS), -1, np.int32)
+    edge_actions = np.full((trees, nodes, duct.DUCT_JOINT_ACTIONS, duct.DUCT_PLAYERS), -1, np.int32)
     action_w = np.zeros((trees, nodes, duct.DUCT_PLAYERS, actions), np.float32)
     action_n = np.ones((trees, nodes, duct.DUCT_PLAYERS, actions), np.int32)
     action_inflight = np.zeros((trees, nodes, duct.DUCT_PLAYERS, actions), np.int32)
@@ -172,8 +172,8 @@ def main() -> None:
         ("d64_a16", 4096, 4, 16, 64),
         ("d64_a16", 8192, 4, 16, 64),
         ("d64_a16", 16384, 4, 16, 64),
-        ("d128_a32", 4096, 4, 32, 128),
-        ("d128_a32", 8192, 4, 32, 128),
+        ("d128_a16", 4096, 4, 16, 128),
+        ("d128_a16", 8192, 4, 16, 128),
     ]
     results = [
         _bench_one(
