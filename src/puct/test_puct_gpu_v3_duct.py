@@ -51,8 +51,19 @@ def decode(raw: int):
     return int(kind), int(slot), int(node)
 
 
+def decode_reason(raw: int) -> int:
+    return int((raw >> v3.PACKED_REASON_SHIFT) & v3.PACKED_REASON_MASK)
+
+
 def joint_slot(action0: int, action1: int) -> int:
     return (action0 << duct.DUCT_ACTION_BITS) | action1
+
+
+def set_edge(case, parent: int, action0: int, action1: int, child: int):
+    slot = joint_slot(action0, action1)
+    case["edge_child"][0, parent, slot] = child
+    case["edge_actions"][0, parent, slot] = (action0, action1)
+    return slot
 
 
 def make_duct_case(trees=1, nodes=4, actions=16, warps=1, path_depth=4):
@@ -184,12 +195,11 @@ def _release_duct_claims_kernel(
             cuda.atomic.sub(node_expand_inflight, (tree, leaf), np.int32(1))
 
 
-def launch_select_duct(d, c_uct=1.0, c_pw=1.0, alpha_pw=0.5, soft_winner=0):
+def launch_select_duct(d, c_uct=1.0, c_pw=1.0, alpha_pw=0.5):
     duct._select_kernel_duct_winner_recalc[d["trees"], d["warps"] * v3.WARP_SIZE](
         np.float32(c_uct),
         np.float32(c_pw),
         np.float32(alpha_pw),
-        np.int32(soft_winner),
         d["edge_child"],
         d["edge_actions"],
         d["action_w"],
@@ -225,9 +235,9 @@ def launch_release_duct(dcase, trees=None, warps=None, virtual_loss=1):
     )
 
 
-def run_select_duct(case, c_uct=1.0, c_pw=1.0, alpha_pw=0.5, soft_winner=0):
+def run_select_duct(case, c_uct=1.0, c_pw=1.0, alpha_pw=0.5):
     d = to_device(case)
-    launch_select_duct(d, c_uct=c_uct, c_pw=c_pw, alpha_pw=alpha_pw, soft_winner=soft_winner)
+    launch_select_duct(d, c_uct=c_uct, c_pw=c_pw, alpha_pw=alpha_pw)
     cuda.synchronize()
     return d, copy_back(d)
 
@@ -236,6 +246,39 @@ def run_release_duct(dcase, virtual_loss=1):
     launch_release_duct(dcase, virtual_loss=virtual_loss)
     cuda.synchronize()
     return copy_back(dcase)
+
+
+@cuda.jit
+def _claim_two_actions_partial_cas_kernel(action_inflight, out_held):
+    lane = cuda.threadIdx.x & np.int32(31)
+    scenario = cuda.blockIdx.x
+
+    held = np.int32(0)
+    if scenario == np.int32(0):
+        held = duct._duct_claim_two_actions(
+            action_inflight,
+            np.int32(0),
+            np.int32(0),
+            np.int32(0),
+            np.int32(0),
+            np.int32(0),
+            np.int32(0),
+            lane,
+        )
+    elif scenario == np.int32(1):
+        held = duct._duct_claim_two_actions(
+            action_inflight,
+            np.int32(0),
+            np.int32(1),
+            np.int32(0),
+            np.int32(0),
+            np.int32(0),
+            np.int32(0),
+            lane,
+        )
+
+    if lane == np.int32(0):
+        out_held[scenario] = held
 
 
 def host_duct_inflight_sum(h):
@@ -337,7 +380,7 @@ def test_multi_warp_claims_unique_pw_slots():
     case = make_duct_case(nodes=2, actions=16, warps=4, path_depth=2)
     case["node_expanded"][0, 1] = v3.NODE_EXPANDED_TERMINAL
     case["node_n"][0, 0] = 16
-    d, h = run_select_duct(case, c_pw=1.0, alpha_pw=0.5, soft_winner=1)
+    d, h = run_select_duct(case, c_pw=1.0, alpha_pw=0.5)
     slots = []
     expand_count = 0
     terminal_count = 0
@@ -363,6 +406,214 @@ def test_multi_warp_claims_unique_pw_slots():
     record("multi-warp PW claims unique joint slots", ok, f"slots={slots}")
 
 
+def test_terminal_root_returns_without_claims():
+    case = make_duct_case(nodes=1, actions=16, path_depth=2)
+    case["node_expanded"][0, 0] = v3.NODE_EXPANDED_TERMINAL
+    _, h = run_select_duct(case)
+    raw = int(h["out_selected"][0, 0])
+    kind, _, node = decode(raw)
+    ok = (
+        kind == v3.SELECT_TERMINAL
+        and node == 0
+        and decode_reason(raw) == v3.REASON_OK_TERMINAL
+        and int(h["out_len"][0, 0]) == 1
+        and host_duct_inflight_sum(h) == 0
+    )
+    record("terminal root returns without claims", ok)
+
+
+def test_expanding_joint_edge_returns_busy_and_rolls_back():
+    case = make_duct_case(nodes=2, actions=16, path_depth=2)
+    slot = joint_slot(0, 0)
+    case["edge_child"][0, 0, slot] = duct.DUCT_EDGE_EXPANDING
+    case["node_n"][0, 0] = 1
+    d, h = run_select_duct(case, c_pw=1.0, c_uct=0.0)
+    raw = int(h["out_selected"][0, 0])
+    kind, _, node = decode(raw)
+    h2 = run_release_duct(d)
+    ok = (
+        kind == v3.SELECT_BUSY
+        and node == 0
+        and decode_reason(raw) == v3.REASON_BUSY_EXPAND_INFLIGHT
+        and int(h["out_len"][0, 0]) == 0
+        and int(h["edge_child"][0, 0, slot]) == duct.DUCT_EDGE_EXPANDING
+        and host_duct_inflight_sum(h) == 0
+        and host_duct_inflight_sum(h2) == 0
+    )
+    record("expanding joint edge returns busy and rolls back", ok)
+
+
+def test_invalid_child_oob_rolls_back_actions():
+    case = make_duct_case(nodes=2, actions=16, path_depth=2)
+    slot = set_edge(case, parent=0, action0=0, action1=0, child=3)
+    case["node_n"][0, 0] = 1
+    _, h = run_select_duct(case, c_pw=1.0, c_uct=0.0)
+    raw = int(h["out_selected"][0, 0])
+    kind, _, _ = decode(raw)
+    ok = (
+        kind == v3.SELECT_INVALID
+        and decode_reason(raw) == v3.REASON_INVALID_CHILD_OOB
+        and int(h["edge_child"][0, 0, slot]) == 3
+        and host_duct_inflight_sum(h) == 0
+    )
+    record("invalid child OOB rolls back action claims", ok)
+
+
+def test_depth_limit_after_existing_edge():
+    case = make_duct_case(nodes=2, actions=16, path_depth=1)
+    slot = set_edge(case, parent=0, action0=0, action1=0, child=1)
+    case["node_n"][0, 0] = 1
+    d, h = run_select_duct(case, c_pw=1.0, c_uct=0.0)
+    raw = int(h["out_selected"][0, 0])
+    kind, _, node = decode(raw)
+    h2 = run_release_duct(d)
+    ok = (
+        kind == v3.SELECT_DEPTH_LIMIT
+        and node == 1
+        and decode_reason(raw) == v3.REASON_OK_DEPTH_LIMIT
+        and int(h["out_len"][0, 0]) == 2
+        and int(h["out_path"][0, 0, 0]) == slot
+        and tuple(int(x) for x in h["out_path_actions"][0, 0, 0]) == (0, 0)
+        and int(h["action_inflight"][0, 0, 0, 0]) == 1
+        and int(h["action_inflight"][0, 0, 1, 0]) == 1
+        and host_duct_inflight_sum(h2) == 0
+    )
+    record("depth limit after existing edge releases path claims", ok)
+
+
+def test_invalid_action_count_returns_invalid():
+    case = make_duct_case(nodes=2, actions=16, path_depth=2)
+    case["action_counts"][0, 0, 0] = 17
+    _, h = run_select_duct(case)
+    raw = int(h["out_selected"][0, 0])
+    kind, _, _ = decode(raw)
+    ok = (
+        kind == v3.SELECT_INVALID
+        and decode_reason(raw) == v3.REASON_INVALID_NODE_INFO
+        and host_duct_inflight_sum(h) == 0
+    )
+    record("invalid action count returns invalid without claims", ok)
+
+
+def test_invalid_shape_rejects_non_256_joint_edges():
+    case = make_duct_case(nodes=2, actions=16, path_depth=2)
+    case["edge_child"] = np.full((1, 2, 128), -1, np.int32)
+    case["edge_actions"] = np.full((1, 2, 128, duct.DUCT_PLAYERS), -1, np.int32)
+    _, h = run_select_duct(case)
+    raw = int(h["out_selected"][0, 0])
+    kind, _, _ = decode(raw)
+    ok = (
+        kind == v3.SELECT_INVALID
+        and decode_reason(raw) == v3.REASON_INVALID_SHAPE
+        and host_duct_inflight_sum(h) == 0
+    )
+    record("invalid shape rejects non-256 joint edge table", ok)
+
+
+def test_pw_window_hides_high_value_actions():
+    case = make_duct_case(nodes=3, actions=16, path_depth=2)
+    slot_00 = set_edge(case, parent=0, action0=0, action1=0, child=1)
+    slot_23 = set_edge(case, parent=0, action0=2, action1=3, child=2)
+    case["node_expanded"][0, 1] = v3.NODE_EXPANDED_TERMINAL
+    case["node_expanded"][0, 2] = v3.NODE_EXPANDED_TERMINAL
+    case["node_n"][0, 0] = 1
+    case["action_n"][0, 0, :, :] = 1
+    case["action_w"][0, 0, 0, 2] = 100.0
+    case["action_w"][0, 0, 1, 3] = 100.0
+    d, h = run_select_duct(case, c_pw=1.0, alpha_pw=0.5, c_uct=0.0)
+    raw = int(h["out_selected"][0, 0])
+    kind, _, node = decode(raw)
+    h2 = run_release_duct(d)
+    ok = (
+        kind == v3.SELECT_TERMINAL
+        and node == 1
+        and int(h["out_path"][0, 0, 0]) == slot_00
+        and int(h["out_path"][0, 0, 0]) != slot_23
+        and tuple(int(x) for x in h["out_path_actions"][0, 0, 0]) == (0, 0)
+        and int(h["action_inflight"][0, 0, 0, 2]) == 0
+        and int(h["action_inflight"][0, 0, 1, 3]) == 0
+        and host_duct_inflight_sum(h2) == 0
+    )
+    record("PW window hides high-value actions outside prefix", ok)
+
+
+def test_variable_action_counts_selects_valid_prefix_actions():
+    case = make_duct_case(nodes=2, actions=16, path_depth=2)
+    slot = set_edge(case, parent=0, action0=2, action1=4, child=1)
+    case["node_expanded"][0, 1] = v3.NODE_EXPANDED_TERMINAL
+    case["node_n"][0, 0] = 10
+    case["action_counts"][0, 0, 0] = 3
+    case["action_counts"][0, 0, 1] = 5
+    case["action_n"][0, 0, 0, :3] = 1
+    case["action_n"][0, 0, 1, :5] = 1
+    case["action_w"][0, 0, 0, 2] = 7.0
+    case["action_w"][0, 0, 1, 4] = 8.0
+    d, h = run_select_duct(case, c_pw=100.0, c_uct=0.0)
+    raw = int(h["out_selected"][0, 0])
+    kind, _, node = decode(raw)
+    h2 = run_release_duct(d)
+    ok = (
+        kind == v3.SELECT_TERMINAL
+        and node == 1
+        and int(h["out_path"][0, 0, 0]) == slot
+        and tuple(int(x) for x in h["out_path_actions"][0, 0, 0]) == (2, 4)
+        and int(h["action_inflight"][0, 0, 0, 2]) == 1
+        and int(h["action_inflight"][0, 0, 1, 4]) == 1
+        and host_duct_inflight_sum(h2) == 0
+    )
+    record("variable action counts select valid per-player prefixes", ok)
+
+
+def test_claim_two_actions_rolls_back_partial_cas():
+    case = make_duct_case(nodes=2, actions=16, path_depth=1)
+    case["action_inflight"][0, 0, 1, 0] = 1
+    case["action_inflight"][0, 1, 0, 0] = 1
+    d = to_device(case)
+    out_held = cuda.to_device(np.full((2,), -1, np.int32))
+
+    _claim_two_actions_partial_cas_kernel[2, v3.WARP_SIZE](
+        d["action_inflight"],
+        out_held,
+    )
+    cuda.synchronize()
+
+    h = copy_back(d)
+    held = out_held.copy_to_host()
+    ok = (
+        tuple(int(x) for x in held) == (0, 0)
+        and int(h["action_inflight"][0, 0, 0, 0]) == 0
+        and int(h["action_inflight"][0, 0, 1, 0]) == 1
+        and int(h["action_inflight"][0, 1, 0, 0]) == 1
+        and int(h["action_inflight"][0, 1, 1, 0]) == 0
+        and host_duct_inflight_nonnegative(h)
+        and host_duct_inflight_sum(h) == 2
+    )
+    record("two-action claim rolls back either partial CAS", ok, f"held={held.tolist()}")
+
+
+def test_soft_winner_keeps_busy_claim():
+    if duct.DUCT_SOFT_WINNER == 0:
+        record("soft winner keeps busy duplicate claim", True, "skipped: PUCT_DUCT_SOFT_WINNER=0")
+        return
+
+    case = make_duct_case(nodes=2, actions=16, warps=2, path_depth=2)
+    slot = set_edge(case, parent=0, action0=0, action1=0, child=1)
+    case["node_expanded"][0, 1] = v3.NODE_EXPANDED_TERMINAL
+    case["node_n"][0, 0] = 1
+    d, h = run_select_duct(case, c_pw=1.0, c_uct=0.0)
+    kinds = [decode(int(h["out_selected"][0, wid]))[0] for wid in range(case["warps"])]
+    h2 = run_release_duct(d)
+    ok = (
+        kinds.count(v3.SELECT_TERMINAL) == 2
+        and int(h["out_path"][0, 0, 0]) == slot
+        and int(h["out_path"][0, 1, 0]) == slot
+        and int(h["action_inflight"][0, 0, 0, 0]) == 2
+        and int(h["action_inflight"][0, 0, 1, 0]) == 2
+        and host_duct_inflight_sum(h2) == 0
+    )
+    record("soft winner keeps busy duplicate claim", ok, f"kinds={kinds}")
+
+
 def summarize_results_and_exit():
     failed = [name for name, ok in results if not ok]
     print("================================================================")
@@ -380,6 +631,16 @@ def main():
     test_independent_ucb_existing_joint_edge()
     test_selected_unexpanded_joint_action_expands()
     test_multi_warp_claims_unique_pw_slots()
+    test_terminal_root_returns_without_claims()
+    test_expanding_joint_edge_returns_busy_and_rolls_back()
+    test_invalid_child_oob_rolls_back_actions()
+    test_depth_limit_after_existing_edge()
+    test_invalid_action_count_returns_invalid()
+    test_invalid_shape_rejects_non_256_joint_edges()
+    test_pw_window_hides_high_value_actions()
+    test_variable_action_counts_selects_valid_prefix_actions()
+    test_claim_two_actions_rolls_back_partial_cas()
+    test_soft_winner_keeps_busy_claim()
     summarize_results_and_exit()
 
 
