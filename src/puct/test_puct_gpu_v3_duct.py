@@ -261,8 +261,6 @@ def _claim_two_actions_partial_cas_kernel(action_inflight, out_held):
             np.int32(0),
             np.int32(0),
             np.int32(0),
-            np.int32(0),
-            np.int32(0),
             lane,
         )
     elif scenario == np.int32(1):
@@ -270,8 +268,6 @@ def _claim_two_actions_partial_cas_kernel(action_inflight, out_held):
             action_inflight,
             np.int32(0),
             np.int32(1),
-            np.int32(0),
-            np.int32(0),
             np.int32(0),
             np.int32(0),
             lane,

@@ -126,21 +126,18 @@ def _duct_joint_slot(action0, action1):
 
 
 @cuda.jit(device=True, inline=True)
-def _duct_parent_n_eff_two_players(node_N, action_inflight,
-                                   tree, node, action_count0, action_count1,
-                                   lane):
-    """Node visits for DUCT UCB/PW, including both players' pending visits."""
-    #& DUCT重构: 两个玩家各自最多 16 个动作，用两个 half-warp 同时累加 inflight。
-    #& 理由: PW 是逐玩家的，父节点有效访问数也可以和动作选择一样并行得到。
+def _duct_parent_n_eff_local(node_N, action_inflight,
+                             tree, node, action_count, lane):
+    """Node visits for this lane's player, including pending visits."""
+    #& DUCT重构: 两个玩家各自最多 16 个动作，用两个 half-warp 同时算各自 inflight。
+    #& 理由: 每个 lane 只需要自己玩家的 PW/UCB 输入，不必持有两份玩家状态。
     player = int32(0)
     half_lane = lane
-    action_count = action_count0
     mask = int32(DUCT_PLAYER0_MASK)
 
     if lane >= int32(DUCT_MARGINAL_ACTIONS):
         player = int32(1)
         half_lane = lane - int32(DUCT_MARGINAL_ACTIONS)
-        action_count = action_count1
         mask = int32(DUCT_PLAYER1_MASK)
 
     inflight_total = int32(0)
@@ -161,12 +158,7 @@ def _duct_parent_n_eff_two_players(node_N, action_inflight,
         base_n = node_N[tree, node]
     base_n = cuda.shfl_sync(FULL_MASK, base_n, 0)
 
-    parent_n_eff0 = max(base_n + cuda.shfl_sync(FULL_MASK, inflight_total, 0), int32(1))
-    parent_n_eff1 = max(
-        base_n + cuda.shfl_sync(FULL_MASK, inflight_total, DUCT_MARGINAL_ACTIONS),
-        int32(1),
-    )
-    return parent_n_eff0, parent_n_eff1
+    return max(base_n + inflight_total, int32(1))
 
 
 @cuda.jit(float32(float32, float32, int32, int32, float32), device=True, inline=True)
@@ -197,25 +189,17 @@ def _duct_ucb_score(c_uct, w, n_action, n_action_inflight, log_parent_n_eff):
 @cuda.jit(device=True, inline=True)
 def _duct_reduce_best_action_halfwarp(c_uct, action_W, action_N, action_inflight,
                                       tree, node, lane,
-                                      action_count0, action_count1,
-                                      log_parent_n_eff0,
-                                      log_parent_n_eff1,
-                                      tie_offset0, tie_offset1):
+                                      action_count, log_parent_n_eff,
+                                      tie_offset):
     #& DUCT重构: 两个玩家各自最多 16 个动作，正好用一个 warp 的两个 half-warp 并行 reduce。
     #& 理由: 旧实现用整 warp 先算 player0 再算 player1，16 动作时一半 lane 空闲且串行两遍。
     player = int32(0)
     half_lane = lane
-    action_count = action_count0
-    log_parent_n_eff = log_parent_n_eff0
-    tie_offset = tie_offset0
     mask = int32(DUCT_PLAYER0_MASK)
 
     if lane >= int32(DUCT_MARGINAL_ACTIONS):
         player = int32(1)
         half_lane = lane - int32(DUCT_MARGINAL_ACTIONS)
-        action_count = action_count1
-        log_parent_n_eff = log_parent_n_eff1
-        tie_offset = tie_offset1
         mask = int32(DUCT_PLAYER1_MASK)
 
     best_score = float32(NEG_INF_F32)
@@ -273,96 +257,84 @@ def _duct_reduce_best_action_halfwarp(c_uct, action_W, action_N, action_inflight
         best_action = other_action
         best_inflight = other_inflight
 
-    best_action0 = cuda.shfl_sync(FULL_MASK, best_action, 0)
-    best_inflight0 = cuda.shfl_sync(FULL_MASK, best_inflight, 0)
-    best_action1 = cuda.shfl_sync(FULL_MASK, best_action, DUCT_MARGINAL_ACTIONS)
-    best_inflight1 = cuda.shfl_sync(FULL_MASK, best_inflight, DUCT_MARGINAL_ACTIONS)
-    return best_action0, best_inflight0, best_action1, best_inflight1
+    return best_action, best_inflight
 
 
 @cuda.jit(device=True, inline=True)
-def _duct_release_two_actions(action_inflight, tree, node, action0, action1, lane):
+def _duct_release_joint_slot(action_inflight, tree, node, joint_slot, lane):
     #& DUCT新增: 回滚/释放两个玩家各自动作上的 virtual loss。
     #& 理由: DUCT 的并发占用在 action_inflight[player, action]，不是 edge_inflight。
-    if lane == int32(0):
-        if action0 >= int32(0) and action0 != int32(INT32_MAX):
-            cuda.atomic.sub(action_inflight, (tree, node, int32(0), action0), int32(1))
-    if lane == int32(DUCT_MARGINAL_ACTIONS):
-        if action1 >= int32(0) and action1 != int32(INT32_MAX):
-            cuda.atomic.sub(action_inflight, (tree, node, int32(1), action1), int32(1))
+    if lane == int32(0) or lane == int32(DUCT_MARGINAL_ACTIONS):
+        if joint_slot >= int32(0):
+            action0 = joint_slot >> int32(DUCT_ACTION_BITS)
+            action1 = joint_slot & int32(DUCT_ACTION_MASK)
+            player = int32(lane != int32(0))
+            action = action0 + (action1 - action0) * player
+            cuda.atomic.sub(action_inflight, (tree, node, player, action), int32(1))
 
 
 @cuda.jit(device=True, inline=True)
-def _duct_claim_two_actions(action_inflight, tree, node,
-                            action0, inflight0, action1, inflight1,
-                            lane):
-    #& DUCT新增: 两个玩家动作必须同时 claim 成功；第二个失败时回滚第一个。
+def _duct_claim_two_actions(action_inflight, tree, node, action, inflight, lane):
+    #& DUCT新增: 两个玩家动作必须同时 claim 成功；任一侧失败时回滚已成功的一侧。
     #& 理由: 一个 select warp 持有的是 joint move，不能留下半个玩家动作的虚拟访问。
-    held0 = int32(0)
-    held1 = int32(0)
-    if lane == int32(0):
-        prev0 = cuda.atomic.cas(
-            action_inflight, (tree, node, int32(0), action0),
-            inflight0, inflight0 + int32(1),
+    held_local = int32(0)
+    if lane == int32(0) or lane == int32(DUCT_MARGINAL_ACTIONS):
+        player = int32(lane != int32(0))
+        prev = cuda.atomic.cas(
+            action_inflight, (tree, node, player, action),
+            inflight, inflight + int32(1),
         )
-        if prev0 == inflight0:
-            held0 = int32(1)
-    if lane == int32(DUCT_MARGINAL_ACTIONS):
-        prev1 = cuda.atomic.cas(
-            action_inflight, (tree, node, int32(1), action1),
-            inflight1, inflight1 + int32(1),
-        )
-        if prev1 == inflight1:
-            held1 = int32(1)
+        if prev == inflight:
+            held_local = int32(1)
 
-    held0 = cuda.shfl_sync(FULL_MASK, held0, 0)
-    held1 = cuda.shfl_sync(FULL_MASK, held1, DUCT_MARGINAL_ACTIONS)
+    held0 = cuda.shfl_sync(FULL_MASK, held_local, 0)
+    held1 = cuda.shfl_sync(FULL_MASK, held_local, DUCT_MARGINAL_ACTIONS)
     if held0 != int32(0) and held1 != int32(0):
         return int32(1)
 
-    if lane == int32(0) and held0 != int32(0):
-        cuda.atomic.sub(action_inflight, (tree, node, int32(0), action0), int32(1))
-    if lane == int32(DUCT_MARGINAL_ACTIONS) and held1 != int32(0):
-        cuda.atomic.sub(action_inflight, (tree, node, int32(1), action1), int32(1))
+    if lane == int32(0) or lane == int32(DUCT_MARGINAL_ACTIONS):
+        if held_local != int32(0):
+            player = int32(lane != int32(0))
+            cuda.atomic.sub(action_inflight, (tree, node, player, action), int32(1))
     return int32(0)
 
 
 @cuda.jit(device=True, inline=True)
 def _duct_best_actions_winner_recalc(c_uct, action_W, action_N, action_inflight,
-                                     tree, node, action_count0, action_count1,
-                                     lane, log_parent_n_eff0,
-                                     log_parent_n_eff1, tie_offset):
+                                     tree, node, action_count, lane,
+                                     log_parent_n_eff, tie_offset):
     #* 选择最优动作，得到对应的 action 与 inflight
-    #& DUCT新增: 用两个 half-warp 并行选择 player0/player1 的动作，然后一起做 winner recalc。
+    #& DUCT新增: 每个 half-warp 只持有自己玩家的 action/inflight，然后一起做 winner recalc。
     #& 理由: 保留单人 PUCT 的 CAS 重算模式，避免多个 warp 长时间挤在同一动作上。
-    best0 = int32(INT32_MAX)
-    best1 = int32(INT32_MAX)
+    best_action = int32(INT32_MAX)
+    pair_valid = int32(0)
     held = int32(0)
     retry = int32(0)
 
-    tie_offset0 = tie_offset
-    if tie_offset0 >= action_count0:
-        tie_offset0 = tie_offset0 % action_count0
-    tie_offset1 = tie_offset + int32(17)
-    if tie_offset1 >= action_count1:
-        tie_offset1 = tie_offset1 % action_count1
+    local_tie_offset = tie_offset
+    if lane >= int32(DUCT_MARGINAL_ACTIONS):
+        local_tie_offset = tie_offset + int32(17)
+    if local_tie_offset >= action_count:
+        local_tie_offset = local_tie_offset % action_count
 
     while retry < int32(MAX_RECALC_RETRY):
-        best0, inflight0, best1, inflight1 = _duct_reduce_best_action_halfwarp(
+        best_action, best_inflight = _duct_reduce_best_action_halfwarp(
             c_uct, action_W, action_N, action_inflight,
-            tree, node, lane,
-            action_count0, action_count1,
-            log_parent_n_eff0, log_parent_n_eff1,
-            tie_offset0, tie_offset1,
+            tree, node, lane, action_count, log_parent_n_eff, local_tie_offset,
         )
 
-        if best0 == int32(INT32_MAX) or best1 == int32(INT32_MAX):
+        valid_local = int32(0)
+        if best_action != int32(INT32_MAX):
+            valid_local = int32(1)
+        valid0 = cuda.shfl_sync(FULL_MASK, valid_local, 0)
+        valid1 = cuda.shfl_sync(FULL_MASK, valid_local, DUCT_MARGINAL_ACTIONS)
+        pair_valid = valid0 & valid1
+        if pair_valid == int32(0):
             break
 
         #* 对 inflight 进行 CAS，并检查是否成功 Hold
         held = _duct_claim_two_actions(
-            action_inflight, tree, node,
-            best0, inflight0, best1, inflight1, lane,
+            action_inflight, tree, node, best_action, best_inflight, lane,
         )
         #* 成功，或超过最大重试次数时退出
         if held == int32(1) or retry + int32(1) >= int32(MAX_RECALC_RETRY):
@@ -372,21 +344,23 @@ def _duct_best_actions_winner_recalc(c_uct, action_W, action_N, action_inflight,
 
     if (
         int32(DUCT_SOFT_WINNER) != int32(0) and held == int32(0) and
-        best0 != int32(INT32_MAX) and best1 != int32(INT32_MAX)
+        pair_valid != int32(0)
     ):
-        if lane == int32(0):
-            cuda.atomic.add(action_inflight, (tree, node, int32(0), best0), int32(1))
-        if lane == int32(DUCT_MARGINAL_ACTIONS):
-            cuda.atomic.add(action_inflight, (tree, node, int32(1), best1), int32(1))
+        if lane == int32(0) or lane == int32(DUCT_MARGINAL_ACTIONS):
+            cuda.atomic.add(
+                action_inflight,
+                (tree, node, int32(lane != int32(0)), best_action),
+                int32(1),
+            )
         held = int32(1)
 
     held = cuda.shfl_sync(FULL_MASK, held, 0)
-    return best0, best1, held
+    return best_action, pair_valid, held
 
 
 @cuda.jit(device=True, inline=True)
 def _duct_claim_joint_expand(edge_tgt_node, edge_actions, node_expand_inflight,
-                             tree, node, joint_slot, action0, action1, lane):
+                             tree, node, joint_slot, lane):
     #& DUCT重构: joint action 固定映射到 0..255 的边槽，缺 child 时直接抢占这条边。
     #& 理由: 不再用 node_expanded/cur_expanded 分配线性 slot，避免线性扫描和重复联合动作。
     held = int32(0)
@@ -398,6 +372,8 @@ def _duct_claim_joint_expand(edge_tgt_node, edge_actions, node_expand_inflight,
             int32(DUCT_EDGE_EXPANDING),
         )
         if prev == int32(DUCT_EDGE_UNEXPANDED):
+            action0 = joint_slot >> int32(DUCT_ACTION_BITS)
+            action1 = joint_slot & int32(DUCT_ACTION_MASK)
             edge_actions[tree, node, joint_slot, int32(0)] = action0
             edge_actions[tree, node, joint_slot, int32(1)] = action1
             cuda.atomic.add(node_expand_inflight, (tree, node), int32(1))
@@ -407,8 +383,7 @@ def _duct_claim_joint_expand(edge_tgt_node, edge_actions, node_expand_inflight,
 
 @cuda.jit(device=True, inline=True)
 def _write_duct_path_step(out_path_eids, out_path_actions,
-                          tree, wid, depth, lane, node, edge_slot,
-                          action0, action1):
+                          tree, wid, depth, lane, node, edge_slot):
     #* Path 编码格式为 (parent_node << 8) | edge_slot。backup 时直接解码。
     #& DUCT新增: 同步写 out_path_actions，保存每个玩家本次实际选择的动作。
     #& 理由: DUCT backup 只更新被选中的 a_i，因此 path 里必须有 action0/action1。
@@ -417,6 +392,8 @@ def _write_duct_path_step(out_path_eids, out_path_actions,
             out_path_eids[tree, wid, depth] = (node << int32(8)) | edge_slot
         else:
             out_path_eids[tree, wid, depth] = int32(-1)
+        action0 = edge_slot >> int32(DUCT_ACTION_BITS)
+        action1 = edge_slot & int32(DUCT_ACTION_MASK)
         out_path_actions[tree, wid, depth, int32(0)] = action0
         out_path_actions[tree, wid, depth, int32(1)] = action1
 
@@ -616,20 +593,20 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
 
 
         #* 每个玩家各自执行 PW，限制当前可访问的边缘动作前缀。
-        parent_n_eff0, parent_n_eff1 = _duct_parent_n_eff_two_players(
-            node_N, action_inflight, tree, node, action_count0, action_count1, lane,
+        local_action_count = action_count0
+        if lane >= int32(DUCT_MARGINAL_ACTIONS):
+            local_action_count = action_count1
+        parent_n_eff = _duct_parent_n_eff_local(
+            node_N, action_inflight, tree, node, local_action_count, lane,
         )
-        allowed0 = _allowed_children(c_pw, alpha_pw, parent_n_eff0, action_count0)
-        allowed1 = _allowed_children(c_pw, alpha_pw, parent_n_eff1, action_count1)
-        log_parent_n_eff0 = math.log(float32(parent_n_eff0))
-        log_parent_n_eff1 = math.log(float32(parent_n_eff1))
+        allowed = _allowed_children(c_pw, alpha_pw, parent_n_eff, local_action_count)
+        log_parent_n_eff = math.log(float32(parent_n_eff))
 
         #& DUCT新增: 每个玩家独立用 DUCT UCB 选择动作，再组合成 joint move。这是 DUCT 和单人 PUCT select 的核心差异；
         tie_offset = wid
-        best_action0, best_action1, claim_held = _duct_best_actions_winner_recalc(
+        local_best_action, pair_valid, claim_held = _duct_best_actions_winner_recalc(
             c_uct, action_W, action_N, action_inflight,
-            tree, node, allowed0, allowed1, lane,
-            log_parent_n_eff0, log_parent_n_eff1, tie_offset,
+            tree, node, allowed, lane, log_parent_n_eff, tie_offset,
         )
 
         #* 当未取得 held 机会时直接回滚；拿到 held 后再校验 child 合法性。
@@ -641,7 +618,7 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
                 int32(1), node_cnt, action_capacity,
             )
             cuda.syncwarp(FULL_MASK)
-            if best_action0 == int32(INT32_MAX) or best_action1 == int32(INT32_MAX):
+            if pair_valid == int32(0):
                 final_packed = _pack_selection(
                     int32(SELECT_INVALID),
                     int32(PACKED_NODE_MASK),
@@ -659,7 +636,11 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
 
         #& DUCT重构: joint action 数量固定为 256，两份 4-bit 边缘动作直接组成 slot。
         #& 理由: Select 已经选出两个玩家动作，定位边不需要扫描 node_expanded。
-        joint_slot = _duct_joint_slot(best_action0, best_action1)
+        joint_slot = int32(0)
+        action1 = cuda.shfl_sync(FULL_MASK, local_best_action, DUCT_MARGINAL_ACTIONS)
+        if lane == int32(0):
+            joint_slot = _duct_joint_slot(local_best_action, action1)
+        joint_slot = cuda.shfl_sync(FULL_MASK, joint_slot, 0)
         joint_child = edge_tgt_node[tree, node, joint_slot]
         joint_child = cuda.shfl_sync(FULL_MASK, joint_child, 0)
 
@@ -667,13 +648,12 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
         if joint_child == int32(DUCT_EDGE_UNEXPANDED):
             expand_held = _duct_claim_joint_expand(
                 edge_tgt_node, edge_actions, node_expand_inflight,
-                tree, node, joint_slot, best_action0, best_action1, lane,
+                tree, node, joint_slot, lane,
             )
             if expand_held == int32(1):
                 _write_duct_path_step(
                     out_path_eids, out_path_actions,
                     tree, wid, depth, lane, node, joint_slot,
-                    best_action0, best_action1,
                 )
                 final_packed = _pack_selection(
                     int32(SELECT_EXPAND),
@@ -691,8 +671,8 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
             expand_busy = int32(1)
 
         if expand_busy != int32(0) or joint_child < int32(0) or joint_child >= node_cnt:
-            _duct_release_two_actions(
-                action_inflight, tree, node, best_action0, best_action1, lane,
+            _duct_release_joint_slot(
+                action_inflight, tree, node, joint_slot, lane,
             )
             cuda.syncwarp(FULL_MASK)
             _rollback_duct_vloss_path_nodes(
@@ -723,7 +703,6 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
         _write_duct_path_step(
             out_path_eids, out_path_actions,
             tree, wid, depth, lane, node, joint_slot,
-            best_action0, best_action1,
         )
         cuda.syncwarp(FULL_MASK)
 
