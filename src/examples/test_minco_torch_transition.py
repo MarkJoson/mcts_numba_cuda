@@ -238,6 +238,46 @@ def test_pool_gather_and_rollout() -> None:
            np.allclose(rollout_out.detach().numpy(), expected.reshape(-1), atol=1e-10))
 
 
+def test_minco_rejects_implicit_buffer_conversion() -> None:
+    transition = MincoTorchTransition(0.1, dtype=torch.float32)
+    coeff = torch.zeros((NCOFF, 2), dtype=torch.float64)
+    target = torch.zeros((2,), dtype=torch.float64)
+    try:
+        transition.step(coeff, target, clamp_target=False)
+    except ValueError as exc:
+        ok = "same dtype/device" in str(exc)
+    else:
+        ok = False
+    record("minco transition rejects implicit per-step buffer conversion", ok)
+
+
+def test_minco_prebuilt_evaluate_basis() -> None:
+    transition = MincoTorchTransition(0.1, dtype=torch.float64, evaluation_times=[0.05])
+    coeff = torch.zeros((2, NCOFF, 2), dtype=torch.float64)
+    coeff[:, 0, :] = torch.tensor([[1.0, 2.0], [-1.0, 0.5]], dtype=torch.float64)
+    coeff[:, 1, :] = torch.tensor([[0.4, -0.2], [0.1, 0.3]], dtype=torch.float64)
+    coeff[:, 2, :] = torch.tensor([[0.5, 0.25], [-0.2, 0.1]], dtype=torch.float64)
+
+    expected_t0 = coeff[:, 0, :]
+    expected_mid = (
+        coeff[:, 0, :]
+        + 0.05 * coeff[:, 1, :]
+        + (0.05 ** 2) * coeff[:, 2, :]
+    )
+    record("minco evaluate uses prebuilt beta at t=0",
+           torch.allclose(transition.evaluate(coeff, 0.0, 0), expected_t0, atol=1e-12))
+    record("minco evaluate uses registered mid-step beta",
+           torch.allclose(transition.evaluate(coeff, 0.05, 0), expected_mid, atol=1e-12))
+
+    try:
+        transition.evaluate(coeff, 0.03, 0)
+    except ValueError as exc:
+        ok = "not prebuilt" in str(exc)
+    else:
+        ok = False
+    record("minco evaluate rejects unregistered times", ok)
+
+
 def test_point_env_time_pack_and_gather() -> None:
     env = MincoPointEnvTransition(
         num_agents=4,
@@ -264,7 +304,7 @@ def test_point_env_time_pack_and_gather() -> None:
            and info.projected_targets.shape == (2, 4, 2)
            and coeff.shape == (2, 4, NCOFF, 2))
 
-    pool = flat.reshape(2, 1, env.state_dim).repeat(1, 2, 1)
+    pool = flat.view(2, 1, env.state_dim).repeat(1, 2, 1)
     gathered_flat, gathered_done = env.gather_step_flat(
         pool,
         torch.tensor([0, 1]),
@@ -401,7 +441,7 @@ def test_point_env_convex_obstacle_geometry() -> None:
         clamp_target=False,
         return_info=True,
     )
-    clearance = env.obstacle_clearance(points.reshape(1, 4, 2))[0]
+    clearance = env.obstacle_clearance(points.view(1, 4, 2))[0]
 
     record("convex obstacle half-plane clearance handles cw and ccw polygons",
            clearance[0, 0] <= 0.0
@@ -431,11 +471,76 @@ def test_point_env_convex_obstacle_geometry() -> None:
         [-1.00, -1.00],
     ], dtype=torch.float64)
     near_mask = margin_env.obstacle_collision_mask(
-        near_edge.reshape(1, 4, 2),
+        near_edge.view(1, 4, 2),
         torch.ones((1, 4), dtype=torch.float64),
     )[0]
     record("convex obstacle margin catches near-edge points",
            torch.equal(near_mask, torch.tensor([True, False, False, False])))
+
+
+def test_obstacle_target_projection_improves_future_clearance() -> None:
+    obstacle = [[-0.35, -0.35], [0.35, -0.35], [0.35, 0.35], [-0.35, 0.35]]
+    base_kwargs = dict(
+        num_agents=4,
+        piece_t=0.1,
+        dt=0.1,
+        collision_radius=0.0,
+        obstacle_vertices=[obstacle],
+        obstacle_collision_margin=0.02,
+        velocity_limit=12.0,
+        acceleration_limit=18.0,
+        dtype=torch.float64,
+        position_bounds=((-3.0, 3.0), (-3.0, 3.0)),
+        done_on_team_eliminated=False,
+    )
+    plain_env = MincoPointEnvTransition(**base_kwargs)
+    projected_env = MincoPointEnvTransition(
+        **base_kwargs,
+        obstacle_target_projection=True,
+        obstacle_projection_iters=5,
+        obstacle_projection_extra_margin=0.02,
+        obstacle_projection_topk=8,
+        obstacle_projection_fixes_per_iter=2,
+    )
+    positions = torch.tensor([
+        [-1.4, 0.0],
+        [-1.4, 1.0],
+        [1.4, 0.0],
+        [1.4, 1.0],
+    ], dtype=torch.float64)
+    targets = torch.tensor([
+        [1.4, 0.0],
+        [-1.4, 1.0],
+        [-1.4, 0.0],
+        [1.4, 1.0],
+    ], dtype=torch.float64)
+    coeff = projected_env.initial_coefficients(positions)
+    active = torch.ones((4,), dtype=torch.float64)
+    dynamic_target = projected_env.robot_transition.project_target(coeff, targets)
+    before_clearance = projected_env.future_obstacle_clearance_from_target(coeff, dynamic_target)
+    repaired, iters, residual = projected_env.project_target_away_from_obstacles(
+        coeff,
+        dynamic_target,
+        active,
+    )
+    after_clearance = projected_env.future_obstacle_clearance_from_target(coeff, repaired)
+
+    flat_plain = plain_env.initial_flat_state(positions)
+    _, _, plain_info = plain_env.step_flat(flat_plain, targets, return_info=True)
+    flat_projected = projected_env.initial_flat_state(positions)
+    _, _, projected_info = projected_env.step_flat(flat_projected, targets, return_info=True)
+
+    record("obstacle target projection moves targets",
+           torch.linalg.norm(repaired - dynamic_target, dim=-1).max() > 1e-6
+           and int(iters) == projected_env.obstacle_projection_iters)
+    record("obstacle target projection uses top-k two-fix settings",
+           projected_env.obstacle_projection_topk == 8
+           and projected_env.obstacle_projection_fixes_per_iter == 2)
+    record("obstacle target projection improves future clearance",
+           after_clearance.min() > before_clearance.min())
+    record("obstacle target projection reduces step obstacle collisions",
+           int(projected_info.obstacle_collision_mask.sum()) <= int(plain_info.obstacle_collision_mask.sum())
+           and torch.equal(projected_info.obstacle_projection_residual_mask, residual))
 
 
 def test_point_env_obstacle_batch_performance() -> None:
@@ -488,12 +593,15 @@ def main() -> None:
     test_matrices_and_one_step()
     test_bounds_batch_and_flat_state()
     test_pool_gather_and_rollout()
+    test_minco_rejects_implicit_buffer_conversion()
+    test_minco_prebuilt_evaluate_basis()
     test_point_env_time_pack_and_gather()
     test_point_env_collision_and_bounds_done()
     test_point_env_convex_obstacle_geometry()
+    test_obstacle_target_projection_improves_future_clearance()
     test_point_env_obstacle_batch_performance()
     print("================================================================")
-    print("  ALL PASSED: 20 checks")
+    print("  ALL PASSED: 27 checks")
     print("================================================================")
 
 
