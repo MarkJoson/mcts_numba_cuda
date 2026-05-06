@@ -53,9 +53,6 @@ DUCT_EXPAND_TOPK = 4
 DUCT_EXPAND_TOPK_BITS = 2
 DUCT_EXPAND_TOPK_MASK = DUCT_EXPAND_TOPK - 1
 DUCT_EXPAND_CANDIDATES = DUCT_EXPAND_TOPK * DUCT_EXPAND_TOPK
-DUCT_EXPAND_JOB_EMPTY = 0
-DUCT_EXPAND_JOB_READY = 1
-DUCT_EXPAND_JOB_FAILED = -1
 DUCT_PATH_SLOT_BITS = 16
 DUCT_PATH_SLOT_MASK = (1 << DUCT_PATH_SLOT_BITS) - 1
 DUCT_SOFT_WINNER = int(os.environ.get("PUCT_DUCT_SOFT_WINNER", "0") == "1")
@@ -1009,160 +1006,6 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
     _write_select_output(tree, wid, lane, final_packed, final_len,
                          out_selected_node, out_path_len)
 
-
-@cuda.jit
-def _commit_expand_stage2_duct(edge_tgt_node,
-                               action_W,
-                               action_N,
-                               action_inflight,
-                               action_counts,
-                               node_N,
-                               node_expand_inflight,
-                               tree_nodes,
-                               node_states,
-                               expand_valid,
-                               expand_parent,
-                               expand_slot,
-                               expand_child,
-                               expand_next_states,
-                               expand_done):
-    """DUCT 扩展阶段2：提交 PyTorch/MINCO 结果并发布 child edge。
-
-    并行粒度：
-        blockIdx.x = tree，一个 warp 对应一个 stage1 job wid。
-        lane 在线性 shape 上 stride 初始化 child 节点和 slot 表。
-
-    输入 staging shape：
-        expand_valid: [T, W]，READY 表示 Python 已填好 stage2 buffer。
-        expand_parent/slot/child: [T, W]，stage1 分配和声明的 tree metadata。
-        expand_next_states: [T, W, state_dim]，MINCO transition 后的 child state。
-        expand_done: [T, W]，terminal 标记。
-
-    树内目标 shape：
-        node_states: [T, N, state_dim]。
-        edge_tgt_node: [T, N, 256]。
-        action_W/N/inflight: [T, N, 2, 16]。
-        action_counts: [T, N, 2]。
-
-    关键算法路径：
-        1) 校验 READY job、parent/child/slot 范围、edge 仍为 EXPANDING、next_state 有限。
-        2) 无效 job 只清空 staging；edge/inflight 保持无效占用，后续 backup 仅处理有效节点。
-        3) 成功 job 先写 child state，再初始化 256 个 joint edge 和 2x16 边缘动作统计。
-        4) 设置 node_N/action_counts，threadfence 后发布 edge_tgt_node=child 或 terminal sentinel。
-        5) 发布后释放 node_expand_inflight，并清空 expand_valid。
-
-    注意：
-        child 的 node_action_targets/probs 已由 PyTorch stage2 按 child id 直接 scatter。
-        这里不再经过 expand_child_action_* staging，避免一份峰值缓冲。
-
-    发布约束：
-        edge_tgt_node[parent, slot] 是最后的树可见发布点；发布前 child 的统计、
-        action slot 和 terminal sentinel 必须已全部写入，避免 select 读到半初始化节点。
-    """
-    tree = cuda.blockIdx.x
-    lane = cuda.threadIdx.x & int32(31)
-    wid = cuda.threadIdx.x >> int32(5)
-
-    if tree >= expand_valid.shape[0]:
-        return
-    if wid >= min(cuda.blockDim.x >> int32(5), expand_valid.shape[1]):
-        return
-
-    status = expand_valid[tree, wid]
-    if status == int32(DUCT_EXPAND_JOB_EMPTY):
-        return
-
-    parent = expand_parent[tree, wid]
-    slot = expand_slot[tree, wid]
-    child = expand_child[tree, wid]
-    node_capacity = node_states.shape[1]
-    action_capacity = action_inflight.shape[3]
-    state_dim = node_states.shape[2]
-
-    #& 读取当前 node pool 上界，用于检查 child ticket 是否仍在有效范围内。
-    node_cnt = int32(0)
-    if lane == int32(0):
-        node_cnt = tree_nodes[tree]
-    node_cnt = cuda.shfl_sync(FULL_MASK, node_cnt, 0)
-
-    invalid = int32(0)
-    if (
-        parent < int32(0) or parent >= node_cnt or
-        child < int32(0) or child >= node_capacity or
-        child >= node_cnt or
-        slot < int32(0) or slot >= int32(DUCT_JOINT_ACTIONS) or
-        status != int32(DUCT_EXPAND_JOB_READY)
-    ):
-        invalid = int32(1)
-
-    edge_state = int32(DUCT_EDGE_UNEXPANDED)
-    if lane == int32(0) and parent >= int32(0) and parent < edge_tgt_node.shape[1]:
-        if slot >= int32(0) and slot < int32(DUCT_JOINT_ACTIONS):
-            edge_state = edge_tgt_node[tree, parent, slot]
-    edge_state = cuda.shfl_sync(FULL_MASK, edge_state, 0)
-    if edge_state != int32(DUCT_EDGE_EXPANDING):
-        invalid = int32(1)
-
-    #& finite guard: PyTorch/MINCO 若产生 NaN/Inf，commit 直接丢弃 job，不做 expand 回滚。
-    idx = lane
-    while idx < state_dim:
-        v = expand_next_states[tree, wid, idx]
-        if not (v == v and abs(v) <= float32(POS_INF_F32)):
-            invalid = int32(1)
-        idx += int32(32)
-    invalid = _duct_warp_or_i32(invalid)
-
-    if invalid != int32(0):
-        if lane == int32(0):
-            expand_valid[tree, wid] = int32(DUCT_EXPAND_JOB_EMPTY)
-        return
-
-    #& Shape拷贝: expand_next_states[tree,wid,state_dim] -> node_states[tree,child,:].
-    idx = lane
-    while idx < state_dim:
-        node_states[tree, child, idx] = expand_next_states[tree, wid, idx]
-        idx += int32(32)
-
-    #& 初始化 child 的固定 16x16 joint edge 表。动作由 slot 直接解码，不再保存冗余表。
-    idx = lane
-    while idx < int32(DUCT_JOINT_ACTIONS):
-        edge_tgt_node[tree, child, idx] = int32(DUCT_EDGE_UNEXPANDED)
-        idx += int32(32)
-
-    #& 初始化两个玩家的 16 个 marginal slot 统计。策略 target/prob 已由 PyTorch 写入 child。
-    idx = lane
-    while idx < int32(DUCT_PLAYERS) * int32(DUCT_MARGINAL_ACTIONS):
-        player = idx // int32(DUCT_MARGINAL_ACTIONS)
-        action = idx - player * int32(DUCT_MARGINAL_ACTIONS)
-        action_W[tree, child, player, action] = float32(0.0)
-        action_N[tree, child, player, action] = int32(0)
-        action_inflight[tree, child, player, action] = int32(0)
-        idx += int32(32)
-
-    #& lane0 写节点级统计。terminal child 不再创建可遍历节点，只在 parent edge 写 sentinel。
-    if lane == int32(0):
-        node_N[tree, child] = int32(0)
-        if expand_done[tree, wid] != int32(0):
-            action_counts[tree, child, int32(0)] = int32(1)
-            action_counts[tree, child, int32(1)] = int32(1)
-        else:
-            action_counts[tree, child, int32(0)] = int32(DUCT_MARGINAL_ACTIONS)
-            action_counts[tree, child, int32(1)] = int32(DUCT_MARGINAL_ACTIONS)
-
-    #& 发布屏障: child 数据全部写完后，再让 parent edge 指向 child。
-    cuda.syncwarp(FULL_MASK)
-    cuda.threadfence()
-
-    if lane == int32(0):
-        #& 树可见发布点。之后 select 可能立刻沿 parent/slot 进入 child。
-        if expand_done[tree, wid] != int32(0):
-            edge_tgt_node[tree, parent, slot] = int32(NODE_EXPANDED_TERMINAL)
-        else:
-            edge_tgt_node[tree, parent, slot] = child
-        cuda.atomic.sub(node_expand_inflight, (tree, parent), int32(1))
-        expand_valid[tree, wid] = int32(DUCT_EXPAND_JOB_EMPTY)
-
-
 # ============================================================
 # DUCT PyTorch bridge helpers
 # ============================================================
@@ -1176,13 +1019,15 @@ class DuctExpandBridge:
         node_action_probs: [T, N, 2, 16]。
 
     job staging shape：
-        expand_valid/tree/parent/slot/child: [T, W]。
-        expand_next_states: [T, W, state_dim]。
+        expand_count: [1]。
+        expand_tree/parent/slot/child: [T*W] compact jobs。
+        expand_next_states: [T*W, state_dim]。
+        expand_done: [T*W]。
 
     关键路径：
-        PyTorch stage1 写 parent/slot/child；
+        PyTorch stage1 连续写 tree/parent/slot/child；
         Python 调 MINCO projection/transition 和 policy sampling，并直接 scatter child slot；
-        CUDA stage2 初始化统计、提交 next_state 并发布 edge。
+        PyTorch stage2 批量发布 parent edge。
 
     注意：
         PyTorch tensor 是 owner；cuda.as_cuda_array 只是零拷贝 view，
@@ -1199,11 +1044,12 @@ class DuctExpandBridge:
         self.state_dim = int(state_dim)
         self.num_agents = int(num_agents)
         self.max_warps = int(max_warps)
+        self.max_jobs = self.n_trees * self.max_warps
         self.device = torch.device(device)
         self.target_dtype = target_dtype or torch.float16
         self.prob_dtype = prob_dtype or torch.float16
 
-        #& 树内持久 storage：child commit 后 select/backup 都从这些 tensor 读取。
+        #& 树内持久 storage：child 发布后 select/backup 都从这些 tensor 读取。
         self.node_states = torch.zeros(
             (self.n_trees, self.node_capacity, self.state_dim),
             dtype=torch.float32, device=self.device,
@@ -1218,39 +1064,24 @@ class DuctExpandBridge:
             dtype=self.prob_dtype, device=self.device,
         )
 
-        #& stage1 -> Python -> stage2 的 job staging。
-        #& expand_valid 是唯一的 job 状态发布字段：EMPTY / READY / FAILED。
-        self.expand_valid = torch.zeros(
-            (self.n_trees, self.max_warps), dtype=torch.int32, device=self.device,
-        )
-        self.expand_tree = torch.full_like(self.expand_valid, -1)
-        self.expand_parent = torch.full_like(self.expand_valid, -1)
-        self.expand_slot = torch.full_like(self.expand_valid, -1)
-        self.expand_child = torch.full_like(self.expand_valid, -1)
+        #& stage1 -> Python stage2 的连续 job staging。
+        self.expand_count = torch.zeros((1,), dtype=torch.int32, device=self.device)
+        self.expand_tree = torch.full((self.max_jobs,), -1, dtype=torch.int32, device=self.device)
+        self.expand_parent = torch.full_like(self.expand_tree, -1)
+        self.expand_slot = torch.full_like(self.expand_tree, -1)
+        self.expand_child = torch.full_like(self.expand_tree, -1)
         self.expand_next_states = torch.zeros(
-            (self.n_trees, self.max_warps, self.state_dim),
+            (self.max_jobs, self.state_dim),
             dtype=torch.float32, device=self.device,
         )
         self.expand_done = torch.zeros(
-            (self.n_trees, self.max_warps), dtype=torch.int32, device=self.device,
+            (self.max_jobs,), dtype=torch.int32, device=self.device,
         )
-        self._refresh_dev_views()
-
-    def _refresh_dev_views(self) -> None:
-        """刷新 Numba CUDA view；shape 与同名 PyTorch tensor 完全一致。"""
-        self.dev_node_states = cuda.as_cuda_array(self.node_states)
-        self.dev_expand_valid = cuda.as_cuda_array(self.expand_valid)
-        self.dev_expand_tree = cuda.as_cuda_array(self.expand_tree)
-        self.dev_expand_parent = cuda.as_cuda_array(self.expand_parent)
-        self.dev_expand_slot = cuda.as_cuda_array(self.expand_slot)
-        self.dev_expand_child = cuda.as_cuda_array(self.expand_child)
-        self.dev_expand_next_states = cuda.as_cuda_array(self.expand_next_states)
-        self.dev_expand_done = cuda.as_cuda_array(self.expand_done)
 
     def reset_jobs(self) -> None:
         """清空 staging job，不改树内 node_* storage。"""
         #& 用于一轮 expand 前/后清理。tree storage 保留，避免误删已提交 child。
-        self.expand_valid.zero_()
+        self.expand_count.zero_()
         self.expand_tree.fill_(-1)
         self.expand_parent.fill_(-1)
         self.expand_slot.fill_(-1)
@@ -1267,7 +1098,8 @@ def prepare_duct_expand_stage1_torch(bridge: DuctExpandBridge,
     """纯 PyTorch DUCT 扩展阶段1：批量解码 select 输出并分配 child index。
 
     Shape:
-        bridge.expand_*: [T, W]，本函数写入 READY job 的 tree/parent/slot/child。
+        bridge.expand_*: [T*W]，本函数连续写入 tree/parent/slot/child。
+        bridge.expand_count: [1]，本轮 READY job 数。
         edge_tgt_node: int32 [T, N, 256]，select 已经把待扩展 edge 置为 EXPANDING。
         tree_nodes: int32 [T]，本函数按 READY job 数批量递增。
         out_selected_node: int32 [T, W]，packed SELECT_EXPAND(parent, joint_slot)。
@@ -1276,7 +1108,7 @@ def prepare_duct_expand_stage1_torch(bridge: DuctExpandBridge,
         1) 向量化 decode `SELECT_EXPAND(parent, joint_slot)`。
         2) 用 edge_tgt_node == EXPANDING 过滤非扩展 job。
         3) 每棵树用 cumsum 做局部 child id 分配；容量外 job 不进入 READY，不做回滚。
-        4) 写索引和 READY 标记，parent state/target 拷贝交给 PyTorch stage2 gather。
+        4) 将 READY job compact 到连续 staging，parent state/target 交给 stage2 gather。
 
     返回:
         dict(num_jobs, num_ready, num_dropped)，用于调试/benchmark 统计。
@@ -1329,16 +1161,19 @@ def prepare_duct_expand_stage1_torch(bridge: DuctExpandBridge,
         ready_counts = ready_mask.to(torch.int32).sum(dim=1)
         tree_nodes.add_(ready_counts.to(dtype=tree_nodes.dtype))
 
-        if bool(ready_mask.any().item()):
-            bridge.expand_tree[ready_mask] = tree_grid[ready_mask].to(torch.int32)
-            bridge.expand_parent[ready_mask] = parent[ready_mask].to(torch.int32)
-            bridge.expand_slot[ready_mask] = slot[ready_mask].to(torch.int32)
-            bridge.expand_child[ready_mask] = child[ready_mask].to(torch.int32)
-            bridge.expand_valid[ready_mask] = int(DUCT_EXPAND_JOB_READY)
+        ready_jobs = int(ready_mask.sum().item())
+        if ready_jobs > 0:
+            if ready_jobs > bridge.max_jobs:
+                raise RuntimeError(f"ready jobs {ready_jobs} exceed bridge capacity {bridge.max_jobs}")
+            bridge.expand_tree[:ready_jobs] = tree_grid[ready_mask].to(torch.int32)
+            bridge.expand_parent[:ready_jobs] = parent[ready_mask].to(torch.int32)
+            bridge.expand_slot[:ready_jobs] = slot[ready_mask].to(torch.int32)
+            bridge.expand_child[:ready_jobs] = child[ready_mask].to(torch.int32)
+            bridge.expand_count[0] = ready_jobs
 
         return {
             "num_jobs": int(claim_ok.sum().item()),
-            "num_ready": int(ready_mask.sum().item()),
+            "num_ready": ready_jobs,
             "num_dropped": int((claim_ok & ~ready_mask).sum().item()),
         }
 
@@ -1350,7 +1185,7 @@ def _as_cuda_float_tensor(value, *, device):
     return torch.as_tensor(value, dtype=torch.float32, device=device).contiguous()
 
 
-def _duct_policy_probs(logits, uniform_sample_prob: float):
+def mix_policy_with_uniform(logits, uniform_sample_prob: float):
     """把策略 logits 转成 DUCT marginal slot 采样分布。
 
     Shape:
@@ -1358,7 +1193,7 @@ def _duct_policy_probs(logits, uniform_sample_prob: float):
         return: [B, 16]，已归一化的概率分布。
 
     关键路径：
-        softmax -> NaN/Inf guard -> 坏行退回 uniform ->
+        softmax -> 数值清理 -> 坏行退回 uniform ->
         mixed = epsilon * uniform + (1 - epsilon) * policy。
     """
     import torch
@@ -1385,9 +1220,9 @@ def _duct_policy_probs(logits, uniform_sample_prob: float):
     return mixed
 
 
-def _sample_policy_targets(states, candidate_targets, policy0, policy1,
-                           uniform_sample_prob: float = 0.0,
-                           generator=None):
+def sample_ranked_action_targets(states, candidate_targets, policy0, policy1,
+                                 uniform_sample_prob: float = 0.0,
+                                 generator=None):
     """按双玩家策略分布采样并排列 child 的 16 个 marginal target slot。
 
     Shape:
@@ -1399,7 +1234,7 @@ def _sample_policy_targets(states, candidate_targets, policy0, policy1,
 
     关键路径：
         两个玩家分别 softmax+epsilon 混合 -> multinomial 无放回采样 16 个 slot ->
-        从 candidate_targets[player, sampled_slot] gather target，供 commit 写入 child。
+        从 candidate_targets[player, sampled_slot] gather target，供 child 初始化写入。
         采样 index 不落盘，树上只保留 target/prob，节省 [T,N,2,16] int32 显存。
     """
     import torch
@@ -1421,8 +1256,8 @@ def _sample_policy_targets(states, candidate_targets, policy0, policy1,
 
     logits0 = policy0(states)
     logits1 = policy1(states)
-    probs0 = _duct_policy_probs(logits0, uniform_sample_prob)
-    probs1 = _duct_policy_probs(logits1, uniform_sample_prob)
+    probs0 = mix_policy_with_uniform(logits0, uniform_sample_prob)
+    probs1 = mix_policy_with_uniform(logits1, uniform_sample_prob)
     ids0 = torch.multinomial(
         probs0, DUCT_MARGINAL_ACTIONS, replacement=False, generator=generator,
     )
@@ -1463,7 +1298,7 @@ def fill_duct_node_action_slots(bridge: DuctExpandBridge, tree_ids, node_ids,
 
     关键路径：
         用当前 state 调 policy0/policy1 -> 采样 slot 排列 ->
-        只写采样后的 target/prob。root 初始化和 child commit 前的 slot 生成共用这条路径。
+        只写采样后的 target/prob。root 初始化和 child 发布前的 slot 生成共用这条路径。
     """
     import torch
 
@@ -1478,7 +1313,7 @@ def fill_duct_node_action_slots(bridge: DuctExpandBridge, tree_ids, node_ids,
         if node_t.numel() != tree_t.numel():
             raise ValueError("node_ids must match tree_ids")
 
-        targets, probs = _sample_policy_targets(
+        targets, probs = sample_ranked_action_targets(
             states_t, candidate_targets, policy0, policy1,
             uniform_sample_prob=uniform_sample_prob,
             generator=generator,
@@ -1512,7 +1347,7 @@ def initialize_duct_root_slots(bridge: DuctExpandBridge, root_states,
     )
 
 
-def _duct_combine_player_targets(env, parent_targets, team_ids=None):
+def combine_team_targets(env, parent_targets, team_ids=None):
     """把两个玩家的 slot target 合成为 MINCO 环境需要的 full target。
 
     Shape:
@@ -1543,7 +1378,7 @@ def _duct_combine_player_targets(env, parent_targets, team_ids=None):
     return torch.where(mask0, parent_targets[:, 0], parent_targets[:, 1])
 
 
-def _duct_step_env_with_projected_targets(env, parent_states, projected_targets):
+def step_env_with_projected_targets(env, parent_states, projected_targets):
     """用已投影 target 推进 MINCO 环境一步，避免重复 obstacle projection。
 
     Shape:
@@ -1587,17 +1422,61 @@ def _duct_step_env_with_projected_targets(env, parent_states, projected_targets)
     return next_flat, done, valid
 
 
+def publish_expand_edges(bridge: DuctExpandBridge,
+                         edge_tgt_node,
+                         node_expand_inflight):
+    """批量发布 compact expand jobs 到 parent edge。
+
+    child 的 state/action storage 必须已经写完；本函数只做最后可见发布点：
+    parent edge 从 EXPANDING 变成 child 或 terminal sentinel，并累计释放
+    node_expand_inflight。重复 parent 通过 bincount 累计处理。
+    """
+    import torch
+
+    with torch.no_grad():
+        edge_tgt_node = torch.as_tensor(edge_tgt_node, device=bridge.device)
+        node_expand_inflight = torch.as_tensor(node_expand_inflight, device=bridge.device)
+        job_count = int(bridge.expand_count[0].item())
+        if job_count <= 0:
+            return {"num_published": 0}
+
+        tree_ids = bridge.expand_tree[:job_count].to(torch.long)
+        parent_nodes = bridge.expand_parent[:job_count].to(torch.long)
+        slot_ids = bridge.expand_slot[:job_count].to(torch.long)
+        child_nodes = bridge.expand_child[:job_count].to(torch.long)
+        done = bridge.expand_done[:job_count].bool()
+
+        publish = torch.where(
+            done,
+            torch.full_like(child_nodes, int(NODE_EXPANDED_TERMINAL)),
+            child_nodes,
+        ).to(dtype=edge_tgt_node.dtype)
+        edge_tgt_node[tree_ids, parent_nodes, slot_ids] = publish
+
+        flat_parent = tree_ids * int(node_expand_inflight.shape[1]) + parent_nodes
+        releases = torch.bincount(
+            flat_parent,
+            minlength=int(node_expand_inflight.numel()),
+        ).view_as(node_expand_inflight).to(dtype=node_expand_inflight.dtype)
+        node_expand_inflight.sub_(releases)
+        return {"num_published": job_count}
+
+
 def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_targets,
+                                 edge_tgt_node, action_W, action_N, action_inflight,
+                                 action_counts, node_N, node_expand_inflight, tree_nodes,
                                  policy0, policy1,
                                  uniform_sample_prob: float = 0.0,
                                  team_ids=None, generator=None):
     """用 MINCO/PyTorch 填充 DUCT expand stage2 buffer。
 
     输入/输出 shape：
-        bridge.expand_valid: [T, W]，只处理 READY job。
-        bridge.expand_tree/parent/slot/child: [T, W]，stage1 输出的索引。
-        bridge.expand_next_states: [T, W, state_dim]，本函数写入。
-        bridge.expand_done: [T, W]，本函数写入。
+        bridge.expand_count: [1]，本轮连续 job 数。
+        bridge.expand_tree/parent/slot/child: [Jmax]，stage1 输出的索引。
+        bridge.expand_next_states: [Jmax, state_dim]，本函数写入。
+        bridge.expand_done: [Jmax]，本函数写入。
+        edge_tgt_node/action_W/action_N/action_inflight/action_counts/node_N:
+            本函数按 child id 直接批量初始化并发布 parent edge。
         bridge.node_action_probs[tree, child]: [2, 16]，本函数直接 scatter 写入。
         bridge.node_action_targets[tree, child]: [2, 16, A, 2]，本函数直接 scatter 写入。
 
@@ -1607,13 +1486,23 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_target
         3) 调 project_target_away_from_obstacles 修正障碍约束。
         4) 用已投影 target 推进环境，得到 next_state/done/valid。
         5) 调 policy0/policy1 生成 child 的 2x16 slot 排列。
-        6) valid 且 finite 的 job 保持 READY；失败 job 标记 FAILED，commit 只丢弃 staging。
+        6) PyTorch 批量初始化 child storage。
+        7) 环境 invalid 作为 terminal 正常提交；最后批量发布 parent edge。
     """
     import torch
 
     with torch.no_grad():
-        job_mask = bridge.expand_valid == int(DUCT_EXPAND_JOB_READY)
-        if not bool(job_mask.any().item()):
+        edge_tgt_node = torch.as_tensor(edge_tgt_node, device=bridge.device)
+        action_W = torch.as_tensor(action_W, device=bridge.device)
+        action_N = torch.as_tensor(action_N, device=bridge.device)
+        action_inflight = torch.as_tensor(action_inflight, device=bridge.device)
+        action_counts = torch.as_tensor(action_counts, device=bridge.device)
+        node_N = torch.as_tensor(node_N, device=bridge.device)
+        node_expand_inflight = torch.as_tensor(node_expand_inflight, device=bridge.device)
+        tree_nodes = torch.as_tensor(tree_nodes, device=bridge.device)
+
+        job_count = int(bridge.expand_count[0].item())
+        if job_count <= 0:
             return {
                 "num_jobs": 0,
                 "num_valid": 0,
@@ -1621,9 +1510,9 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_target
                 "projected_targets": None,
             }
 
-        tree_ids = bridge.expand_tree[job_mask].to(torch.long)
-        parent_nodes = bridge.expand_parent[job_mask].to(torch.long)
-        slot_ids = bridge.expand_slot[job_mask].to(torch.long)
+        tree_ids = bridge.expand_tree[:job_count].to(torch.long)
+        parent_nodes = bridge.expand_parent[:job_count].to(torch.long)
+        slot_ids = bridge.expand_slot[:job_count].to(torch.long)
         parent_states = bridge.node_states[tree_ids, parent_nodes]
         action0 = slot_ids >> DUCT_ACTION_BITS
         action1 = slot_ids & DUCT_ACTION_MASK
@@ -1634,7 +1523,7 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_target
             ),
             dim=1,
         ).to(dtype=torch.float32)
-        full_targets = _duct_combine_player_targets(env, parent_targets, team_ids=team_ids)
+        full_targets = combine_team_targets(env, parent_targets, team_ids=team_ids)
         coeff, active, _ = env.unpack_state(parent_states)
         projected_targets, _, _ = env.project_target_away_from_obstacles(
             coeff,
@@ -1643,24 +1532,39 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_target
             clamp_to_dynamic_bounds=True,
             return_residual=False,
         )
-        next_states, done, valid = _duct_step_env_with_projected_targets(
+        next_states, done, valid = step_env_with_projected_targets(
             env, parent_states, projected_targets,
         )
         finite = torch.isfinite(next_states).all(dim=-1) & torch.isfinite(projected_targets).all(dim=(-1, -2))
-        ok = valid.bool() & finite
+        done = done.bool() | ~valid.bool() | ~finite
 
-        bridge.expand_next_states[job_mask] = torch.nan_to_num(next_states, nan=0.0, posinf=0.0, neginf=0.0)
-        bridge.expand_done[job_mask] = done.to(torch.int32)
+        clean_next_states = torch.nan_to_num(next_states, nan=0.0, posinf=0.0, neginf=0.0)
+        bridge.expand_next_states[:job_count] = clean_next_states
+        bridge.expand_done[:job_count] = done.to(torch.int32)
 
-        targets, probs = _sample_policy_targets(
-            bridge.expand_next_states[job_mask],
+        targets, probs = sample_ranked_action_targets(
+            clean_next_states,
             candidate_targets,
             policy0,
             policy1,
             uniform_sample_prob=uniform_sample_prob,
             generator=generator,
         )
-        child_nodes = bridge.expand_child[job_mask].to(torch.long)
+        child_nodes = bridge.expand_child[:job_count].to(torch.long)
+        bridge.node_states[tree_ids, child_nodes] = clean_next_states
+        edge_tgt_node[tree_ids, child_nodes] = int(DUCT_EDGE_UNEXPANDED)
+        action_W[tree_ids, child_nodes] = 0.0
+        action_N[tree_ids, child_nodes] = 0
+        action_inflight[tree_ids, child_nodes] = 0
+        node_N[tree_ids, child_nodes] = 0
+        action_counts[tree_ids, child_nodes, :] = int(DUCT_MARGINAL_ACTIONS)
+        terminal = done.bool()
+        if bool(terminal.any().item()):
+            action_counts[
+                tree_ids[terminal],
+                child_nodes[terminal],
+                :,
+            ] = 1
         bridge.node_action_targets[tree_ids, child_nodes] = targets.to(
             dtype=bridge.node_action_targets.dtype,
         )
@@ -1668,15 +1572,14 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_target
             dtype=bridge.node_action_probs.dtype,
         )
 
-        status = torch.where(
-            ok,
-            torch.full_like(bridge.expand_valid[job_mask], int(DUCT_EXPAND_JOB_READY)),
-            torch.full_like(bridge.expand_valid[job_mask], int(DUCT_EXPAND_JOB_FAILED)),
+        publish_info = publish_expand_edges(
+            bridge, edge_tgt_node, node_expand_inflight,
         )
-        bridge.expand_valid[job_mask] = status
+
         return {
-            "num_jobs": int(job_mask.sum().item()),
-            "num_valid": int(ok.sum().item()),
+            "num_jobs": job_count,
+            "num_valid": int(valid.bool().sum().item()),
+            "num_published": publish_info["num_published"],
             "full_targets": full_targets.detach(),
             "projected_targets": projected_targets.detach(),
         }
