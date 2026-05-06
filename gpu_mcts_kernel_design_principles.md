@@ -320,25 +320,25 @@ Backup 关注 path 上的统计更新。
 
 ## 17. DUCT Expand 两阶段图解
 
-`puct_gpu_v3_duct.py` 的 expand 被拆成两个 CUDA kernel 和一个 PyTorch/MINCO bridge。
-核心原则是：select 只 claim，stage1 只导出 job，PyTorch 只算环境和策略，stage2
-才提交 child 并发布 parent edge。
+`puct_gpu_v3_duct.py` 的 expand 被拆成 stage1 索引准备、PyTorch/MINCO bridge、
+stage2 CUDA commit 三段。核心原则是：select 只 claim，stage1 只导出 job 索引，
+PyTorch 负责批量索引/环境/策略，stage2 才提交 child 并发布 parent edge。
 
 ### 17.1 总体流程图
 
 ```mermaid
 flowchart TD
-    ROOT["Root slot init<br/>initialize_duct_root_slots<br/>node_action_*[T,0,2,16...]"]
+    ROOT["Root slot init<br/>initialize_duct_root_slots<br/>node_action_targets/probs[T,0,2,16...]"]
     SELECT["Select kernel<br/>block = tree, warp = traversal<br/>DUCT UCB + virtual loss"]
     CLAIM{"edge_tgt_node[parent,slot]<br/>是否 UNEXPANDED?"}
     CAS["CAS UNEXPANDED -> EXPANDING<br/>node_expand_inflight += 1<br/>输出 SELECT_EXPAND(parent,slot)"]
     BUSY["EXPANDING / busy<br/>回滚本次 action virtual loss"]
     DESCEND["child >= 0<br/>记录 path 后继续遍历"]
 
-    STAGE1["Expand stage1 CUDA<br/>_prepare_expand_stage1_duct<br/>分配 child ticket<br/>导出 parent state + slot targets"]
+    STAGE1["Expand stage1<br/>prepare_duct_expand_stage1_torch<br/>或 _prepare_expand_stage1_duct<br/>分配 child ticket<br/>只导出 job 索引"]
     PY["PyTorch / MINCO bridge<br/>project_target_away_from_obstacles<br/>transition with projected target<br/>policy0/policy1 sampling"]
     STAGE2{"Expand stage2 CUDA<br/>_commit_expand_stage2_duct<br/>job READY 且 finite?"}
-    COMMIT["写 child node<br/>state + edge table + action stats<br/>node_action ids/targets/probs"]
+    COMMIT["写 child node<br/>state + edge table + action stats<br/>node_action_targets/probs"]
     FENCE["threadfence<br/>发布 edge_tgt_node[parent,slot] = child"]
     FAIL["失败回滚<br/>edge EXPANDING -> UNEXPANDED<br/>release node_expand_inflight<br/>rollback action_inflight"]
     BACKUP["Backup stage<br/>消费 traversal virtual loss<br/>更新 action_W/N"]
@@ -359,7 +359,7 @@ flowchart TD
 sequenceDiagram
     participant S as Select Warp
     participant E as edge_tgt_node
-    participant K1 as Stage1 CUDA
+    participant K1 as Stage1 Torch/CUDA
     participant B as DuctExpandBridge
     participant P as PyTorch/MINCO
     participant K2 as Stage2 CUDA
@@ -369,12 +369,11 @@ sequenceDiagram
     alt claim success
         S->>S: 写 path + action virtual loss
         S-->>K1: SELECT_EXPAND(parent, slot)
-        K1->>K1: atomic.add(tree_nodes[tree], 1) -> child
-        K1->>B: expand_parent_states[T,W,D]
-        K1->>B: expand_parent_targets[T,W,2,A,2]
+        K1->>K1: cumsum/atomic 分配 child ticket
         K1->>B: expand_parent/slot/child[T,W]
         K1->>B: expand_valid[T,W] = READY
         P->>B: gather READY jobs
+        P->>B: 用 parent/slot 从 node_states/node_action_targets 批量索引
         P->>P: combine player targets -> full_targets[B,A,2]
         P->>P: project_target_away_from_obstacles(...)
         P->>P: transition with projected_targets
@@ -418,7 +417,6 @@ stateDiagram-v2
 flowchart LR
     subgraph TREE["Tree storage"]
         NS["node_states<br/>float32[T,N,state_dim]"]
-        IDS["node_action_ids<br/>int32[T,N,2,16]"]
         TGT["node_action_targets<br/>float32[T,N,2,16,A,2]"]
         PROB["node_action_probs<br/>float32[T,N,2,16]"]
         EDGE["edge_tgt_node<br/>int32[T,N,256]"]
@@ -427,11 +425,9 @@ flowchart LR
 
     subgraph JOB["Expand job staging"]
         META["expand_valid/tree/parent/slot/child<br/>int32[T,W]"]
-        PS["expand_parent_states<br/>float32[T,W,state_dim]"]
-        PT["expand_parent_targets<br/>float32[T,W,2,A,2]"]
         NX["expand_next_states<br/>float32[T,W,state_dim]"]
         DONE["expand_done<br/>int32[T,W]"]
-        CA["expand_child_action_ids/probs<br/>[T,W,2,16]"]
+        CA["expand_child_action_probs<br/>[T,W,2,16]"]
         CT["expand_child_action_targets<br/>float32[T,W,2,16,A,2]"]
     end
 
@@ -442,21 +438,41 @@ flowchart LR
         POL["policy sampling<br/>logits[B,16] -> slots[B,2,16]"]
     end
 
-    NS -->|"stage1 gather parent"| PS
-    IDS -->|"stage1 selected slot id"| META
-    TGT -->|"stage1 selected targets"| PT
-    PT --> COMB --> PROJ --> STEP --> NX
+    META -->|"PyTorch gather parent indices"| NS
+    META -->|"PyTorch decode slot"| TGT
+    NS -->|"parent states[B,D]"| COMB
+    TGT -->|"selected parent targets[B,2,A,2]"| COMB
+    COMB --> PROJ --> STEP --> NX
     NX --> POL --> CA
     POL --> CT
     NX -->|"stage2 commit"| NS
-    CA -->|"stage2 commit"| IDS
     CT -->|"stage2 commit"| TGT
-    PROB -->|"parent selected prob export"| META
     EDGE -->|"claim / publish"| EDGE
     STATS -->|"init child + rollback failure"| STATS
 ```
 
-### 17.5 Warp 内工作划分
+### 17.5 Stage1 推荐路径
+
+```mermaid
+flowchart TD
+    OUT["out_selected_node<br/>int32[T,W]<br/>SELECT_EXPAND(parent,slot)"]
+    DECODE["PyTorch bit decode<br/>kind / parent / slot"]
+    FILTER["过滤<br/>kind == SELECT_EXPAND<br/>edge_tgt_node == EXPANDING"]
+    ALLOC["每棵树 cumsum 分配 child<br/>tree_nodes += ready_count"]
+    READY["写 expand_tree/parent/slot/child<br/>expand_valid = READY"]
+    FAIL["容量不足<br/>edge -> UNEXPANDED<br/>rollback node/action inflight"]
+    STAGE2["run_duct_expand_stage2_minco<br/>按索引批量 gather parent state/target"]
+
+    OUT --> DECODE --> FILTER --> ALLOC
+    ALLOC -->|"child < capacity"| READY --> STAGE2
+    ALLOC -->|"overflow"| FAIL
+```
+
+说明：select kernel 输出暂时不需要修改；`[T,W]` 坐标已经给出了 tree/job，
+packed value 已经包含 parent 和 joint slot。把 stage1 放到 PyTorch 后，只有
+容量失败这种稀疏路径需要回滚循环，常规路径是批量张量索引和 `cumsum`。
+
+### 17.6 Warp 内工作划分
 
 ```mermaid
 flowchart TB
@@ -466,10 +482,10 @@ flowchart TB
         WN["warp k<br/>traversal / expand job k"]
     end
 
-    subgraph WARP["一个 warp = 一个 SELECT_EXPAND job"]
-        L0["lane0<br/>CAS / ticket / metadata publish"]
+    subgraph WARP["兼容 CUDA stage1/commit 路径"]
+        L0["stage1 legacy<br/>thread = job index<br/>metadata publish"]
         LS["lane stride<br/>state_dim 拷贝"]
-        LT["lane stride<br/>2 x A x 2 target 拷贝"]
+        LT["lane stride<br/>2 x 16 x A x 2 target 拷贝"]
         LI["lane stride<br/>child 256 edges + 2x16 stats 初始化"]
     end
 

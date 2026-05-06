@@ -45,7 +45,7 @@ DUCT_ACTION_BITS = 4
 DUCT_MARGINAL_ACTIONS = 1 << DUCT_ACTION_BITS
 DUCT_ACTION_MASK = DUCT_MARGINAL_ACTIONS - 1
 DUCT_JOINT_ACTIONS = DUCT_MARGINAL_ACTIONS * DUCT_MARGINAL_ACTIONS
-DUCT_EDGE_UNEXPANDED = -1
+DUCT_EDGE_UNEXPANDED = -3
 DUCT_EDGE_EXPANDING = -2
 DUCT_PLAYER0_MASK = 0x0000FFFF
 DUCT_PLAYER1_MASK = 0xFFFF0000
@@ -76,8 +76,9 @@ DUCT_SOFT_EXPAND = int(os.environ.get(
 # edge_slot is the fixed joint action id:
 #   edge_slot = (action_player0 << 4) | action_player1
 # edge_tgt_node[tree, node, edge_slot] stores the transition target:
-#   -1: no rollout/state transition has been created for this joint action.
+#   -3: no rollout/state transition has been created for this joint action.
 #   -2: another warp has claimed this edge for Expand.
+#   -1: terminal transition (NODE_EXPANDED_TERMINAL).
 #  >=0: child node id.
 # edge_actions[tree, node, edge_slot, player] mirrors the decoded joint action
 # for Expand/backup code that consumes action tensors directly.
@@ -355,6 +356,18 @@ def _duct_release_joint_slot(action_inflight, tree, node, joint_slot, lane):
 
 
 @cuda.jit(device=True, inline=True)
+def _duct_pack_terminal_selection(node, reason):
+    #& DUCT: terminal child 直接存 NODE_EXPANDED_TERMINAL(-1)，packed node 字段不能写负数。
+    #& 因此 terminal 输出统一把 node 编成 PACKED_NODE_MASK，kind/reason 表示真实语义。
+    return _pack_selection(
+        int32(SELECT_TERMINAL),
+        int32(PACKED_NODE_MASK),
+        int32(0),
+        reason,
+    )
+
+
+@cuda.jit(device=True, inline=True)
 def _duct_add_joint_slot_inflight(action_inflight, tree, node, joint_slot, lane):
     #& DUCT soft-expand: fallback 到另一条 joint edge 后，把 virtual loss 挪到新动作上。
     if lane == int32(0) or lane == int32(DUCT_MARGINAL_ACTIONS):
@@ -461,7 +474,14 @@ def _duct_best_actions_winner_recalc(c_uct, action_W, action_N, action_inflight,
 def _duct_claim_joint_expand(edge_tgt_node, edge_actions, node_expand_inflight,
                              tree, node, joint_slot, lane):
     #& DUCT重构: joint action 固定映射到 0..255 的边槽，缺 child 时直接抢占这条边。
-    #& 理由: 不再用 node_expanded/cur_expanded 分配线性 slot，避免线性扫描和重复联合动作。
+    #& 理由: 不再用节点扩展计数分配线性 slot，避免线性扫描和重复联合动作。
+    #& Shape:
+    #&   edge_tgt_node: [T, N, 256]，UNEXPANDED -> EXPANDING 的边状态表。
+    #&   edge_actions: [T, N, 256, 2]，记录 joint_slot 解码出的两个玩家动作。
+    #&   node_expand_inflight: [T, N]，父节点上正在扩展的 edge 数。
+    #& 关键路径:
+    #&   lane0 对目标 joint edge 做一次 CAS；成功后发布 edge_actions 并增加
+    #&   node_expand_inflight。树容量由 select 入口的 tree_full 只读判断处理。
     held = int32(0)
     if lane == int32(0):
         prev = cuda.atomic.cas(
@@ -477,7 +497,8 @@ def _duct_claim_joint_expand(edge_tgt_node, edge_actions, node_expand_inflight,
             edge_actions[tree, node, joint_slot, int32(1)] = action1
             cuda.atomic.add(node_expand_inflight, (tree, node), int32(1))
             held = int32(1)
-    return cuda.shfl_sync(FULL_MASK, held, 0)
+    held = cuda.shfl_sync(FULL_MASK, held, 0)
+    return held
 
 
 @cuda.jit(device=True, inline=True)
@@ -579,6 +600,13 @@ def _duct_claim_soft_expand_fallback(edge_tgt_node, edge_actions,
                                      node_expand_inflight,
                                      tree, node, avoid_slot, lane, tie_offset,
                                      sorted_action, sorted_score):
+    #& DUCT soft-expand claim。
+    #& Shape:
+    #&   edge_tgt_node: [T, N, 256]，只在 top4xtop4 候选中的 UNEXPANDED 边上 CAS。
+    #&   edge_actions: [T, N, 256, 2]，成功 claim 后写入两个玩家动作。
+    #& 关键路径:
+    #&   16 个 lane 并行评分候选；lane0 逐轮 CAS 最优候选。容量检查由调用方
+    #&   tree_full 分支控制，本函数只负责抢边。
     held = int32(0)
     fallback_slot = int32(-1)
     retry = int32(0)
@@ -680,45 +708,6 @@ def _duct_warp_or_i32(value):
     return cuda.shfl_sync(FULL_MASK, value, 0)
 
 
-@cuda.jit(device=True, inline=True)
-def _duct_release_expand_job(edge_tgt_node, node_expand_inflight,
-                             action_inflight, tree_nodes,
-                             out_path_eids, out_path_actions, out_path_len,
-                             tree, wid, parent, slot, lane,
-                             node_cnt, action_capacity,
-                             reclaim_tree_ticket):
-    #& Expand失败路径公共回滚。
-    #& Shape:
-    #&   edge_tgt_node: [T, N, 256]，joint edge child id / sentinel。
-    #&   node_expand_inflight: [T, N]，parent 上正在扩展的 edge 数。
-    #&   action_inflight: [T, N, 2, 16]，select 阶段加上的边缘 virtual loss。
-    #&   out_path_*: [T, W, D...]，本 warp 遍历路径，供回滚本次 claim。
-    #& 关键路径:
-    #&   1) lane0 CAS(EXPANDING -> UNEXPANDED)，只由 claim owner 释放 inflight。
-    #&   2) 容量失败时可用 atomic.min 回收 node pool ticket。
-    #&   3) 全 warp 按 path 并行回滚两个玩家动作维度上的 virtual loss。
-    if lane == int32(0):
-        prev = cuda.atomic.cas(
-            edge_tgt_node,
-            (tree, parent, slot),
-            int32(DUCT_EDGE_EXPANDING),
-            int32(DUCT_EDGE_UNEXPANDED),
-        )
-        if prev == int32(DUCT_EDGE_EXPANDING):
-            cuda.atomic.sub(node_expand_inflight, (tree, parent), int32(1))
-        if reclaim_tree_ticket != int32(0):
-            cuda.atomic.min(tree_nodes, tree, node_cnt)
-
-    action_depth = out_path_len[tree, wid]
-    _rollback_duct_vloss_path_nodes(
-        tree, wid, action_depth, lane,
-        out_path_eids, out_path_actions,
-        action_inflight, int32(1), node_cnt, action_capacity,
-    )
-
-
-
-
 # ============================================================
 # DUCT selection kernels
 # ============================================================
@@ -726,14 +715,14 @@ def _duct_release_expand_job(edge_tgt_node, node_expand_inflight,
     float32, float32, float32,
     int32[:, :, :], int32[:, :, :, :],
     float32[:, :, :, :], int32[:, :, :, :], int32[:, :, :, :],
-    int32[:, :, :], int32[:, :], int32[:, :], int32[:, :], int32[:],
+    int32[:, :, :], int32[:, :], int32[:, :], int32[:],
     int32[:, :], int32[:, :, :], int32[:, :, :, :], int32[:, :]),
     fastmath=True)
 def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
                                       edge_tgt_node, edge_actions,
                                       action_W, action_N, action_inflight,
                                       action_counts, node_N, node_expand_inflight,
-                                      node_expanded, tree_nodes,
+                                      tree_nodes,
                                       out_selected_node, out_path_eids,
                                       out_path_actions, out_path_len):
     """
@@ -749,15 +738,16 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
         joint_slot = (action0 << 4) | action1        # 共 256 个 joint action
 
     Select 只处理这条确定的 joint edge：
-        - edge_tgt_node == -1：该 joint edge 还没有 child，用 CAS(-1, -2)
+        - edge_tgt_node == -3：该 joint edge 还没有 child，用 CAS(-3, -2)
           抢占 Expand 权限，并返回 SELECT_EXPAND(node, joint_slot)。
         - edge_tgt_node == -2：已有其他 warp 正在扩展这条边，回滚本次
           virtual loss 并返回 SELECT_BUSY。
+        - edge_tgt_node == -1：该边到达 terminal，记录路径后返回 SELECT_TERMINAL。
         - edge_tgt_node >= 0：该边已有 child，记录路径后继续向 child 遍历。
 
     PW 是每个玩家独立维护的边缘动作可见窗口，不再按 joint edge 计数。
-    node_expanded 只保留 terminal sentinel 和基本状态检查用途，不参与决定
-    当前可访问多少 joint action。
+    terminal 不再使用独立节点状态数组；terminal child 直接以
+    NODE_EXPANDED_TERMINAL(-1) 写入 edge_tgt_node[parent, slot]。
 
     DUCT_SOFT_WINNER / DUCT_SOFT_EXPAND 是导入模块时确定的编译期常量。
     前者允许 winner CAS 失败后保留重复选择；后者在选中边正在扩展时，
@@ -765,12 +755,13 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
     未扩展 joint edge。
 
     关键输入：
-        edge_tgt_node: [tree, node, 256]，child node id；-1 未扩展，-2 正在扩展。
+        edge_tgt_node: [tree, node, 256]，-3 未扩展，-2 正在扩展，-1 terminal，>=0 child。
         edge_actions: [tree, node, 256, player]，缓存 joint slot 解码后的两个动作。
         action_W/N/inflight: [tree, node, player, action]，每个玩家的边缘 DUCT 统计。
         action_counts: [tree, node, player]，每个玩家的合法边缘动作数，最大 16。
         node_N: 节点访问次数，用于 UCB/PW。
         node_expand_inflight: 当前节点已抢占但尚未完成的 edge Expand 数。
+        tree_nodes: [tree]，当前已分配节点上界；select 只读它判断树是否已满。
 
     输出：
         out_selected_node: 打包后的 SELECT_* 结果，以及被选中的 node/joint slot。
@@ -792,17 +783,14 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
 
     max_edges = edge_tgt_node.shape[2]
     max_edge_steps = out_path_eids.shape[2]
-    node_capacity = node_expanded.shape[1]
+    node_capacity = edge_tgt_node.shape[1]
     action_capacity = action_W.shape[3]
     action_players = action_W.shape[2]
     action_count_players = action_counts.shape[2]
     edge_action_players = edge_actions.shape[3]
     path_action_players = out_path_actions.shape[3]
 
-    node_cnt = int32(0)
-    if lane == int32(0):
-        node_cnt = tree_nodes[tree]
-    node_cnt = cuda.shfl_sync(FULL_MASK, node_cnt, 0)
+    node_cnt = tree_nodes[tree]
 
     if not _valid_duct_select_shape(
         max_edge_steps, node_capacity, node_cnt, max_edges,
@@ -827,21 +815,13 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
     final_len = int32(0)
     node = int32(0)
     depth = int32(0)
+    node_limit = node_capacity
+    if node_limit > int32(PACKED_NODE_LIMIT):
+        node_limit = int32(PACKED_NODE_LIMIT)
 
     while True:
-        node_info = node_expanded[tree, node]
-        if node_info == int32(NODE_EXPANDED_TERMINAL):
-            final_packed = _pack_selection(
-                int32(SELECT_TERMINAL),
-                node,
-                int32(0),
-                int32(REASON_OK_TERMINAL),
-            )
-            final_len = depth + int32(1)
-            break
-
-        #* DUCT 不再用 node_expanded 记录扩展计数；这里仅保留非法 sentinel 的防御检查。
-        if node_info < int32(0) or node_info > max_edges:
+        #* node id 的有效性完全由 tree_nodes 上界和 terminal sentinel 判定。
+        if node < int32(0) or node >= node_cnt:
             _rollback_duct_vloss_path_nodes(
                 tree, wid, depth, lane,
                 out_path_eids, out_path_actions, action_inflight,
@@ -930,7 +910,7 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
             break
 
         #& DUCT重构: joint action 数量固定为 256，两份 4-bit 边缘动作直接组成 slot。
-        #& 理由: Select 已经选出两个玩家动作，定位边不需要扫描 node_expanded。
+        #& 理由: Select 已经选出两个玩家动作，定位边不需要扫描节点扩展表。
         joint_slot = int32(0)
         action1 = cuda.shfl_sync(FULL_MASK, local_best_action, DUCT_MARGINAL_ACTIONS)
         if lane == int32(0):
@@ -939,36 +919,55 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
         joint_child = edge_tgt_node[tree, node, joint_slot]
         joint_child = cuda.shfl_sync(FULL_MASK, joint_child, 0)
 
+        tree_full = int32(0)
+        if node_cnt >= node_limit:
+            tree_full = int32(1)
         expand_busy = int32(0)
         if joint_child == int32(DUCT_EDGE_UNEXPANDED):
-            expand_held = _duct_claim_joint_expand(
-                edge_tgt_node, edge_actions, node_expand_inflight,
-                tree, node, joint_slot, lane,
-            )
-            if expand_held == int32(1):
-                _write_duct_path_step(
-                    out_path_eids, out_path_actions,
-                    tree, wid, depth, lane, node, joint_slot,
+            if tree_full != int32(0):
+                expand_busy = int32(0)
+            else:
+                expand_held = _duct_claim_joint_expand(
+                    edge_tgt_node, edge_actions, node_expand_inflight,
+                    tree, node, joint_slot, lane,
                 )
-                final_packed = _pack_selection(
-                    int32(SELECT_EXPAND),
-                    node,
-                    joint_slot,
-                    int32(REASON_OK_EXPAND),
-                )
-                final_len = depth + int32(1)
-                break
+                if expand_held == int32(1):
+                    _write_duct_path_step(
+                        out_path_eids, out_path_actions,
+                        tree, wid, depth, lane, node, joint_slot,
+                    )
+                    final_packed = _pack_selection(
+                        int32(SELECT_EXPAND),
+                        node,
+                        joint_slot,
+                        int32(REASON_OK_EXPAND),
+                    )
+                    final_len = depth + int32(1)
+                    break
 
-            expand_busy = int32(1)
+                expand_busy = int32(1)
 
         #* 其他 warp 已选择将其扩展
         if joint_child == int32(DUCT_EDGE_EXPANDING):
             expand_busy = int32(1)
 
-        if expand_busy != int32(0) or joint_child < int32(0) or joint_child >= node_cnt:
+        if joint_child == int32(NODE_EXPANDED_TERMINAL):
+            _write_duct_path_step(
+                out_path_eids, out_path_actions,
+                tree, wid, depth, lane, node, joint_slot,
+            )
+            cuda.syncwarp(FULL_MASK)
+            final_packed = _duct_pack_terminal_selection(node, int32(REASON_OK_TERMINAL))
+            final_len = depth + int32(2)
+            break
+
+        if (
+            expand_busy != int32(0) or
+            joint_child < int32(0) or joint_child >= node_cnt
+        ):
             if (
                 int32(DUCT_SOFT_EXPAND) != int32(0) and
-                expand_busy != int32(0)
+                expand_busy != int32(0) and tree_full == int32(0)
             ):
                 sorted_action, sorted_score = _duct_sort_actions_halfwarp(
                     c_uct, action_W, action_N, action_inflight,
@@ -1042,185 +1041,6 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
                          out_selected_node, out_path_len)
 
 
-# ============================================================
-# DUCT expand kernels
-# ============================================================
-
-@cuda.jit
-def _prepare_expand_stage1_duct(edge_tgt_node,
-                                node_expand_inflight,
-                                action_inflight,
-                                tree_nodes,
-                                out_selected_node,
-                                out_path_eids,
-                                out_path_actions,
-                                out_path_len,
-                                node_states,
-                                node_action_ids,
-                                node_action_targets,
-                                node_action_probs,
-                                expand_valid,
-                                expand_tree,
-                                expand_parent,
-                                expand_slot,
-                                expand_child,
-                                expand_parent_states,
-                                expand_parent_targets,
-                                expand_parent_action_ids,
-                                expand_parent_action_probs):
-    """DUCT 扩展阶段1：把 select 的 SELECT_EXPAND 输出转成 PyTorch job。
-
-    并行粒度：
-        blockIdx.x = tree，一个 block 处理一棵树。
-        一个 warp 对应一次独立遍历输出 wid；lane 在线性 shape 上 stride 拷贝。
-
-    关键输入 shape：
-        edge_tgt_node: [T, N, 256]，joint edge 状态；-1 未扩展，-2 正在扩展。
-        out_selected_node: [T, W]，select 输出的 packed SELECT_EXPAND(parent, slot)。
-        out_path_eids/actions/len: [T, W, D...]，失败时回滚本次 virtual loss。
-        node_states: [T, N, state_dim]，parent state 源数据。
-        node_action_ids: [T, N, 2, 16]，每个玩家本地 slot 对应的候选 action id。
-        node_action_targets: [T, N, 2, 16, A, 2]，slot 对应 MINCO target。
-        node_action_probs: [T, N, 2, 16]，策略/均匀混合后的 slot 概率。
-
-    输出 staging shape：
-        expand_valid/tree/parent/slot/child: [T, W]。
-        expand_parent_states: [T, W, state_dim]。
-        expand_parent_targets: [T, W, 2, A, 2]，只导出被选中的两个玩家 slot target。
-        expand_parent_action_ids/probs: [T, W, 2]。
-
-    关键算法路径：
-        1) 解码 SELECT_EXPAND(parent, joint_slot)，并确认 edge 仍为 EXPANDING。
-        2) lane0 从 tree_nodes[T] 原子分配 child id，容量失败则重置 edge 并回滚。
-        3) warp 并行导出 parent state 和两个玩家被选中的 slot target。
-        4) 写完 metadata 后，最后发布 expand_valid=READY，交给 PyTorch stage2。
-
-    发布约束：
-        stage1 只分配 child/staging，不发布 edge_tgt_node[parent, slot]=child。
-        child 对其他 select warp 的可见性由 stage2 commit 的 threadfence 保证。
-    """
-    tree = cuda.blockIdx.x
-    lane = cuda.threadIdx.x & int32(31)
-    wid = cuda.threadIdx.x >> int32(5)
-
-    if tree >= out_selected_node.shape[0]:
-        return
-    if wid >= min(cuda.blockDim.x >> int32(5), out_selected_node.shape[1]):
-        return
-
-    #& 先清空本 warp job header，避免上一轮残留被 Python bridge 误读。
-    if lane == int32(0):
-        expand_valid[tree, wid] = int32(DUCT_EXPAND_JOB_EMPTY)
-        expand_tree[tree, wid] = int32(-1)
-        expand_parent[tree, wid] = int32(-1)
-        expand_slot[tree, wid] = int32(-1)
-        expand_child[tree, wid] = int32(-1)
-
-    raw = out_selected_node[tree, wid]
-    kind = (raw >> int32(PACKED_KIND_SHIFT)) & int32(PACKED_KIND_MASK)
-    if kind != int32(SELECT_EXPAND):
-        return
-
-    #& 解码 select packed 输出；slot 是 8-bit joint action: (a0 << 4) | a1。
-    parent = raw & int32(PACKED_NODE_MASK)
-    slot = (raw >> int32(PACKED_SLOT_SHIFT)) & int32(PACKED_EDGE_MASK)
-    node_capacity = node_states.shape[1]
-    action_capacity = action_inflight.shape[3]
-
-    node_cnt = int32(0)
-    if lane == int32(0):
-        node_cnt = tree_nodes[tree]
-    node_cnt = cuda.shfl_sync(FULL_MASK, node_cnt, 0)
-
-    if (
-        parent < int32(0) or parent >= node_cnt or
-        parent >= edge_tgt_node.shape[1] or
-        slot < int32(0) or slot >= int32(DUCT_JOINT_ACTIONS)
-    ):
-        return
-
-    #& 二次验证 edge ownership：select 抢到的 EXPANDING 可能已被其他路径失败释放。
-    child_state = int32(DUCT_EDGE_UNEXPANDED)
-    if lane == int32(0):
-        child_state = edge_tgt_node[tree, parent, slot]
-    child_state = cuda.shfl_sync(FULL_MASK, child_state, 0)
-    if child_state != int32(DUCT_EDGE_EXPANDING):
-        return
-
-    #& node pool 分配只由 lane0 执行；child id 经 shfl 广播给整个 warp。
-    child = int32(-1)
-    if lane == int32(0):
-        child = cuda.atomic.add(tree_nodes, tree, int32(1))
-    child = cuda.shfl_sync(FULL_MASK, child, 0)
-
-    if child < int32(0) or child >= node_capacity or child >= int32(PACKED_NODE_LIMIT):
-        alloc_limit = node_capacity
-        if alloc_limit > int32(PACKED_NODE_LIMIT):
-            alloc_limit = int32(PACKED_NODE_LIMIT)
-        #& 容量/OOB 失败: 不发布 child，释放 edge claim，并回滚本 warp virtual loss。
-        _duct_release_expand_job(
-            edge_tgt_node, node_expand_inflight, action_inflight, tree_nodes,
-            out_path_eids, out_path_actions, out_path_len,
-            tree, wid, parent, slot, lane,
-            alloc_limit, action_capacity, int32(1),
-        )
-        if lane == int32(0):
-            expand_valid[tree, wid] = int32(DUCT_EXPAND_JOB_EMPTY)
-        return
-
-    state_dim = node_states.shape[2]
-    #& Shape拷贝: parent state [state_dim] -> expand_parent_states[tree, wid, :].
-    idx = lane
-    while idx < state_dim:
-        expand_parent_states[tree, wid, idx] = node_states[tree, parent, idx]
-        idx += int32(32)
-
-    action0 = slot >> int32(DUCT_ACTION_BITS)
-    action1 = slot & int32(DUCT_ACTION_MASK)
-    num_agents = node_action_targets.shape[4]
-
-    #& Shape拷贝: 两个玩家选中的 marginal slot target
-    #&   node_action_targets[tree,parent,player,action,A,2]
-    #&   -> expand_parent_targets[tree,wid,player,A,2].
-    idx = lane
-    while idx < int32(DUCT_PLAYERS) * num_agents * int32(2):
-        player = idx // (num_agents * int32(2))
-        rem = idx - player * num_agents * int32(2)
-        agent = rem >> int32(1)
-        dim = rem & int32(1)
-        action = action0
-        if player == int32(1):
-            action = action1
-        expand_parent_targets[tree, wid, player, agent, dim] = (
-            node_action_targets[tree, parent, player, action, agent, dim]
-        )
-        idx += int32(32)
-
-    #& lane0 写 job metadata；READY 必须最后写，Python 只扫描 READY job。
-    if lane == int32(0):
-        expand_parent_action_ids[tree, wid, int32(0)] = (
-            node_action_ids[tree, parent, int32(0), action0]
-        )
-        expand_parent_action_ids[tree, wid, int32(1)] = (
-            node_action_ids[tree, parent, int32(1), action1]
-        )
-        expand_parent_action_probs[tree, wid, int32(0)] = (
-            node_action_probs[tree, parent, int32(0), action0]
-        )
-        expand_parent_action_probs[tree, wid, int32(1)] = (
-            node_action_probs[tree, parent, int32(1), action1]
-        )
-        expand_tree[tree, wid] = tree
-        expand_parent[tree, wid] = parent
-        expand_slot[tree, wid] = slot
-        expand_child[tree, wid] = child
-
-    cuda.syncwarp(FULL_MASK)
-    if lane == int32(0):
-        #& 发布 stage1 job。此时 parent state/targets/metadata 已对本 warp 写完。
-        expand_valid[tree, wid] = int32(DUCT_EXPAND_JOB_READY)
-
-
 @cuda.jit
 def _commit_expand_stage2_duct(edge_tgt_node,
                                edge_actions,
@@ -1230,13 +1050,11 @@ def _commit_expand_stage2_duct(edge_tgt_node,
                                action_counts,
                                node_N,
                                node_expand_inflight,
-                               node_expanded,
                                tree_nodes,
                                out_path_eids,
                                out_path_actions,
                                out_path_len,
                                node_states,
-                               node_action_ids,
                                node_action_targets,
                                node_action_probs,
                                expand_valid,
@@ -1245,7 +1063,6 @@ def _commit_expand_stage2_duct(edge_tgt_node,
                                expand_child,
                                expand_next_states,
                                expand_done,
-                               expand_child_action_ids,
                                expand_child_action_targets,
                                expand_child_action_probs):
     """DUCT 扩展阶段2：提交 PyTorch/MINCO 结果并发布 child edge。
@@ -1259,7 +1076,7 @@ def _commit_expand_stage2_duct(edge_tgt_node,
         expand_parent/slot/child: [T, W]，stage1 分配和声明的 tree metadata。
         expand_next_states: [T, W, state_dim]，MINCO transition 后的 child state。
         expand_done: [T, W]，terminal 标记。
-        expand_child_action_ids/probs: [T, W, 2, 16]，新 child 的本地候选 slot。
+        expand_child_action_probs: [T, W, 2, 16]，新 child slot 的策略概率。
         expand_child_action_targets: [T, W, 2, 16, A, 2]，slot 对应连续 target。
 
     树内目标 shape：
@@ -1272,8 +1089,8 @@ def _commit_expand_stage2_duct(edge_tgt_node,
         1) 校验 READY job、parent/child/slot 范围、edge 仍为 EXPANDING、next_state 有限。
         2) 失败 job 重置 edge，并回滚 select 加上的 virtual loss。
         3) 成功 job 先写 child state，再初始化 256 个 joint edge 和 2x16 边缘动作统计。
-        4) 拷贝 PyTorch 采样出的 child slot ids/targets/probs。
-        5) 设置 node_N/node_expanded/action_counts，threadfence 后发布 edge_tgt_node=child。
+        4) 拷贝 PyTorch 采样出的 child slot targets/probs。
+        5) 设置 node_N/action_counts，threadfence 后发布 edge_tgt_node=child 或 terminal sentinel。
         6) 发布后释放 node_expand_inflight，并清空 expand_valid。
 
     发布约束：
@@ -1325,7 +1142,7 @@ def _commit_expand_stage2_duct(edge_tgt_node,
     if edge_state != int32(DUCT_EDGE_EXPANDING):
         invalid = int32(1)
 
-    #& finite guard: PyTorch/MINCO 若产生 NaN/Inf，commit 失败并走 rollback。
+    #& finite guard: PyTorch/MINCO 若产生 NaN/Inf，commit 直接丢弃 job，不做 expand 回滚。
     idx = lane
     while idx < state_dim:
         v = expand_next_states[tree, wid, idx]
@@ -1335,17 +1152,6 @@ def _commit_expand_stage2_duct(edge_tgt_node,
     invalid = _duct_warp_or_i32(invalid)
 
     if invalid != int32(0):
-        #& 失败路径只释放仍然由本 job 持有的 EXPANDING edge。
-        if (
-            edge_state == int32(DUCT_EDGE_EXPANDING) and
-            parent >= int32(0) and parent < edge_tgt_node.shape[1]
-        ):
-            _duct_release_expand_job(
-                edge_tgt_node, node_expand_inflight, action_inflight, tree_nodes,
-                out_path_eids, out_path_actions, out_path_len,
-                tree, wid, parent, slot, lane,
-                node_cnt, action_capacity, int32(0),
-            )
         if lane == int32(0):
             expand_valid[tree, wid] = int32(DUCT_EXPAND_JOB_EMPTY)
         return
@@ -1365,7 +1171,7 @@ def _commit_expand_stage2_duct(edge_tgt_node,
         edge_actions[tree, child, idx, int32(1)] = int32(-1)
         idx += int32(32)
 
-    #& 初始化两个玩家的 16 个 marginal slot 统计，并写入策略采样后的 action id/prob。
+    #& 初始化两个玩家的 16 个 marginal slot 统计，并写入策略采样后的 prob。
     idx = lane
     while idx < int32(DUCT_PLAYERS) * int32(DUCT_MARGINAL_ACTIONS):
         player = idx // int32(DUCT_MARGINAL_ACTIONS)
@@ -1373,9 +1179,6 @@ def _commit_expand_stage2_duct(edge_tgt_node,
         action_W[tree, child, player, action] = float32(0.0)
         action_N[tree, child, player, action] = int32(0)
         action_inflight[tree, child, player, action] = int32(0)
-        node_action_ids[tree, child, player, action] = (
-            expand_child_action_ids[tree, wid, player, action]
-        )
         node_action_probs[tree, child, player, action] = (
             expand_child_action_probs[tree, wid, player, action]
         )
@@ -1397,16 +1200,13 @@ def _commit_expand_stage2_duct(edge_tgt_node,
         )
         idx += int32(32)
 
-    #& lane0 写节点级状态。terminal child 设置防御性 action_count=1，
-    #& select 会通过 NODE_EXPANDED_TERMINAL 跳过继续扩展。
+    #& lane0 写节点级统计。terminal child 不再创建可遍历节点，只在 parent edge 写 sentinel。
     if lane == int32(0):
         node_N[tree, child] = int32(0)
         if expand_done[tree, wid] != int32(0):
-            node_expanded[tree, child] = int32(NODE_EXPANDED_TERMINAL)
             action_counts[tree, child, int32(0)] = int32(1)
             action_counts[tree, child, int32(1)] = int32(1)
         else:
-            node_expanded[tree, child] = int32(0)
             action_counts[tree, child, int32(0)] = int32(DUCT_MARGINAL_ACTIONS)
             action_counts[tree, child, int32(1)] = int32(DUCT_MARGINAL_ACTIONS)
 
@@ -1416,7 +1216,10 @@ def _commit_expand_stage2_duct(edge_tgt_node,
 
     if lane == int32(0):
         #& 树可见发布点。之后 select 可能立刻沿 parent/slot 进入 child。
-        edge_tgt_node[tree, parent, slot] = child
+        if expand_done[tree, wid] != int32(0):
+            edge_tgt_node[tree, parent, slot] = int32(NODE_EXPANDED_TERMINAL)
+        else:
+            edge_tgt_node[tree, parent, slot] = child
         cuda.atomic.sub(node_expand_inflight, (tree, parent), int32(1))
         expand_valid[tree, wid] = int32(DUCT_EXPAND_JOB_EMPTY)
 
@@ -1430,20 +1233,17 @@ class DuctExpandBridge:
 
     树内持久 storage shape：
         node_states: [T, N, state_dim]。
-        node_action_ids: [T, N, 2, 16]。
         node_action_targets: [T, N, 2, 16, A, 2]。
         node_action_probs: [T, N, 2, 16]。
 
     job staging shape：
         expand_valid/tree/parent/slot/child: [T, W]。
-        expand_parent_states: [T, W, state_dim]。
-        expand_parent_targets: [T, W, 2, A, 2]。
         expand_next_states: [T, W, state_dim]。
-        expand_child_action_ids/probs: [T, W, 2, 16]。
         expand_child_action_targets: [T, W, 2, 16, A, 2]。
+        expand_child_action_probs: [T, W, 2, 16]。
 
     关键路径：
-        CUDA stage1 写 parent/slot/child 和 parent target staging；
+        PyTorch stage1 写 parent/slot/child；
         Python 调 MINCO projection/transition 和 policy sampling；
         CUDA stage2 把 next_state/slot 表提交回 tree 并发布 edge。
 
@@ -1468,10 +1268,6 @@ class DuctExpandBridge:
             (self.n_trees, self.node_capacity, self.state_dim),
             dtype=torch.float32, device=self.device,
         )
-        self.node_action_ids = torch.full(
-            (self.n_trees, self.node_capacity, DUCT_PLAYERS, DUCT_MARGINAL_ACTIONS),
-            -1, dtype=torch.int32, device=self.device,
-        )
         self.node_action_targets = torch.zeros(
             (self.n_trees, self.node_capacity, DUCT_PLAYERS,
              DUCT_MARGINAL_ACTIONS, self.num_agents, 2),
@@ -1491,32 +1287,12 @@ class DuctExpandBridge:
         self.expand_parent = torch.full_like(self.expand_valid, -1)
         self.expand_slot = torch.full_like(self.expand_valid, -1)
         self.expand_child = torch.full_like(self.expand_valid, -1)
-        self.expand_parent_states = torch.zeros(
-            (self.n_trees, self.max_warps, self.state_dim),
-            dtype=torch.float32, device=self.device,
-        )
-        self.expand_parent_targets = torch.zeros(
-            (self.n_trees, self.max_warps, DUCT_PLAYERS, self.num_agents, 2),
-            dtype=torch.float32, device=self.device,
-        )
-        self.expand_parent_action_ids = torch.full(
-            (self.n_trees, self.max_warps, DUCT_PLAYERS),
-            -1, dtype=torch.int32, device=self.device,
-        )
-        self.expand_parent_action_probs = torch.zeros(
-            (self.n_trees, self.max_warps, DUCT_PLAYERS),
-            dtype=torch.float32, device=self.device,
-        )
         self.expand_next_states = torch.zeros(
             (self.n_trees, self.max_warps, self.state_dim),
             dtype=torch.float32, device=self.device,
         )
         self.expand_done = torch.zeros(
             (self.n_trees, self.max_warps), dtype=torch.int32, device=self.device,
-        )
-        self.expand_child_action_ids = torch.full(
-            (self.n_trees, self.max_warps, DUCT_PLAYERS, DUCT_MARGINAL_ACTIONS),
-            -1, dtype=torch.int32, device=self.device,
         )
         self.expand_child_action_targets = torch.zeros(
             (self.n_trees, self.max_warps, DUCT_PLAYERS,
@@ -1533,7 +1309,6 @@ class DuctExpandBridge:
     def _refresh_dev_views(self) -> None:
         """刷新 Numba CUDA view；shape 与同名 PyTorch tensor 完全一致。"""
         self.dev_node_states = cuda.as_cuda_array(self.node_states)
-        self.dev_node_action_ids = cuda.as_cuda_array(self.node_action_ids)
         self.dev_node_action_targets = cuda.as_cuda_array(self.node_action_targets)
         self.dev_node_action_probs = cuda.as_cuda_array(self.node_action_probs)
         self.dev_expand_valid = cuda.as_cuda_array(self.expand_valid)
@@ -1541,13 +1316,8 @@ class DuctExpandBridge:
         self.dev_expand_parent = cuda.as_cuda_array(self.expand_parent)
         self.dev_expand_slot = cuda.as_cuda_array(self.expand_slot)
         self.dev_expand_child = cuda.as_cuda_array(self.expand_child)
-        self.dev_expand_parent_states = cuda.as_cuda_array(self.expand_parent_states)
-        self.dev_expand_parent_targets = cuda.as_cuda_array(self.expand_parent_targets)
-        self.dev_expand_parent_action_ids = cuda.as_cuda_array(self.expand_parent_action_ids)
-        self.dev_expand_parent_action_probs = cuda.as_cuda_array(self.expand_parent_action_probs)
         self.dev_expand_next_states = cuda.as_cuda_array(self.expand_next_states)
         self.dev_expand_done = cuda.as_cuda_array(self.expand_done)
-        self.dev_expand_child_action_ids = cuda.as_cuda_array(self.expand_child_action_ids)
         self.dev_expand_child_action_targets = cuda.as_cuda_array(self.expand_child_action_targets)
         self.dev_expand_child_action_probs = cuda.as_cuda_array(self.expand_child_action_probs)
 
@@ -1559,15 +1329,94 @@ class DuctExpandBridge:
         self.expand_parent.fill_(-1)
         self.expand_slot.fill_(-1)
         self.expand_child.fill_(-1)
-        self.expand_parent_states.zero_()
-        self.expand_parent_targets.zero_()
-        self.expand_parent_action_ids.fill_(-1)
-        self.expand_parent_action_probs.zero_()
         self.expand_next_states.zero_()
         self.expand_done.zero_()
-        self.expand_child_action_ids.fill_(-1)
         self.expand_child_action_targets.zero_()
         self.expand_child_action_probs.zero_()
+
+
+def prepare_duct_expand_stage1_torch(bridge: DuctExpandBridge,
+                                     edge_tgt_node,
+                                     tree_nodes,
+                                     out_selected_node,
+                                     ):
+    """纯 PyTorch DUCT 扩展阶段1：批量解码 select 输出并分配 child index。
+
+    Shape:
+        bridge.expand_*: [T, W]，本函数写入 READY job 的 tree/parent/slot/child。
+        edge_tgt_node: int32 [T, N, 256]，select 已经把待扩展 edge 置为 EXPANDING。
+        tree_nodes: int32 [T]，本函数按 READY job 数批量递增。
+        out_selected_node: int32 [T, W]，packed SELECT_EXPAND(parent, joint_slot)。
+
+    关键算法路径：
+        1) 向量化 decode `SELECT_EXPAND(parent, joint_slot)`。
+        2) 用 edge_tgt_node == EXPANDING 过滤非扩展 job。
+        3) 每棵树用 cumsum 做局部 child id 分配；容量外 job 不进入 READY，不做回滚。
+        4) 写索引和 READY 标记，parent state/target 拷贝交给 PyTorch stage2 gather。
+
+    返回:
+        dict(num_jobs, num_ready, num_dropped)，用于调试/benchmark 统计。
+    """
+    import torch
+
+    with torch.no_grad():
+        bridge.reset_jobs()
+
+        raw = out_selected_node.to(torch.int64)
+        kind = (raw >> int(PACKED_KIND_SHIFT)) & int(PACKED_KIND_MASK)
+        parent = raw & int(PACKED_NODE_MASK)
+        slot = (raw >> int(PACKED_SLOT_SHIFT)) & int(PACKED_EDGE_MASK)
+
+        n_trees, max_warps = out_selected_node.shape
+        tree_grid = torch.arange(n_trees, dtype=torch.long, device=bridge.device).view(-1, 1)
+        tree_grid = tree_grid.expand(n_trees, max_warps)
+
+        node_cap = int(edge_tgt_node.shape[1])
+        alloc_limit = min(node_cap, int(PACKED_NODE_LIMIT))
+        node_counts = tree_nodes.to(torch.long).view(-1, 1)
+        range_ok = (
+            (kind == int(SELECT_EXPAND)) &
+            (parent >= 0) &
+            (parent < node_counts) &
+            (parent < node_cap) &
+            (slot >= 0) &
+            (slot < int(DUCT_JOINT_ACTIONS))
+        )
+
+        edge_ok = torch.zeros_like(range_ok, dtype=torch.bool)
+        if bool(range_ok.any().item()):
+            edge_ok[range_ok] = (
+                edge_tgt_node[
+                    tree_grid[range_ok],
+                    parent[range_ok].to(torch.long),
+                    slot[range_ok].to(torch.long),
+                ] == int(DUCT_EDGE_EXPANDING)
+        )
+        claim_ok = range_ok & edge_ok
+
+        local_offset_claim = torch.cumsum(claim_ok.to(torch.long), dim=1) - 1
+        available = torch.clamp(
+            torch.full_like(node_counts, int(alloc_limit)) - node_counts,
+            min=0,
+        )
+        ready_mask = claim_ok & (local_offset_claim < available)
+        child = node_counts + local_offset_claim
+
+        ready_counts = ready_mask.to(torch.int32).sum(dim=1)
+        tree_nodes.add_(ready_counts.to(dtype=tree_nodes.dtype))
+
+        if bool(ready_mask.any().item()):
+            bridge.expand_tree[ready_mask] = tree_grid[ready_mask].to(torch.int32)
+            bridge.expand_parent[ready_mask] = parent[ready_mask].to(torch.int32)
+            bridge.expand_slot[ready_mask] = slot[ready_mask].to(torch.int32)
+            bridge.expand_child[ready_mask] = child[ready_mask].to(torch.int32)
+            bridge.expand_valid[ready_mask] = int(DUCT_EXPAND_JOB_READY)
+
+        return {
+            "num_jobs": int(claim_ok.sum().item()),
+            "num_ready": int(ready_mask.sum().item()),
+            "num_dropped": int((claim_ok & ~ready_mask).sum().item()),
+        }
 
 
 def _as_cuda_float_tensor(value, *, device):
@@ -1612,36 +1461,36 @@ def _duct_policy_probs(logits, uniform_sample_prob: float):
     return mixed
 
 
-def _sample_policy_action_table(states, action_table, policy0, policy1,
-                                uniform_sample_prob: float = 0.0,
-                                generator=None):
-    """按双玩家策略分布采样并排列 child 的 16 个 marginal slot。
+def _sample_policy_targets(states, candidate_targets, policy0, policy1,
+                           uniform_sample_prob: float = 0.0,
+                           generator=None):
+    """按双玩家策略分布采样并排列 child 的 16 个 marginal target slot。
 
     Shape:
         states: [B, state_dim]，即 child state batch。
-        action_table: [2, 16, A, 2]，外部候选 target 表。
+        candidate_targets: [2, 16, A, 2]，外部候选 target 池。
         policy0/1(states): [B, 16] logits。
-        return ids: [B, 2, 16]，每个玩家的候选 action id 排列。
-        return targets: [B, 2, 16, A, 2]，按 ids gather 后的连续 target。
-        return ordered_probs: [B, 2, 16]，ids 顺序对应的混合概率。
+        return targets: [B, 2, 16, A, 2]，按采样顺序 gather 后的连续 target。
+        return ordered_probs: [B, 2, 16]，slot 顺序对应的混合概率。
 
     关键路径：
         两个玩家分别 softmax+epsilon 混合 -> multinomial 无放回采样 16 个 slot ->
-        从 action_table[player, id] gather target，供 commit 写入 child。
+        从 candidate_targets[player, sampled_slot] gather target，供 commit 写入 child。
+        采样 index 不落盘，树上只保留 target/prob，节省 [T,N,2,16] int32 显存。
     """
     import torch
 
-    table = _as_cuda_float_tensor(action_table, device=states.device)
+    table = _as_cuda_float_tensor(candidate_targets, device=states.device)
     if table.ndim != 4:
         raise ValueError(
-            "action_table must have shape "
+            "candidate_targets must have shape "
             f"({DUCT_PLAYERS}, {DUCT_MARGINAL_ACTIONS}, num_agents, 2), "
             f"got {tuple(table.shape)}"
         )
     expected = (DUCT_PLAYERS, DUCT_MARGINAL_ACTIONS, table.shape[-2], 2)
     if tuple(table.shape) != expected:
         raise ValueError(
-            "action_table must have shape "
+            "candidate_targets must have shape "
             f"({DUCT_PLAYERS}, {DUCT_MARGINAL_ACTIONS}, num_agents, 2), "
             f"got {tuple(table.shape)}"
         )
@@ -1656,7 +1505,6 @@ def _sample_policy_action_table(states, action_table, policy0, policy1,
     ids1 = torch.multinomial(
         probs1, DUCT_MARGINAL_ACTIONS, replacement=False, generator=generator,
     )
-    ids = torch.stack((ids0, ids1), dim=1)
 
     batch = states.shape[0]
     targets = torch.empty(
@@ -1673,11 +1521,11 @@ def _sample_policy_action_table(states, action_table, policy0, policy1,
         (torch.gather(probs0, 1, ids0), torch.gather(probs1, 1, ids1)),
         dim=1,
     )
-    return ids.to(torch.int32), targets, ordered_probs
+    return targets, ordered_probs
 
 
 def fill_duct_node_action_slots(bridge: DuctExpandBridge, tree_ids, node_ids,
-                                states, action_table, policy0, policy1,
+                                states, candidate_targets, policy0, policy1,
                                 uniform_sample_prob: float = 0.0,
                                 generator=None):
     """给已有节点填充策略排序的 DUCT marginal action slots。
@@ -1686,13 +1534,12 @@ def fill_duct_node_action_slots(bridge: DuctExpandBridge, tree_ids, node_ids,
         tree_ids/node_ids: [B]，指定要填的树和节点。
         states: [B, state_dim]，会同步写入 bridge.node_states。
         写入:
-            node_action_ids[tree, node]: [2, 16]。
             node_action_targets[tree, node]: [2, 16, A, 2]。
             node_action_probs[tree, node]: [2, 16]。
 
     关键路径：
         用当前 state 调 policy0/policy1 -> 采样 slot 排列 ->
-        写入 tree storage。root 初始化和 child commit 前的 slot 生成共用这条路径。
+        只写采样后的 target/prob。root 初始化和 child commit 前的 slot 生成共用这条路径。
     """
     import torch
 
@@ -1707,27 +1554,26 @@ def fill_duct_node_action_slots(bridge: DuctExpandBridge, tree_ids, node_ids,
         if node_t.numel() != tree_t.numel():
             raise ValueError("node_ids must match tree_ids")
 
-        ids, targets, probs = _sample_policy_action_table(
-            states_t, action_table, policy0, policy1,
+        targets, probs = _sample_policy_targets(
+            states_t, candidate_targets, policy0, policy1,
             uniform_sample_prob=uniform_sample_prob,
             generator=generator,
         )
         bridge.node_states[tree_t, node_t] = states_t
-        bridge.node_action_ids[tree_t, node_t] = ids
         bridge.node_action_targets[tree_t, node_t] = targets
         bridge.node_action_probs[tree_t, node_t] = probs
-        return ids, targets, probs
+        return targets, probs
 
 
 def initialize_duct_root_slots(bridge: DuctExpandBridge, root_states,
-                               action_table, policy0, policy1,
+                               candidate_targets, policy0, policy1,
                                uniform_sample_prob: float = 0.0,
                                generator=None):
     """初始化每棵树 root(node=0) 的 DUCT action slots。
 
     Shape:
         root_states: [T, state_dim]，T 必须等于 bridge.n_trees。
-        action_table/policy 输出 shape 与 fill_duct_node_action_slots 相同。
+        candidate_targets/policy 输出 shape 与 fill_duct_node_action_slots 相同。
 
     关键路径：
         tree_ids = arange(T)，node_ids = 0，然后复用统一的策略填槽逻辑。
@@ -1737,7 +1583,7 @@ def initialize_duct_root_slots(bridge: DuctExpandBridge, root_states,
     tree_ids = torch.arange(bridge.n_trees, dtype=torch.long, device=bridge.device)
     node_ids = torch.zeros_like(tree_ids)
     return fill_duct_node_action_slots(
-        bridge, tree_ids, node_ids, root_states, action_table, policy0, policy1,
+        bridge, tree_ids, node_ids, root_states, candidate_targets, policy0, policy1,
         uniform_sample_prob=uniform_sample_prob, generator=generator,
     )
 
@@ -1817,7 +1663,7 @@ def _duct_step_env_with_projected_targets(env, parent_states, projected_targets)
     return next_flat, done, valid
 
 
-def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, action_table,
+def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_targets,
                                  policy0, policy1,
                                  uniform_sample_prob: float = 0.0,
                                  team_ids=None, generator=None):
@@ -1825,11 +1671,10 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, action_table,
 
     输入/输出 shape：
         bridge.expand_valid: [T, W]，只处理 READY job。
-        bridge.expand_parent_states: [T, W, state_dim]。
-        bridge.expand_parent_targets: [T, W, 2, A, 2]。
+        bridge.expand_tree/parent/slot/child: [T, W]，stage1 输出的索引。
         bridge.expand_next_states: [T, W, state_dim]，本函数写入。
         bridge.expand_done: [T, W]，本函数写入。
-        bridge.expand_child_action_ids/probs: [T, W, 2, 16]，本函数写入。
+        bridge.expand_child_action_probs: [T, W, 2, 16]，本函数写入。
         bridge.expand_child_action_targets: [T, W, 2, 16, A, 2]，本函数写入。
 
     关键算法路径：
@@ -1838,7 +1683,7 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, action_table,
         3) 调 project_target_away_from_obstacles 修正障碍约束。
         4) 用已投影 target 推进环境，得到 next_state/done/valid。
         5) 调 policy0/policy1 生成 child 的 2x16 slot 排列。
-        6) valid 且 finite 的 job 保持 READY；失败 job 标记 FAILED，交给 commit rollback。
+        6) valid 且 finite 的 job 保持 READY；失败 job 标记 FAILED，commit 只丢弃 staging。
     """
     import torch
 
@@ -1852,8 +1697,19 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, action_table,
                 "projected_targets": None,
             }
 
-        parent_states = bridge.expand_parent_states[job_mask]
-        parent_targets = bridge.expand_parent_targets[job_mask]
+        tree_ids = bridge.expand_tree[job_mask].to(torch.long)
+        parent_nodes = bridge.expand_parent[job_mask].to(torch.long)
+        slot_ids = bridge.expand_slot[job_mask].to(torch.long)
+        parent_states = bridge.node_states[tree_ids, parent_nodes]
+        action0 = slot_ids >> DUCT_ACTION_BITS
+        action1 = slot_ids & DUCT_ACTION_MASK
+        parent_targets = torch.stack(
+            (
+                bridge.node_action_targets[tree_ids, parent_nodes, 0, action0],
+                bridge.node_action_targets[tree_ids, parent_nodes, 1, action1],
+            ),
+            dim=1,
+        )
         full_targets = _duct_combine_player_targets(env, parent_targets, team_ids=team_ids)
         coeff, active, _ = env.unpack_state(parent_states)
         projected_targets, _, _ = env.project_target_away_from_obstacles(
@@ -1872,15 +1728,14 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, action_table,
         bridge.expand_next_states[job_mask] = torch.nan_to_num(next_states, nan=0.0, posinf=0.0, neginf=0.0)
         bridge.expand_done[job_mask] = done.to(torch.int32)
 
-        ids, targets, probs = _sample_policy_action_table(
+        targets, probs = _sample_policy_targets(
             bridge.expand_next_states[job_mask],
-            action_table,
+            candidate_targets,
             policy0,
             policy1,
             uniform_sample_prob=uniform_sample_prob,
             generator=generator,
         )
-        bridge.expand_child_action_ids[job_mask] = ids
         bridge.expand_child_action_targets[job_mask] = targets
         bridge.expand_child_action_probs[job_mask] = probs
 

@@ -74,7 +74,6 @@ def pack_expand(parent: int, slot: int) -> np.int32:
 class NumpyExpandBridge:
     names = (
         "node_states",
-        "node_action_ids",
         "node_action_targets",
         "node_action_probs",
         "expand_valid",
@@ -82,13 +81,8 @@ class NumpyExpandBridge:
         "expand_parent",
         "expand_slot",
         "expand_child",
-        "expand_parent_states",
-        "expand_parent_targets",
-        "expand_parent_action_ids",
-        "expand_parent_action_probs",
         "expand_next_states",
         "expand_done",
-        "expand_child_action_ids",
         "expand_child_action_targets",
         "expand_child_action_probs",
     )
@@ -101,7 +95,6 @@ class NumpyExpandBridge:
         self.num_agents = num_agents
         self.max_warps = warps
         self.node_states = np.zeros((trees, nodes, state_dim), np.float32)
-        self.node_action_ids = np.full((trees, nodes, 2, 16), -1, np.int32)
         self.node_action_targets = np.zeros((trees, nodes, 2, 16, num_agents, 2), np.float32)
         self.node_action_probs = np.zeros((trees, nodes, 2, 16), np.float32)
         self.expand_valid = np.zeros((trees, warps), np.int32)
@@ -109,13 +102,8 @@ class NumpyExpandBridge:
         self.expand_parent = np.full((trees, warps), -1, np.int32)
         self.expand_slot = np.full((trees, warps), -1, np.int32)
         self.expand_child = np.full((trees, warps), -1, np.int32)
-        self.expand_parent_states = np.zeros((trees, warps, state_dim), np.float32)
-        self.expand_parent_targets = np.zeros((trees, warps, 2, num_agents, 2), np.float32)
-        self.expand_parent_action_ids = np.full((trees, warps, 2), -1, np.int32)
-        self.expand_parent_action_probs = np.zeros((trees, warps, 2), np.float32)
         self.expand_next_states = np.zeros((trees, warps, state_dim), np.float32)
         self.expand_done = np.zeros((trees, warps), np.int32)
-        self.expand_child_action_ids = np.full((trees, warps, 2, 16), -1, np.int32)
         self.expand_child_action_targets = np.zeros((trees, warps, 2, 16, num_agents, 2), np.float32)
         self.expand_child_action_probs = np.zeros((trees, warps, 2, 16), np.float32)
 
@@ -142,7 +130,6 @@ class DeviceExpandBridge:
         for name in (
             "expand_next_states",
             "expand_done",
-            "expand_child_action_ids",
             "expand_child_action_targets",
             "expand_child_action_probs",
         ):
@@ -165,7 +152,6 @@ def make_case(trees=1, nodes=8, warps=1, state_dim=8, num_agents=4, actions=16):
     action_counts = np.full((trees, nodes, duct.DUCT_PLAYERS), actions, np.int32)
     node_n = np.zeros((trees, nodes), np.int32)
     node_expand_inflight = np.zeros((trees, nodes), np.int32)
-    node_expanded = np.zeros((trees, nodes), np.int32)
     tree_nodes = np.ones((trees,), np.int32)
     out_selected = np.full((trees, warps), v3.PACKED_INVALID, np.int32)
     out_path = np.full((trees, warps, 2), -1, np.int32)
@@ -181,7 +167,6 @@ def make_case(trees=1, nodes=8, warps=1, state_dim=8, num_agents=4, actions=16):
         "action_counts": action_counts,
         "node_n": node_n,
         "node_expand_inflight": node_expand_inflight,
-        "node_expanded": node_expanded,
         "tree_nodes": tree_nodes,
         "out_selected": out_selected,
         "out_path": out_path,
@@ -212,12 +197,28 @@ def copy_back(dcase):
     return {k: v.copy_to_host() if hasattr(v, "copy_to_host") else v for k, v in dcase.items()}
 
 
+def numpy_case_to_torch_stage1(case):
+    if not TORCH_CUDA:
+        raise RuntimeError("PyTorch CUDA is required for DUCT expand stage1")
+    return {
+        "edge_child": torch.as_tensor(case["edge_child"], dtype=torch.int32, device="cuda"),
+        "tree_nodes": torch.as_tensor(case["tree_nodes"], dtype=torch.int32, device="cuda"),
+        "out_selected": torch.as_tensor(case["out_selected"], dtype=torch.int32, device="cuda"),
+        "bridge": duct.DuctExpandBridge(
+            case["trees"],
+            case["nodes"],
+            case["state_dim"],
+            case["num_agents"],
+            case["warps"],
+        ),
+    }
+
+
 def seed_root_slots(bridge):
     state = np.arange(bridge.state_dim, dtype=np.float32)
     bridge.node_states[0, 0] = state
     for p in range(duct.DUCT_PLAYERS):
         for a in range(duct.DUCT_MARGINAL_ACTIONS):
-            bridge.node_action_ids[0, 0, p, a] = a
             bridge.node_action_probs[0, 0, p, a] = float(a + 1) / 100.0
             for ag in range(bridge.num_agents):
                 bridge.node_action_targets[0, 0, p, a, ag, 0] = 1000.0 * p + 100.0 * a + 10.0 * ag
@@ -232,7 +233,6 @@ def seed_child_payload(bridge, done: int = 0):
         bridge.expand_done[0, wid] = done
         for p in range(duct.DUCT_PLAYERS):
             for a in range(duct.DUCT_MARGINAL_ACTIONS):
-                bridge.expand_child_action_ids[0, wid, p, a] = 15 - a
                 bridge.expand_child_action_probs[0, wid, p, a] = 0.01 * (a + 1 + p)
                 bridge.expand_child_action_targets[0, wid, p, a] = (
                     float(100 * wid + 10 * p + a)
@@ -255,30 +255,12 @@ def mark_expand_job(case, wid: int, action0: int, action1: int):
     return slot
 
 
-def launch_prepare(dcase):
-    b = dcase["bridge"]
-    duct._prepare_expand_stage1_duct[dcase["trees"], dcase["warps"] * v3.WARP_SIZE](
-        dcase["edge_child"],
-        dcase["node_expand_inflight"],
-        dcase["action_inflight"],
-        dcase["tree_nodes"],
-        dcase["out_selected"],
-        dcase["out_path"],
-        dcase["out_path_actions"],
-        dcase["out_len"],
-        b.dev_node_states,
-        b.dev_node_action_ids,
-        b.dev_node_action_targets,
-        b.dev_node_action_probs,
-        b.dev_expand_valid,
-        b.dev_expand_tree,
-        b.dev_expand_parent,
-        b.dev_expand_slot,
-        b.dev_expand_child,
-        b.dev_expand_parent_states,
-        b.dev_expand_parent_targets,
-        b.dev_expand_parent_action_ids,
-        b.dev_expand_parent_action_probs,
+def launch_prepare_torch(case):
+    return duct.prepare_duct_expand_stage1_torch(
+        case["bridge"],
+        case["edge_child"],
+        case["tree_nodes"],
+        case["out_selected"],
     )
 
 
@@ -293,13 +275,11 @@ def launch_commit(dcase):
         dcase["action_counts"],
         dcase["node_n"],
         dcase["node_expand_inflight"],
-        dcase["node_expanded"],
         dcase["tree_nodes"],
         dcase["out_path"],
         dcase["out_path_actions"],
         dcase["out_len"],
         b.dev_node_states,
-        b.dev_node_action_ids,
         b.dev_node_action_targets,
         b.dev_node_action_probs,
         b.dev_expand_valid,
@@ -308,38 +288,50 @@ def launch_commit(dcase):
         b.dev_expand_child,
         b.dev_expand_next_states,
         b.dev_expand_done,
-        b.dev_expand_child_action_ids,
         b.dev_expand_child_action_targets,
         b.dev_expand_child_action_probs,
     )
+
+
+def prepare_case_for_commit(case):
+    torch_case = numpy_case_to_torch_stage1(case)
+    launch_prepare_torch(torch_case)
+    cuda_case = to_device(case)
+    for name in (
+        "expand_valid",
+        "expand_tree",
+        "expand_parent",
+        "expand_slot",
+        "expand_child",
+    ):
+        getattr(cuda_case["bridge"], f"dev_{name}").copy_to_device(
+            getattr(torch_case["bridge"], name).detach().cpu().numpy()
+        )
+    cuda_case["tree_nodes"].copy_to_device(torch_case["tree_nodes"].detach().cpu().numpy())
+    return cuda_case
 
 
 def test_fresh_expand_commits_child():
     case = make_case(nodes=6, warps=1, state_dim=8, num_agents=3)
     seed_root_slots(case["bridge"])
     slot = mark_expand_job(case, 0, 2, 3)
-    d = to_device(case)
-    launch_prepare(d)
-    cuda.synchronize()
+    d = prepare_case_for_commit(case)
     seed_child_payload(d["bridge"])
     launch_commit(d)
     cuda.synchronize()
     h = copy_back(d)
     b = case["bridge"]
     b_node_states = d["bridge"].copy_field("node_states")
-    b_node_action_ids = d["bridge"].copy_field("node_action_ids")
     b_node_action_targets = d["bridge"].copy_field("node_action_targets")
     b_expand_valid = d["bridge"].copy_field("expand_valid")
     ok = (
         int(h["edge_child"][0, 0, slot]) == 1
         and int(h["tree_nodes"][0]) == 2
         and int(h["node_expand_inflight"][0, 0]) == 0
-        and int(h["node_expanded"][0, 1]) == 0
         and tuple(int(x) for x in h["action_counts"][0, 1]) == (16, 16)
         and int(h["action_inflight"][0, 0, 0, 2]) == 1
         and int(h["action_inflight"][0, 0, 1, 3]) == 1
         and np.allclose(b_node_states[0, 1], np.arange(8, dtype=np.float32) + 10.0)
-        and int(b_node_action_ids[0, 1, 0, 0]) == 15
         and float(b_node_action_targets[0, 1, 1, 4, 0, 0]) == 14.0
         and int(b_expand_valid[0, 0]) == duct.DUCT_EXPAND_JOB_EMPTY
     )
@@ -350,9 +342,7 @@ def test_multi_warp_expand_allocates_unique_children():
     case = make_case(nodes=8, warps=4, state_dim=4, num_agents=2)
     seed_root_slots(case["bridge"])
     slots = [mark_expand_job(case, wid, wid, (wid + 1) % 4) for wid in range(4)]
-    d = to_device(case)
-    launch_prepare(d)
-    cuda.synchronize()
+    d = prepare_case_for_commit(case)
     seed_child_payload(d["bridge"])
     launch_commit(d)
     cuda.synchronize()
@@ -367,25 +357,6 @@ def test_multi_warp_expand_allocates_unique_children():
     record("multi-warp expand allocates unique child ids", ok, f"children={children}")
 
 
-def test_capacity_overflow_resets_edge_and_claims():
-    case = make_case(nodes=1, warps=1, state_dim=4, num_agents=2)
-    seed_root_slots(case["bridge"])
-    slot = mark_expand_job(case, 0, 0, 0)
-    d = to_device(case)
-    launch_prepare(d)
-    cuda.synchronize()
-    h = copy_back(d)
-    ok = (
-        int(h["tree_nodes"][0]) == 1
-        and int(h["edge_child"][0, 0, slot]) == duct.DUCT_EDGE_UNEXPANDED
-        and int(h["node_expand_inflight"][0, 0]) == 0
-        and int(h["action_inflight"][0, 0, 0, 0]) == 0
-        and int(h["action_inflight"][0, 0, 1, 0]) == 0
-        and int(d["bridge"].copy_field("expand_valid")[0, 0]) == duct.DUCT_EXPAND_JOB_EMPTY
-    )
-    record("capacity overflow resets edge and rolls back claims", ok)
-
-
 def test_non_expand_and_stale_jobs_are_ignored():
     case = make_case(nodes=4, warps=2, state_dim=4, num_agents=2)
     seed_root_slots(case["bridge"])
@@ -393,39 +364,130 @@ def test_non_expand_and_stale_jobs_are_ignored():
     case["out_selected"][0, 0] = v3.PACKED_INVALID
     case["out_selected"][0, 1] = pack_expand(0, stale_slot)
     case["edge_child"][0, 0, stale_slot] = 2
-    d = to_device(case)
-    launch_prepare(d)
-    cuda.synchronize()
-    h = copy_back(d)
+    torch_case = numpy_case_to_torch_stage1(case)
+    info = launch_prepare_torch(torch_case)
     ok = (
-        int(h["tree_nodes"][0]) == 1
-        and int(h["edge_child"][0, 0, stale_slot]) == 2
-        and int(d["bridge"].copy_field("expand_valid")[0, 0]) == duct.DUCT_EXPAND_JOB_EMPTY
-        and int(d["bridge"].copy_field("expand_valid")[0, 1]) == duct.DUCT_EXPAND_JOB_EMPTY
+        info == {"num_jobs": 0, "num_ready": 0, "num_dropped": 0}
+        and int(case["tree_nodes"][0].item()) == 1
+        and int(case["edge_child"][0, 0, stale_slot].item()) == 2
+        and int(case["bridge"].expand_valid[0, 0].item()) == duct.DUCT_EXPAND_JOB_EMPTY
+        and int(case["bridge"].expand_valid[0, 1].item()) == duct.DUCT_EXPAND_JOB_EMPTY
     )
     record("non-SELECT_EXPAND and stale jobs are ignored", ok)
 
 
-def test_failed_commit_resets_edge_and_rolls_back():
+def test_failed_commit_discards_job_without_rollback():
     case = make_case(nodes=4, warps=1, state_dim=4, num_agents=2)
     seed_root_slots(case["bridge"])
     slot = mark_expand_job(case, 0, 4, 5)
-    d = to_device(case)
-    launch_prepare(d)
-    cuda.synchronize()
+    d = prepare_case_for_commit(case)
     d["bridge"].expand_valid[0, 0] = duct.DUCT_EXPAND_JOB_FAILED
     d["bridge"].copy_status_to_device()
     launch_commit(d)
     cuda.synchronize()
     h = copy_back(d)
     ok = (
-        int(h["edge_child"][0, 0, slot]) == duct.DUCT_EDGE_UNEXPANDED
-        and int(h["node_expand_inflight"][0, 0]) == 0
-        and int(h["action_inflight"][0, 0, 0, 4]) == 0
-        and int(h["action_inflight"][0, 0, 1, 5]) == 0
+        int(h["edge_child"][0, 0, slot]) == duct.DUCT_EDGE_EXPANDING
+        and int(h["node_expand_inflight"][0, 0]) == 1
+        and int(h["action_inflight"][0, 0, 0, 4]) == 1
+        and int(h["action_inflight"][0, 0, 1, 5]) == 1
         and int(d["bridge"].copy_field("expand_valid")[0, 0]) == duct.DUCT_EXPAND_JOB_EMPTY
     )
-    record("failed commit resets edge and rolls back virtual losses", ok)
+    record("failed commit discards job without rollback", ok)
+
+
+def test_terminal_commit_publishes_terminal_sentinel():
+    case = make_case(nodes=4, warps=1, state_dim=4, num_agents=2)
+    seed_root_slots(case["bridge"])
+    slot = mark_expand_job(case, 0, 1, 2)
+    d = prepare_case_for_commit(case)
+    seed_child_payload(d["bridge"], done=1)
+    launch_commit(d)
+    cuda.synchronize()
+    h = copy_back(d)
+    ok = (
+        int(h["edge_child"][0, 0, slot]) == v3.NODE_EXPANDED_TERMINAL
+        and int(h["node_expand_inflight"][0, 0]) == 0
+        and tuple(int(x) for x in h["action_counts"][0, 1]) == (1, 1)
+        and int(d["bridge"].copy_field("expand_valid")[0, 0]) == duct.DUCT_EXPAND_JOB_EMPTY
+    )
+    record("terminal commit publishes NODE_EXPANDED_TERMINAL sentinel", ok)
+
+
+def make_torch_stage1_tensors(nodes=4, warps=2):
+    device = "cuda"
+    edge_child = torch.full(
+        (1, nodes, duct.DUCT_JOINT_ACTIONS),
+        duct.DUCT_EDGE_UNEXPANDED,
+        dtype=torch.int32,
+        device=device,
+    )
+    tree_nodes = torch.ones((1,), dtype=torch.int32, device=device)
+    out_selected = torch.full((1, warps), v3.PACKED_INVALID, dtype=torch.int32, device=device)
+    bridge = duct.DuctExpandBridge(1, nodes, 5, 2, warps)
+    return {
+        "edge_child": edge_child,
+        "tree_nodes": tree_nodes,
+        "out_selected": out_selected,
+        "bridge": bridge,
+    }
+
+
+def mark_torch_stage1_job(case, wid: int, action0: int, action1: int):
+    slot = joint_slot(action0, action1)
+    case["out_selected"][0, wid] = int(pack_expand(0, slot))
+    case["edge_child"][0, 0, slot] = duct.DUCT_EDGE_EXPANDING
+    return slot
+
+
+def test_torch_stage1_allocates_ready_jobs_without_kernel():
+    if not TORCH_CUDA:
+        record("torch stage1 allocates READY jobs without CUDA prepare kernel", True, "skipped: PyTorch CUDA unavailable")
+        return
+    case = make_torch_stage1_tensors(nodes=6, warps=3)
+    mark_torch_stage1_job(case, 0, 2, 3)
+    stale_slot = joint_slot(4, 5)
+    case["out_selected"][0, 1] = int(pack_expand(0, stale_slot))
+    case["edge_child"][0, 0, stale_slot] = 9
+    mark_torch_stage1_job(case, 2, 6, 7)
+    info = duct.prepare_duct_expand_stage1_torch(
+        case["bridge"],
+        case["edge_child"],
+        case["tree_nodes"],
+        case["out_selected"],
+    )
+    torch.cuda.synchronize()
+    ready = case["bridge"].expand_valid.cpu().numpy().tolist()[0]
+    children = case["bridge"].expand_child.cpu().numpy().tolist()[0]
+    ok = (
+        info == {"num_jobs": 2, "num_ready": 2, "num_dropped": 0}
+        and int(case["tree_nodes"][0].item()) == 3
+        and ready == [duct.DUCT_EXPAND_JOB_READY, duct.DUCT_EXPAND_JOB_EMPTY, duct.DUCT_EXPAND_JOB_READY]
+        and children == [1, -1, 2]
+    )
+    record("torch stage1 allocates READY jobs without CUDA prepare kernel", ok, f"children={children}")
+
+
+def test_torch_stage1_drops_overflow_jobs_without_rollback():
+    if not TORCH_CUDA:
+        record("torch stage1 drops overflow jobs without rollback", True, "skipped: PyTorch CUDA unavailable")
+        return
+    case = make_torch_stage1_tensors(nodes=1, warps=1)
+    slot = mark_torch_stage1_job(case, 0, 0, 1)
+    info = duct.prepare_duct_expand_stage1_torch(
+        case["bridge"],
+        case["edge_child"],
+        case["tree_nodes"],
+        case["out_selected"],
+    )
+    torch.cuda.synchronize()
+    ok = (
+        info == {"num_jobs": 1, "num_ready": 0, "num_dropped": 1}
+        and int(case["tree_nodes"][0].item()) == 1
+        and int(case["edge_child"][0, 0, slot].item()) == duct.DUCT_EDGE_EXPANDING
+        and int(case["bridge"].expand_valid[0, 0].item()) == duct.DUCT_EXPAND_JOB_EMPTY
+    )
+    record("torch stage1 drops overflow jobs without rollback", ok)
 
 
 class FixedPolicy(nn.Module):
@@ -437,7 +499,7 @@ class FixedPolicy(nn.Module):
         return self.logits.to(x.device).unsqueeze(0).expand(x.shape[0], -1)
 
 
-def make_action_table(num_agents=2):
+def make_candidate_targets(num_agents=2):
     table = torch.zeros((2, 16, num_agents, 2), dtype=torch.float32, device="cuda")
     for p in range(2):
         for a in range(16):
@@ -457,22 +519,19 @@ def test_policy_sampling_prefers_policy_first_slot():
     logits1[3] = 20.0
     gen = torch.Generator(device="cuda")
     gen.manual_seed(123)
-    ids, _, probs = duct.fill_duct_node_action_slots(
+    targets, probs = duct.fill_duct_node_action_slots(
         bridge,
         torch.tensor([0], device="cuda"),
         torch.tensor([0], device="cuda"),
         states,
-        make_action_table(),
+        make_candidate_targets(),
         FixedPolicy(logits0).cuda(),
         FixedPolicy(logits1).cuda(),
         uniform_sample_prob=0.0,
         generator=gen,
     )
     ok = (
-        int(ids[0, 0, 0]) == 7
-        and int(ids[0, 1, 0]) == 3
-        and sorted(int(x) for x in ids[0, 0].tolist()) == list(range(16))
-        and sorted(int(x) for x in ids[0, 1].tolist()) == list(range(16))
+        targets.shape == (1, 2, 16, 2, 2)
         and float(probs[0, 0, 0]) > 0.99
         and float(probs[0, 1, 0]) > 0.99
     )
@@ -488,12 +547,12 @@ def test_uniform_sampling_uses_uniform_probabilities():
     logits = [100.0] + [-100.0] * 15
     gen = torch.Generator(device="cuda")
     gen.manual_seed(321)
-    ids, _, probs = duct.fill_duct_node_action_slots(
+    targets, probs = duct.fill_duct_node_action_slots(
         bridge,
         [0],
         [0],
         states,
-        make_action_table(),
+        make_candidate_targets(),
         FixedPolicy(logits).cuda(),
         FixedPolicy(logits).cuda(),
         uniform_sample_prob=1.0,
@@ -501,8 +560,7 @@ def test_uniform_sampling_uses_uniform_probabilities():
     )
     expected = torch.full((16,), 1.0 / 16.0, device="cuda")
     ok = (
-        sorted(int(x) for x in ids[0, 0].tolist()) == list(range(16))
-        and sorted(int(x) for x in ids[0, 1].tolist()) == list(range(16))
+        targets.shape == (1, 2, 16, 2, 2)
         and torch.allclose(probs[0, 0], expected)
         and torch.allclose(probs[0, 1], expected)
     )
@@ -519,12 +577,12 @@ def test_nan_inf_policy_falls_back_to_uniform():
     bad1 = [float("inf")] + [0.0] * 15
     gen = torch.Generator(device="cuda")
     gen.manual_seed(111)
-    _, _, probs = duct.fill_duct_node_action_slots(
+    _, probs = duct.fill_duct_node_action_slots(
         bridge,
         [0],
         [0],
         states,
-        make_action_table(),
+        make_candidate_targets(),
         FixedPolicy(bad0).cuda(),
         FixedPolicy(bad1).cuda(),
         uniform_sample_prob=0.0,
@@ -556,19 +614,14 @@ def test_minco_smoke_select_prepare_project_commit():
     case["bridge"] = duct.DuctExpandBridge(1, 4, env.state_dim, 2, 1)
     case["bridge"].node_states[0, 0] = root[0]
     case["bridge"].node_action_targets.zero_()
-    case["bridge"].node_action_ids[0, 0] = torch.arange(
-        16, device="cuda", dtype=torch.int32,
-    ).view(1, 16).expand(2, -1)
     case["bridge"].node_action_probs[0, 0] = 1.0 / 16.0
-    action_table = torch.zeros((2, 16, 2, 2), dtype=torch.float32, device="cuda")
+    candidate_targets = torch.zeros((2, 16, 2, 2), dtype=torch.float32, device="cuda")
     slot = mark_expand_job(case, 0, 0, 0)
-    d = to_device(case)
-    launch_prepare(d)
-    cuda.synchronize()
+    d = prepare_case_for_commit(case)
     info = duct.run_duct_expand_stage2_minco(
         case["bridge"],
         env,
-        action_table,
+        candidate_targets,
         FixedPolicy([0.0] * 16).cuda(),
         FixedPolicy([0.0] * 16).cuda(),
         uniform_sample_prob=1.0,
@@ -605,9 +658,11 @@ def summarize_results_and_exit():
 def main():
     test_fresh_expand_commits_child()
     test_multi_warp_expand_allocates_unique_children()
-    test_capacity_overflow_resets_edge_and_claims()
     test_non_expand_and_stale_jobs_are_ignored()
-    test_failed_commit_resets_edge_and_rolls_back()
+    test_failed_commit_discards_job_without_rollback()
+    test_terminal_commit_publishes_terminal_sentinel()
+    test_torch_stage1_allocates_ready_jobs_without_kernel()
+    test_torch_stage1_drops_overflow_jobs_without_rollback()
     test_policy_sampling_prefers_policy_first_slot()
     test_uniform_sampling_uses_uniform_probabilities()
     test_nan_inf_policy_falls_back_to_uniform()

@@ -266,7 +266,6 @@ def make_case_from_spec(
     action_counts = np.full((trees, nodes, duct.DUCT_PLAYERS), actions, np.int32)
     node_n_arr = np.full((trees, nodes), node_n, np.int32)
     node_expand_inflight = np.zeros((trees, nodes), np.int32)
-    node_expanded = np.zeros((trees, nodes), np.int32)
     node_count = np.full((trees,), nodes, np.int32)
     out_selected = np.full((trees, warps), v3.PACKED_INVALID, np.int32)
     out_path = np.full((trees, warps, path_depth), -1, np.int32)
@@ -280,9 +279,14 @@ def make_case_from_spec(
             edge_actions[0, parent, slot, 0] = a0
             edge_actions[0, parent, slot, 1] = a1
 
+    for parent, children in spec["expanded_edges"].items():
+        for a0, a1, child in children:
+            if child in spec["terminal_nodes"]:
+                slot = joint_slot(a0, a1)
+                edge_child[0, parent, slot] = v3.NODE_EXPANDED_TERMINAL
+
     for nid in range(nodes):
         if nid in spec["terminal_nodes"]:
-            node_expanded[0, nid] = v3.NODE_EXPANDED_TERMINAL
             continue
         a0, a1 = _preferred_pair_for_node(spec, nid)
         action_w[0, nid, 0, a0] = np.float32(best_w)
@@ -297,7 +301,6 @@ def make_case_from_spec(
         "action_counts": action_counts,
         "node_n": node_n_arr,
         "node_expand_inflight": node_expand_inflight,
-        "node_expanded": node_expanded,
         "node_count": node_count,
         "out_selected": out_selected,
         "out_path": out_path,
@@ -313,12 +316,12 @@ def make_case_from_spec(
 
 def compute_expected_pw(case: dict, host: dict, c_pw: float, alpha_pw: float):
     actions = int(case["actions"])
-    nodes = host["node_expanded"].shape[1]
+    nodes = host["node_n"].shape[1]
     allowed = np.zeros((nodes, duct.DUCT_PLAYERS), dtype=np.int32)
     n_eff = np.zeros((nodes, duct.DUCT_PLAYERS), dtype=np.int32)
 
     for node in range(nodes):
-        if int(host["node_expanded"][0, node]) == v3.NODE_EXPANDED_TERMINAL:
+        if node in case["spec"]["terminal_nodes"]:
             continue
 
         for player in range(duct.DUCT_PLAYERS):
@@ -354,7 +357,6 @@ def run_select(case: dict, c_uct: float, c_pw: float, alpha_pw: float):
         d["action_counts"],
         d["node_n"],
         d["node_expand_inflight"],
-        d["node_expanded"],
         d["node_count"],
         d["out_selected"],
         d["out_path"],
@@ -485,9 +487,8 @@ def make_dot(case: dict, host: dict, infos: list[dict], title: str, expected: di
     for lvl in sorted(levels.keys()):
         rank_nodes = []
         for nid in levels[lvl]:
-            nexp = int(host["node_expanded"][0, nid])
             fill = _node_fill_color(nid, spec)
-            if nexp == v3.NODE_EXPANDED_TERMINAL:
+            if nid in spec["terminal_nodes"]:
                 label = f"n{nid}\\nterminal"
             else:
                 label = (
