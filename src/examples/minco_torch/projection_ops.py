@@ -9,6 +9,12 @@ import torch.nn.functional as F
 from .collision_ops import MincoCollisionOps
 from .constants import NDIM
 from .scene import MincoScene
+from .triton_kernels import (
+    build_topk_linear_inputs,
+    jacobi_update_fused_inplace,
+    jacobi_update_megakernel_inplace,
+    triton_available,
+)
 from .transition import MincoTorchTransition
 
 
@@ -75,6 +81,10 @@ class MincoProjectionOps:
         self._sel_den: dict[str, int] = defaultdict(int)
         # torch.compile：默认始终启用（懒编译一次，后续复用）。
         self._compiled_project_target_away = None
+        # Triton 融合 Jacobi 修正：默认关闭，仅用于实验性优化。
+        self._triton_jacobi_enabled = False
+        # Triton Jacobi 模式：basic(用预构建 a_vec/rhs/denom) 或 mega(内核内构建约束)
+        self._triton_jacobi_mode = "basic"
 
     @property
     def num_obstacles(self) -> int:
@@ -103,11 +113,25 @@ class MincoProjectionOps:
         # 修正系数变化后清理已编译图，后续按新系数懒编译。
         self._compiled_project_target_away = None
 
+    def set_triton_jacobi(self, enabled: bool) -> None:
+        """设置 Triton 融合 Jacobi 修正开关。"""
+        self._triton_jacobi_enabled = bool(enabled and triton_available())
+
+    def set_triton_jacobi_mode(self, mode: str) -> None:
+        """设置 Triton Jacobi 模式：basic / mega。"""
+        m = str(mode).strip().lower()
+        if m not in ("basic", "mega"):
+            raise ValueError(f"unsupported triton jacobi mode: {mode}")
+        self._triton_jacobi_mode = m
+
     def _ensure_compiled_project_target_away(self) -> None:
         """懒编译障碍投影 fast-path（始终开启）。"""
         if self._compiled_project_target_away is not None:
             return
         if not hasattr(torch, "compile"):
+            return
+        if self._triton_jacobi_enabled:
+            # Triton jacobi 路径暂不走 compile wrapper，避免图捕获/突变交互导致反向退化。
             return
 
         def _compiled_fn(
@@ -375,11 +399,13 @@ class MincoProjectionOps:
         _pop()
 
         projected = target          # [..., A, 2]
-        margin = torch.as_tensor(
-            self.obstacle_collision_margin + self.obstacle_projection_extra_margin,
-            dtype=target.dtype,
-            device=target.device,
-        )
+        margin = float(self.obstacle_collision_margin + self.obstacle_projection_extra_margin)
+        # 动态边界仅由 coeff 决定，可在迭代前一次性计算，避免每轮重复做 bounds()。
+        if clamp_to_dynamic_bounds:
+            dyn_lower, dyn_upper = self.robot_transition.bounds(coeff)
+        else:
+            dyn_lower = None
+            dyn_upper = None
 
         _push("proj.eval_candidate")
         # 关键路径 1：一次性评估初始目标点的违规候选。
@@ -405,46 +431,84 @@ class MincoProjectionOps:
             )
         _pop()
 
-        _push("proj.topk_select")
-        # 关键路径 2：展平 [P, O]，做 top-k 候选筛选。
-        # [Profile] proj.topk_select ≈ 0.075 ms/iter（~0.43%）
-        # 备注：ncu 显示 top-k 相关 kernel（gatherTopK + bitonicSort）仍是主要 GPU 时间来源之一。
         candidate_count = clearance.shape[-2] * clearance.shape[-1]
         topk = min(self.obstacle_projection_topk, candidate_count)
         fixes_per_iter = min(self.obstacle_projection_fixes_per_iter, topk)
-        # flat_violation: [..., A, P*O]
-        flat_violation = candidate_violation.contiguous().view(*target.shape[:-1], candidate_count)
-        # top_values/top_flat_idx: [..., A, K]
-        top_values, top_flat_idx = torch.topk(flat_violation, k=topk, dim=-1)
-        # checkpoint_idx / obstacle_idx: [..., A, K], 计算 点id / 障碍物id / 边id
-        checkpoint_idx = torch.div(top_flat_idx, self.num_obstacles, rounding_mode="floor")
-        obstacle_idx = top_flat_idx - checkpoint_idx * self.num_obstacles
-        flat_edge_idx = edge_idx.contiguous().view(*target.shape[:-1], candidate_count)  # [..., A, P*O]
-        selected_edge_idx = torch.gather(flat_edge_idx, -1, top_flat_idx)
-        # select 统计：top-k 候选里正违规（>0）比例。
-        self._sel_count(
-            "topk_positive_violation",
-            top_values > 0,
-            torch.ones_like(top_values, dtype=torch.bool),
-        )
-        _pop()
-
-        _push("proj.build_linear")
-        # p_const: [..., A, P, 2]；selected_p_const: [..., A, K, 2]
-        # [Profile] proj.build_linear ≈ 0.182 ms/iter（~1.05%）
         p_const = torch.einsum("pc,...acd->...apd", pos_const, coeff)
-        selected_p_const = torch.gather(
-            p_const,
-            -2,
-            checkpoint_idx.unsqueeze(-1).expand(*checkpoint_idx.shape, NDIM),
+        # Triton 分支可进一步融合 topk + gather（目前仅支持 topk 为 2 次幂）。
+        can_triton_topk_gather = (
+            self._triton_jacobi_enabled
+            and (self._triton_jacobi_mode == "mega")
+            and projected.is_cuda
+            and (projected.dtype in (torch.float16, torch.float32))
+            and (topk > 0)
+            and ((topk & (topk - 1)) == 0)
+            and (topk <= 4)
+            and (not self.prof_nvtx)
+            and (not self.prof_select_stats)
         )
-        # selected_gain: [..., A, K], A个Agent, 每个 Agent 选出 Top-K 个
-        selected_gain = pos_gain[checkpoint_idx]
-        # selected_normals / selected_offsets / selected_edge_valid: [..., A, K, 2] / [..., A, K] / [..., A, K]
-        selected_normals = normals[obstacle_idx, selected_edge_idx]
-        selected_offsets = offsets[obstacle_idx, selected_edge_idx]
-        selected_edge_valid = edge_mask[obstacle_idx, selected_edge_idx]
-        selected_valid = selected_edge_valid & (top_values > 0)
+        if can_triton_topk_gather:
+            _push("proj.topk_build_linear_triton")
+            flat_violation = candidate_violation.contiguous().view(-1, candidate_count)
+            flat_edge_idx = edge_idx.contiguous().view(-1, candidate_count)
+            flat_p_const = p_const.contiguous().view(-1, p_const.shape[-2], NDIM)
+            sg, sn, so, spc, sv = build_topk_linear_inputs(
+                flat_violation,
+                flat_edge_idx,
+                flat_p_const,
+                pos_gain,
+                normals,
+                offsets,
+                edge_mask,
+                topk=topk,
+            )
+            selected_gain = sg.view(*target.shape[:-1], topk)
+            selected_normals = sn.view(*target.shape[:-1], topk, NDIM)
+            selected_offsets = so.view(*target.shape[:-1], topk)
+            selected_p_const = spc.view(*target.shape[:-1], topk, NDIM)
+            selected_valid = sv.view(*target.shape[:-1], topk).bool()
+            selected_edge_valid = selected_valid
+            top_values = None
+            _pop()
+        else:
+            _push("proj.topk_select")
+            # 关键路径 2：展平 [P, O]，做 top-k 候选筛选。
+            # [Profile] proj.topk_select ≈ 0.075 ms/iter（~0.43%）
+            # 备注：ncu 显示 top-k 相关 kernel（gatherTopK + bitonicSort）仍是主要 GPU 时间来源之一。
+            # flat_violation: [..., A, P*O]
+            flat_violation = candidate_violation.contiguous().view(*target.shape[:-1], candidate_count)
+            # top_values/top_flat_idx: [..., A, K]
+            # 这里只需要“top-k 集合”，后续不依赖排序顺序，关闭 sorted 可省掉额外排序开销。
+            top_values, top_flat_idx = torch.topk(flat_violation, k=topk, dim=-1, sorted=False)
+            # checkpoint_idx / obstacle_idx: [..., A, K], 计算 点id / 障碍物id / 边id
+            checkpoint_idx = torch.div(top_flat_idx, self.num_obstacles, rounding_mode="floor")
+            obstacle_idx = top_flat_idx - checkpoint_idx * self.num_obstacles
+            flat_edge_idx = edge_idx.contiguous().view(*target.shape[:-1], candidate_count)  # [..., A, P*O]
+            selected_edge_idx = torch.gather(flat_edge_idx, -1, top_flat_idx)
+            # select 统计：top-k 候选里正违规（>0）比例。
+            self._sel_count(
+                "topk_positive_violation",
+                top_values > 0,
+                torch.ones_like(top_values, dtype=torch.bool),
+            )
+            _pop()
+
+            _push("proj.build_linear")
+            # p_const: [..., A, P, 2]；selected_p_const: [..., A, K, 2]
+            # [Profile] proj.build_linear ≈ 0.182 ms/iter（~1.05%）
+            selected_p_const = torch.gather(
+                p_const,
+                -2,
+                checkpoint_idx.unsqueeze(-1).expand(*checkpoint_idx.shape, NDIM),
+            )
+            # selected_gain: [..., A, K], A个Agent, 每个 Agent 选出 Top-K 个
+            selected_gain = pos_gain[checkpoint_idx]
+            # selected_normals / selected_offsets / selected_edge_valid: [..., A, K, 2] / [..., A, K] / [..., A, K]
+            selected_normals = normals[obstacle_idx, selected_edge_idx]
+            selected_offsets = offsets[obstacle_idx, selected_edge_idx]
+            selected_edge_valid = edge_mask[obstacle_idx, selected_edge_idx]
+            selected_valid = selected_edge_valid & (top_values > 0)
+            _pop()
         # select 统计：被 gather 到的边里，真实有效边比例（非 padding）。
         self._sel_count(
             "selected_edge_valid",
@@ -467,26 +531,84 @@ class MincoProjectionOps:
         _push("proj.iter_refine")
         # [Profile] proj.iter_refine ≈ 0.835 ms/iter（~4.81%）
         if self.iter_update_mode == "jacobi":
-            for _ in range(iters):
-                _push("proj.iter.violation")
-                # Jacobi 批量修正：不过滤 fix 子集，直接对 K 个候选并行累积修正。
-                violation = rhs - torch.sum(a_vec * projected.unsqueeze(-2), dim=-1)
-                weighted_violation = torch.where(
-                    selected_valid,
-                    torch.clamp(violation, min=0.0),
-                    torch.zeros_like(violation),
-                )
-                _pop()
-                _push("proj.iter.apply_correction")
-                correction = self.jacobi_relax * torch.sum(
-                    (weighted_violation / denom).unsqueeze(-1) * a_vec,
-                    dim=-2,
-                )
-                projected = projected + correction
-                _pop()
+            use_triton_jacobi = (
+                self._triton_jacobi_enabled
+                and (not self.prof_nvtx)
+                and (not self.prof_select_stats)
+                and projected.is_cuda
+                and (projected.dtype in (torch.float16, torch.float32))
+            )
+            if use_triton_jacobi:
+                k_dim = int(a_vec.shape[-2])
+                use_mega = (self._triton_jacobi_mode == "mega")
+                if not use_mega:
+                    a_vec_flat = a_vec.contiguous().view(-1, k_dim, NDIM)
+                    rhs_flat = rhs.contiguous().view(-1, k_dim)
+                    denom_flat = denom.contiguous().view(-1, k_dim)
+                else:
+                    selected_gain_flat = selected_gain.contiguous().view(-1, k_dim)
+                    selected_normals_flat = selected_normals.contiguous().view(-1, k_dim, NDIM)
+                    selected_offsets_flat = selected_offsets.contiguous().view(-1, k_dim)
+                    selected_pconst_flat = selected_p_const.contiguous().view(-1, k_dim, NDIM)
+                valid_flat_i8 = selected_valid.to(dtype=torch.int8).contiguous().view(-1, k_dim)
                 if clamp_to_dynamic_bounds:
+                    # 动态边界仅由 coeff 决定，与迭代中的 projected 无关，循环外一次计算即可。
+                    lower_bound, upper_bound = self.robot_transition.bounds(coeff)
+                    lower_flat = lower_bound.contiguous().view(-1, NDIM)
+                    upper_flat = upper_bound.contiguous().view(-1, NDIM)
+                else:
+                    lower_flat = None
+                    upper_flat = None
+            for _ in range(iters):
+                if use_triton_jacobi:
+                    _push("proj.iter.triton_jacobi")
+                    projected_flat = projected.contiguous().view(-1, NDIM)
+                    if use_mega:
+                        jacobi_update_megakernel_inplace(
+                            projected_flat,
+                            selected_gain_flat,
+                            selected_normals_flat,
+                            selected_offsets_flat,
+                            selected_pconst_flat,
+                            valid_flat_i8,
+                            float(margin),
+                            self.jacobi_relax,
+                            lower_flat=lower_flat,
+                            upper_flat=upper_flat,
+                        )
+                    else:
+                        jacobi_update_fused_inplace(
+                            projected_flat,
+                            a_vec_flat,
+                            rhs_flat,
+                            denom_flat,
+                            valid_flat_i8,
+                            self.jacobi_relax,
+                            lower_flat=lower_flat,
+                            upper_flat=upper_flat,
+                        )
+                    projected = projected_flat.view(*projected.shape)
+                    _pop()
+                else:
+                    _push("proj.iter.violation")
+                    # Jacobi 批量修正：不过滤 fix 子集，直接对 K 个候选并行累积修正。
+                    violation = rhs - torch.sum(a_vec * projected.unsqueeze(-2), dim=-1)
+                    weighted_violation = torch.where(
+                        selected_valid,
+                        torch.clamp(violation, min=0.0),
+                        torch.zeros_like(violation),
+                    )
+                    _pop()
+                    _push("proj.iter.apply_correction")
+                    correction = self.jacobi_relax * torch.sum(
+                        (weighted_violation / denom).unsqueeze(-1) * a_vec,
+                        dim=-2,
+                    )
+                    projected = projected + correction
+                    _pop()
+                if clamp_to_dynamic_bounds and (not use_triton_jacobi):
                     _push("proj.iter.clamp_target")
-                    projected = self.robot_transition.project_target(coeff, projected)
+                    projected = torch.minimum(torch.maximum(projected, dyn_lower), dyn_upper)
                     _pop()
         else:
             for _ in range(iters):
@@ -503,7 +625,8 @@ class MincoProjectionOps:
                 _push("proj.iter.select_fix")
                 # 每轮只修正最严重的 fixes_per_iter 个 violation，降低计算开销。
                 # [Profile] proj.iter.select_fix ≈ 0.264 ms/iter（~1.52%，约占 iter_refine 的 31.6%）
-                fix_values, fix_idx = torch.topk(positive_violation, k=fixes_per_iter, dim=-1)
+                # 同样只需要被选中的候选集合，不需要按 violation 大小排序。
+                fix_values, fix_idx = torch.topk(positive_violation, k=fixes_per_iter, dim=-1, sorted=False)
                 # select 统计：fix top-k 里正违规比例。
                 self._sel_count(
                     "fix_topk_positive",
@@ -533,7 +656,7 @@ class MincoProjectionOps:
                 if clamp_to_dynamic_bounds:
                     _push("proj.iter.clamp_target")
                     # [Profile] proj.iter.clamp_target ≈ 0.330 ms/iter（~1.90%，约占 iter_refine 的 39.6%）
-                    projected = self.robot_transition.project_target(coeff, projected)
+                    projected = torch.minimum(torch.maximum(projected, dyn_lower), dyn_upper)
                     _pop()
         _pop()
 
