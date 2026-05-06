@@ -59,10 +59,14 @@ def joint_slot(action0: int, action1: int) -> int:
     return (action0 << duct.DUCT_ACTION_BITS) | action1
 
 
+def path_actions(encoded: int) -> tuple[int, int]:
+    slot = encoded & duct.DUCT_PATH_SLOT_MASK
+    return slot >> duct.DUCT_ACTION_BITS, slot & duct.DUCT_ACTION_MASK
+
+
 def set_edge(case, parent: int, action0: int, action1: int, child: int):
     slot = joint_slot(action0, action1)
     case["edge_child"][0, parent, slot] = child
-    case["edge_actions"][0, parent, slot] = (action0, action1)
     case["node_count"][0] = max(int(case["node_count"][0]), child + 1)
     return slot
 
@@ -70,17 +74,11 @@ def set_edge(case, parent: int, action0: int, action1: int, child: int):
 def set_terminal_edge(case, parent: int, action0: int, action1: int):
     slot = joint_slot(action0, action1)
     case["edge_child"][0, parent, slot] = v3.NODE_EXPANDED_TERMINAL
-    case["edge_actions"][0, parent, slot] = (action0, action1)
     return slot
 
 
 def make_duct_case(trees=1, nodes=4, actions=16, warps=1, path_depth=4):
     edge_child = np.full((trees, nodes, duct.DUCT_JOINT_ACTIONS), duct.DUCT_EDGE_UNEXPANDED, np.int32)
-    edge_actions = np.full(
-        (trees, nodes, duct.DUCT_JOINT_ACTIONS, duct.DUCT_PLAYERS),
-        -1,
-        np.int32,
-    )
     action_w = np.zeros((trees, nodes, duct.DUCT_PLAYERS, actions), np.float32)
     action_n = np.zeros((trees, nodes, duct.DUCT_PLAYERS, actions), np.int32)
     action_inflight = np.zeros((trees, nodes, duct.DUCT_PLAYERS, actions), np.int32)
@@ -90,15 +88,9 @@ def make_duct_case(trees=1, nodes=4, actions=16, warps=1, path_depth=4):
     node_count = np.ones((trees,), np.int32)
     out_selected = np.full((trees, warps), v3.PACKED_INVALID, np.int32)
     out_path = np.full((trees, warps, max(1, path_depth)), -1, np.int32)
-    out_path_actions = np.full(
-        (trees, warps, max(1, path_depth), duct.DUCT_PLAYERS),
-        -1,
-        np.int32,
-    )
     out_len = np.zeros((trees, warps), np.int32)
     return {
         "edge_child": edge_child,
-        "edge_actions": edge_actions,
         "action_w": action_w,
         "action_n": action_n,
         "action_inflight": action_inflight,
@@ -108,7 +100,6 @@ def make_duct_case(trees=1, nodes=4, actions=16, warps=1, path_depth=4):
         "node_count": node_count,
         "out_selected": out_selected,
         "out_path": out_path,
-        "out_path_actions": out_path_actions,
         "out_len": out_len,
         "warps": warps,
         "trees": trees,
@@ -132,7 +123,6 @@ def _release_duct_claims_kernel(
     node_count,
     out_selected,
     out_path,
-    out_path_actions,
     out_len,
 ):
     tree = cuda.blockIdx.x
@@ -172,9 +162,10 @@ def _release_duct_claims_kernel(
     while d < action_steps:
         encoded = out_path[tree, wid, d]
         if encoded >= np.int32(0):
-            parent = encoded >> np.int32(8)
-            a0 = out_path_actions[tree, wid, d, np.int32(0)]
-            a1 = out_path_actions[tree, wid, d, np.int32(1)]
+            parent = encoded >> np.int32(duct.DUCT_PATH_SLOT_BITS)
+            slot = encoded & np.int32(duct.DUCT_PATH_SLOT_MASK)
+            a0 = slot >> np.int32(duct.DUCT_ACTION_BITS)
+            a1 = slot & np.int32(duct.DUCT_ACTION_MASK)
             if (
                 parent >= np.int32(0)
                 and parent < node_limit
@@ -207,7 +198,6 @@ def launch_select_duct(d, c_uct=1.0, c_pw=1.0, alpha_pw=0.5):
         np.float32(c_pw),
         np.float32(alpha_pw),
         d["edge_child"],
-        d["edge_actions"],
         d["action_w"],
         d["action_n"],
         d["action_inflight"],
@@ -217,7 +207,6 @@ def launch_select_duct(d, c_uct=1.0, c_pw=1.0, alpha_pw=0.5):
         d["node_count"],
         d["out_selected"],
         d["out_path"],
-        d["out_path_actions"],
         d["out_len"],
     )
 
@@ -235,7 +224,6 @@ def launch_release_duct(dcase, trees=None, warps=None, virtual_loss=1):
         dcase["node_count"],
         dcase["out_selected"],
         dcase["out_path"],
-        dcase["out_path_actions"],
         dcase["out_len"],
     )
 
@@ -333,7 +321,7 @@ def test_fresh_root_expand_roundtrip():
         and slot == 0
         and int(h["out_len"][0, 0]) == 1
         and int(h["out_path"][0, 0, 0]) == 0
-        and tuple(int(x) for x in h["out_path_actions"][0, 0, 0]) == (0, 0)
+        and path_actions(int(h["out_path"][0, 0, 0])) == (0, 0)
         and int(h["action_inflight"][0, 0, 0, 0]) == 1
         and int(h["action_inflight"][0, 0, 1, 0]) == 1
         and int(h["node_expand_inflight"][0, 0]) == 1
@@ -361,7 +349,7 @@ def test_independent_ucb_existing_joint_edge():
         and node == v3.PACKED_NODE_MASK
         and int(h["out_len"][0, 0]) == 2
         and int(h["out_path"][0, 0, 0]) == slot_23
-        and tuple(int(x) for x in h["out_path_actions"][0, 0, 0]) == (2, 3)
+        and path_actions(int(h["out_path"][0, 0, 0])) == (2, 3)
         and int(h["action_inflight"][0, 0, 0, 2]) == 1
         and int(h["action_inflight"][0, 0, 1, 3]) == 1
         and host_duct_inflight_sum(h2) == 0
@@ -385,7 +373,7 @@ def test_selected_unexpanded_joint_action_expands():
         and node == 0
         and slot == slot_23
         and int(h["out_path"][0, 0, 0]) == slot_23
-        and tuple(int(x) for x in h["out_path_actions"][0, 0, 0]) == (2, 3)
+        and path_actions(int(h["out_path"][0, 0, 0])) == (2, 3)
         and int(h["edge_child"][0, 0, slot_23]) == duct.DUCT_EDGE_EXPANDING
         and int(h["action_inflight"][0, 0, 0, 2]) == 1
         and int(h["action_inflight"][0, 0, 1, 3]) == 1
@@ -473,7 +461,7 @@ def test_terminal_edge_records_path_and_releases_claims():
         and decode_reason(raw) == v3.REASON_OK_TERMINAL
         and int(h["out_len"][0, 0]) == 2
         and int(h["out_path"][0, 0, 0]) == 0
-        and tuple(int(x) for x in h["out_path_actions"][0, 0, 0]) == (0, 0)
+        and path_actions(int(h["out_path"][0, 0, 0])) == (0, 0)
         and int(h["action_inflight"][0, 0, 0, 0]) == 1
         and int(h["action_inflight"][0, 0, 1, 0]) == 1
         and host_duct_inflight_sum(h2) == 0
@@ -549,7 +537,7 @@ def test_depth_limit_after_existing_edge():
         and decode_reason(raw) == v3.REASON_OK_DEPTH_LIMIT
         and int(h["out_len"][0, 0]) == 2
         and int(h["out_path"][0, 0, 0]) == slot
-        and tuple(int(x) for x in h["out_path_actions"][0, 0, 0]) == (0, 0)
+        and path_actions(int(h["out_path"][0, 0, 0])) == (0, 0)
         and int(h["action_inflight"][0, 0, 0, 0]) == 1
         and int(h["action_inflight"][0, 0, 1, 0]) == 1
         and host_duct_inflight_sum(h2) == 0
@@ -574,7 +562,6 @@ def test_invalid_action_count_returns_invalid():
 def test_invalid_shape_rejects_non_256_joint_edges():
     case = make_duct_case(nodes=2, actions=16, path_depth=2)
     case["edge_child"] = np.full((1, 2, 128), duct.DUCT_EDGE_UNEXPANDED, np.int32)
-    case["edge_actions"] = np.full((1, 2, 128, duct.DUCT_PLAYERS), -1, np.int32)
     _, h = run_select_duct(case)
     raw = int(h["out_selected"][0, 0])
     kind, _, _ = decode(raw)
@@ -603,7 +590,7 @@ def test_pw_window_hides_high_value_actions():
         and node == v3.PACKED_NODE_MASK
         and int(h["out_path"][0, 0, 0]) == slot_00
         and int(h["out_path"][0, 0, 0]) != slot_23
-        and tuple(int(x) for x in h["out_path_actions"][0, 0, 0]) == (0, 0)
+        and path_actions(int(h["out_path"][0, 0, 0])) == (0, 0)
         and int(h["action_inflight"][0, 0, 0, 2]) == 0
         and int(h["action_inflight"][0, 0, 1, 3]) == 0
         and host_duct_inflight_sum(h2) == 0
@@ -629,7 +616,7 @@ def test_variable_action_counts_selects_valid_prefix_actions():
         kind == v3.SELECT_TERMINAL
         and node == v3.PACKED_NODE_MASK
         and int(h["out_path"][0, 0, 0]) == slot
-        and tuple(int(x) for x in h["out_path_actions"][0, 0, 0]) == (2, 4)
+        and path_actions(int(h["out_path"][0, 0, 0])) == (2, 4)
         and int(h["action_inflight"][0, 0, 0, 2]) == 1
         and int(h["action_inflight"][0, 0, 1, 4]) == 1
         and host_duct_inflight_sum(h2) == 0
@@ -739,7 +726,7 @@ def test_soft_expand_fallback_avoids_expanding_joint_edge():
     raw = int(h["out_selected"][0, 0])
     kind, slot, node = decode(raw)
     h2 = run_release_duct(d)
-    fallback_actions = tuple(int(x) for x in h["out_path_actions"][0, 0, 0])
+    fallback_actions = path_actions(int(h["out_path"][0, 0, 0]))
     ok = (
         kind == v3.SELECT_EXPAND
         and node == 0
@@ -786,7 +773,7 @@ def test_soft_expand_fallback_uses_ranked_top4_candidates():
         and slot != prefix_scan_slot
         and int(h["edge_child"][0, 0, busy_slot]) == duct.DUCT_EDGE_EXPANDING
         and int(h["edge_child"][0, 0, expected_slot]) == duct.DUCT_EDGE_EXPANDING
-        and tuple(int(x) for x in h["out_path_actions"][0, 0, 0]) == (10, 15)
+        and path_actions(int(h["out_path"][0, 0, 0])) == (10, 15)
         and int(h["action_inflight"][0, 0, 0, 10]) == 1
         and int(h["action_inflight"][0, 0, 1, 15]) == 1
         and host_duct_inflight_sum(h2) == 0

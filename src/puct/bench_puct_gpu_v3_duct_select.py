@@ -43,7 +43,6 @@ class DuctBenchResult:
 def _make_deep_duct_case(trees: int, warps: int, actions: int, depth: int) -> dict:
     nodes = depth + 1
     edge_child = np.full((trees, nodes, duct.DUCT_JOINT_ACTIONS), duct.DUCT_EDGE_UNEXPANDED, np.int32)
-    edge_actions = np.full((trees, nodes, duct.DUCT_JOINT_ACTIONS, duct.DUCT_PLAYERS), -1, np.int32)
     action_w = np.zeros((trees, nodes, duct.DUCT_PLAYERS, actions), np.float32)
     action_n = np.ones((trees, nodes, duct.DUCT_PLAYERS, actions), np.int32)
     action_inflight = np.zeros((trees, nodes, duct.DUCT_PLAYERS, actions), np.int32)
@@ -53,18 +52,14 @@ def _make_deep_duct_case(trees: int, warps: int, actions: int, depth: int) -> di
     node_count = np.full((trees,), nodes, np.int32)
     out_selected = np.full((trees, warps), v3.PACKED_INVALID, np.int32)
     out_path = np.full((trees, warps, depth + 1), -1, np.int32)
-    out_path_actions = np.full((trees, warps, depth + 1, duct.DUCT_PLAYERS), -1, np.int32)
     out_len = np.zeros((trees, warps), np.int32)
 
     for d in range(depth):
         edge_child[:, d, 0] = d + 1
-        edge_actions[:, d, 0, 0] = 0
-        edge_actions[:, d, 0, 1] = 0
         action_w[:, d, :, 0] = 100.0
     edge_child[:, depth - 1, 0] = v3.NODE_EXPANDED_TERMINAL
     return {
         "edge_child": edge_child,
-        "edge_actions": edge_actions,
         "action_w": action_w,
         "action_n": action_n,
         "action_inflight": action_inflight,
@@ -74,7 +69,6 @@ def _make_deep_duct_case(trees: int, warps: int, actions: int, depth: int) -> di
         "node_count": node_count,
         "out_selected": out_selected,
         "out_path": out_path,
-        "out_path_actions": out_path_actions,
         "out_len": out_len,
         "trees": trees,
         "warps": warps,

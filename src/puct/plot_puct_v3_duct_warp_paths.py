@@ -255,11 +255,6 @@ def make_case_from_spec(
     nodes = int(spec["nodes"])
 
     edge_child = np.full((trees, nodes, duct.DUCT_JOINT_ACTIONS), duct.DUCT_EDGE_UNEXPANDED, np.int32)
-    edge_actions = np.full(
-        (trees, nodes, duct.DUCT_JOINT_ACTIONS, duct.DUCT_PLAYERS),
-        -1,
-        np.int32,
-    )
     action_w = np.full((trees, nodes, duct.DUCT_PLAYERS, actions), side_w, np.float32)
     action_n_arr = np.full((trees, nodes, duct.DUCT_PLAYERS, actions), action_n, np.int32)
     action_inflight = np.zeros((trees, nodes, duct.DUCT_PLAYERS, actions), np.int32)
@@ -269,15 +264,12 @@ def make_case_from_spec(
     node_count = np.full((trees,), nodes, np.int32)
     out_selected = np.full((trees, warps), v3.PACKED_INVALID, np.int32)
     out_path = np.full((trees, warps, path_depth), -1, np.int32)
-    out_path_actions = np.full((trees, warps, path_depth, duct.DUCT_PLAYERS), -1, np.int32)
     out_len = np.zeros((trees, warps), np.int32)
 
     for parent, children in spec["expanded_edges"].items():
         for a0, a1, child in children:
             slot = joint_slot(a0, a1)
             edge_child[0, parent, slot] = child
-            edge_actions[0, parent, slot, 0] = a0
-            edge_actions[0, parent, slot, 1] = a1
 
     for parent, children in spec["expanded_edges"].items():
         for a0, a1, child in children:
@@ -294,7 +286,6 @@ def make_case_from_spec(
 
     return {
         "edge_child": edge_child,
-        "edge_actions": edge_actions,
         "action_w": action_w,
         "action_n": action_n_arr,
         "action_inflight": action_inflight,
@@ -304,7 +295,6 @@ def make_case_from_spec(
         "node_count": node_count,
         "out_selected": out_selected,
         "out_path": out_path,
-        "out_path_actions": out_path_actions,
         "out_len": out_len,
         "trees": trees,
         "warps": warps,
@@ -350,7 +340,6 @@ def run_select(case: dict, c_uct: float, c_pw: float, alpha_pw: float):
         np.float32(c_pw),
         np.float32(alpha_pw),
         d["edge_child"],
-        d["edge_actions"],
         d["action_w"],
         d["action_n"],
         d["action_inflight"],
@@ -360,7 +349,6 @@ def run_select(case: dict, c_uct: float, c_pw: float, alpha_pw: float):
         d["node_count"],
         d["out_selected"],
         d["out_path"],
-        d["out_path_actions"],
         d["out_len"],
     )
     cuda.synchronize()
@@ -389,10 +377,10 @@ def collect_warp_infos(case: dict, host: dict):
             enc = int(host["out_path"][0, wid, d])
             if enc < 0:
                 break
-            parent = enc >> 8
-            joint = enc & 0xFF
-            a0 = int(host["out_path_actions"][0, wid, d, 0])
-            a1 = int(host["out_path_actions"][0, wid, d, 1])
+            parent = enc >> duct.DUCT_PATH_SLOT_BITS
+            joint = enc & duct.DUCT_PATH_SLOT_MASK
+            a0 = joint >> duct.DUCT_ACTION_BITS
+            a1 = joint & duct.DUCT_ACTION_MASK
             child = int(host["edge_child"][0, parent, joint])
             visual_child = child if child >= 0 else _candidate_child(spec, parent, joint)
             edges.append(

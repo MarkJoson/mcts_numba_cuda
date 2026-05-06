@@ -56,6 +56,8 @@ DUCT_EXPAND_CANDIDATES = DUCT_EXPAND_TOPK * DUCT_EXPAND_TOPK
 DUCT_EXPAND_JOB_EMPTY = 0
 DUCT_EXPAND_JOB_READY = 1
 DUCT_EXPAND_JOB_FAILED = -1
+DUCT_PATH_SLOT_BITS = 16
+DUCT_PATH_SLOT_MASK = (1 << DUCT_PATH_SLOT_BITS) - 1
 DUCT_SOFT_WINNER = int(os.environ.get("PUCT_DUCT_SOFT_WINNER", "0") == "1")
 DUCT_SOFT_EXPAND = int(os.environ.get(
     "PUCT_DUCT_SOFT_EXPAND",
@@ -80,9 +82,6 @@ DUCT_SOFT_EXPAND = int(os.environ.get(
 #   -2: another warp has claimed this edge for Expand.
 #   -1: terminal transition (NODE_EXPANDED_TERMINAL).
 #  >=0: child node id.
-# edge_actions[tree, node, edge_slot, player] mirrors the decoded joint action
-# for Expand/backup code that consumes action tensors directly.
-#
 #& DUCT新增: 每个玩家独立维护动作边际统计，而不是维护 joint action 的 Q/N。
 #& 理由: DUCT UPDATE 只更新本玩家被选中的动作 a_i，不更新对方动作；
 #&      select 也必须按玩家维度分别套 UCB。
@@ -93,13 +92,9 @@ DUCT_SOFT_EXPAND = int(os.environ.get(
 #   action_inflight[..., i, a] holds virtual visits while select traversals are
 #   in flight.
 #
-#& DUCT新增: path 需要额外保存两个玩家的动作。
-#& 理由: backup 时要对 X_{s,a_i}^i / n_{s,a_i}^i 做边际更新，仅靠
-#&      单人 PUCT 的 (parent_node << 8) | edge_slot 无法知道每个玩家动作。
-# out_path_actions[tree, warp, depth, player] records the per-player actions
-# selected at each traversed node. Backup can use this directly to update only
-# the chosen action for each player. out_path_eids keeps the resolved joint edge
-# slot.
+#& DUCT新增: path 只保存 (parent_node << 16) | joint_slot。
+#& 理由: joint_slot 的高/低 4bit 就是两个玩家动作，backup/rollback 可直接解码，
+#&      不需要额外 out_path_actions[T,W,D,2] 缓冲。
 
 
 # ============================================================
@@ -110,7 +105,7 @@ DUCT_SOFT_EXPAND = int(os.environ.get(
 def _valid_duct_select_shape(max_edge_steps, node_capacity, node_cnt,
                              max_edges, action_capacity,
                              action_players, action_count_players,
-                             edge_action_players, path_action_players):
+                             path_action_players):
     return (
         max_edge_steps >= int32(1) and
         node_capacity > int32(0) and
@@ -121,7 +116,6 @@ def _valid_duct_select_shape(max_edge_steps, node_capacity, node_cnt,
         action_capacity > int32(0) and
         action_players >= int32(DUCT_PLAYERS) and
         action_count_players >= int32(DUCT_PLAYERS) and
-        edge_action_players >= int32(DUCT_PLAYERS) and
         path_action_players >= int32(DUCT_PLAYERS)
     )
 
@@ -471,17 +465,16 @@ def _duct_best_actions_winner_recalc(c_uct, action_W, action_N, action_inflight,
 
 
 @cuda.jit(device=True, inline=True)
-def _duct_claim_joint_expand(edge_tgt_node, edge_actions, node_expand_inflight,
+def _duct_claim_joint_expand(edge_tgt_node, node_expand_inflight,
                              tree, node, joint_slot, lane):
     #& DUCT重构: joint action 固定映射到 0..255 的边槽，缺 child 时直接抢占这条边。
     #& 理由: 不再用节点扩展计数分配线性 slot，避免线性扫描和重复联合动作。
     #& Shape:
     #&   edge_tgt_node: [T, N, 256]，UNEXPANDED -> EXPANDING 的边状态表。
-    #&   edge_actions: [T, N, 256, 2]，记录 joint_slot 解码出的两个玩家动作。
     #&   node_expand_inflight: [T, N]，父节点上正在扩展的 edge 数。
     #& 关键路径:
-    #&   lane0 对目标 joint edge 做一次 CAS；成功后发布 edge_actions 并增加
-    #&   node_expand_inflight。树容量由 select 入口的 tree_full 只读判断处理。
+    #&   lane0 对目标 joint edge 做一次 CAS；成功后增加 node_expand_inflight。
+    #&   两个玩家动作直接由 joint_slot 解码，不再存冗余 edge_actions 表。
     held = int32(0)
     if lane == int32(0):
         prev = cuda.atomic.cas(
@@ -491,10 +484,6 @@ def _duct_claim_joint_expand(edge_tgt_node, edge_actions, node_expand_inflight,
             int32(DUCT_EDGE_EXPANDING),
         )
         if prev == int32(DUCT_EDGE_UNEXPANDED):
-            action0 = joint_slot >> int32(DUCT_ACTION_BITS)
-            action1 = joint_slot & int32(DUCT_ACTION_MASK)
-            edge_actions[tree, node, joint_slot, int32(0)] = action0
-            edge_actions[tree, node, joint_slot, int32(1)] = action1
             cuda.atomic.add(node_expand_inflight, (tree, node), int32(1))
             held = int32(1)
     held = cuda.shfl_sync(FULL_MASK, held, 0)
@@ -596,17 +585,15 @@ def _duct_best_top4_joint_slot(edge_tgt_node, tree, node, avoid_slot, lane,
 
 
 @cuda.jit(device=True, inline=True)
-def _duct_claim_soft_expand_fallback(edge_tgt_node, edge_actions,
-                                     node_expand_inflight,
+def _duct_claim_soft_expand_fallback(edge_tgt_node, node_expand_inflight,
                                      tree, node, avoid_slot, lane, tie_offset,
                                      sorted_action, sorted_score):
     #& DUCT soft-expand claim。
     #& Shape:
     #&   edge_tgt_node: [T, N, 256]，只在 top4xtop4 候选中的 UNEXPANDED 边上 CAS。
-    #&   edge_actions: [T, N, 256, 2]，成功 claim 后写入两个玩家动作。
     #& 关键路径:
     #&   16 个 lane 并行评分候选；lane0 逐轮 CAS 最优候选。容量检查由调用方
-    #&   tree_full 分支控制，本函数只负责抢边。
+    #&   tree_full 分支控制，本函数只负责抢边；动作由 candidate slot 解码。
     held = int32(0)
     fallback_slot = int32(-1)
     retry = int32(0)
@@ -629,10 +616,6 @@ def _duct_claim_soft_expand_fallback(edge_tgt_node, edge_actions,
                 int32(DUCT_EDGE_EXPANDING),
             )
             if prev == int32(DUCT_EDGE_UNEXPANDED):
-                action0 = candidate >> int32(DUCT_ACTION_BITS)
-                action1 = candidate & int32(DUCT_ACTION_MASK)
-                edge_actions[tree, node, candidate, int32(0)] = action0
-                edge_actions[tree, node, candidate, int32(1)] = action1
                 cuda.atomic.add(node_expand_inflight, (tree, node), int32(1))
                 fallback_slot = candidate
                 held = int32(1)
@@ -648,29 +631,22 @@ def _duct_claim_soft_expand_fallback(edge_tgt_node, edge_actions,
 
 
 @cuda.jit(device=True, inline=True)
-def _write_duct_path_step(out_path_eids, out_path_actions,
-                          tree, wid, depth, lane, node, edge_slot):
-    #* Path 编码格式为 (parent_node << 8) | edge_slot。backup 时直接解码。
-    #& DUCT新增: 同步写 out_path_actions，保存每个玩家本次实际选择的动作。
-    #& 理由: DUCT backup 只更新被选中的 a_i，因此 path 里必须有 action0/action1。
+def _write_duct_path_step(out_path_eids, tree, wid, depth, lane, node, edge_slot):
+    #* Path 编码格式为 (parent_node << 16) | edge_slot。低 16bit 支持最多 65536 个 action slot。
     if lane == int32(0):
         if edge_slot >= int32(0):
-            out_path_eids[tree, wid, depth] = (node << int32(8)) | edge_slot
+            out_path_eids[tree, wid, depth] = (node << int32(DUCT_PATH_SLOT_BITS)) | edge_slot
         else:
             out_path_eids[tree, wid, depth] = int32(-1)
-        action0 = edge_slot >> int32(DUCT_ACTION_BITS)
-        action1 = edge_slot & int32(DUCT_ACTION_MASK)
-        out_path_actions[tree, wid, depth, int32(0)] = action0
-        out_path_actions[tree, wid, depth, int32(1)] = action1
 
 
 @cuda.jit(device=True, inline=True)
 def _rollback_duct_vloss_path_nodes(tree, wid, action_depth, lane,
-                                    out_path_eids, out_path_actions,
-                                    action_inflight, virtual_loss,
+                                    out_path_eids, action_inflight, virtual_loss,
                                     n_nodes, action_capacity):
     #& DUCT新增: path rollback 按玩家动作维度回滚 virtual loss。
     #& 理由: 单人 PUCT 回滚 edge_inflight；DUCT 没有 joint edge 级别的选择占用。
+    #&      动作由 path_eid 低 8bit 的 joint_slot 解码，避免冗余 path action 表。
     player = int32(0)
     half_lane = lane
     if lane >= int32(DUCT_MARGINAL_ACTIONS):
@@ -680,10 +656,14 @@ def _rollback_duct_vloss_path_nodes(tree, wid, action_depth, lane,
     d = half_lane
     while d < action_depth:
         encoded = out_path_eids[tree, wid, d]
-        parent = encoded >> int32(8)
+        parent = encoded >> int32(DUCT_PATH_SLOT_BITS)
+        joint_slot = encoded & int32(DUCT_PATH_SLOT_MASK)
         if encoded < int32(0):
             parent = int32(0)
-        action = out_path_actions[tree, wid, d, player]
+            joint_slot = int32(0)
+        action = joint_slot & int32(DUCT_ACTION_MASK)
+        if player == int32(0):
+            action = joint_slot >> int32(DUCT_ACTION_BITS)
         assert parent >= int32(0) and parent < n_nodes
         assert action >= int32(0) and action < action_capacity
         cuda.atomic.sub(action_inflight, (tree, parent, player, action), virtual_loss)
@@ -713,18 +693,16 @@ def _duct_warp_or_i32(value):
 # ============================================================
 @cuda.jit(void(
     float32, float32, float32,
-    int32[:, :, :], int32[:, :, :, :],
+    int32[:, :, :],
     float32[:, :, :, :], int32[:, :, :, :], int32[:, :, :, :],
     int32[:, :, :], int32[:, :], int32[:, :], int32[:],
-    int32[:, :], int32[:, :, :], int32[:, :, :, :], int32[:, :]),
+    int32[:, :], int32[:, :, :], int32[:, :]),
     fastmath=True)
 def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
-                                      edge_tgt_node, edge_actions,
-                                      action_W, action_N, action_inflight,
+                                      edge_tgt_node, action_W, action_N, action_inflight,
                                       action_counts, node_N, node_expand_inflight,
                                       tree_nodes,
-                                      out_selected_node, out_path_eids,
-                                      out_path_actions, out_path_len):
+                                      out_selected_node, out_path_eids, out_path_len):
     """
     双玩家同时决策的 DUCT select kernel。
 
@@ -756,7 +734,6 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
 
     关键输入：
         edge_tgt_node: [tree, node, 256]，-3 未扩展，-2 正在扩展，-1 terminal，>=0 child。
-        edge_actions: [tree, node, 256, player]，缓存 joint slot 解码后的两个动作。
         action_W/N/inflight: [tree, node, player, action]，每个玩家的边缘 DUCT 统计。
         action_counts: [tree, node, player]，每个玩家的合法边缘动作数，最大 16。
         node_N: 节点访问次数，用于 UCB/PW。
@@ -765,8 +742,7 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
 
     输出：
         out_selected_node: 打包后的 SELECT_* 结果，以及被选中的 node/joint slot。
-        out_path_eids: 路径边，编码为 (parent_node << 8) | joint_slot。
-        out_path_actions: 每条路径边对应的 action0/action1。
+        out_path_eids: 路径边，编码为 (parent_node << 16) | joint_slot。
         out_path_len: 路径长度或评估叶子的长度。
     """
     tree = cuda.blockIdx.x
@@ -787,15 +763,13 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
     action_capacity = action_W.shape[3]
     action_players = action_W.shape[2]
     action_count_players = action_counts.shape[2]
-    edge_action_players = edge_actions.shape[3]
-    path_action_players = out_path_actions.shape[3]
 
     node_cnt = tree_nodes[tree]
 
     if not _valid_duct_select_shape(
         max_edge_steps, node_capacity, node_cnt, max_edges,
         action_capacity, action_players, action_count_players,
-        edge_action_players, path_action_players,
+        int32(DUCT_PLAYERS),
     ):
         if lane == int32(0):
             out_selected_node[tree, wid] = _pack_selection(
@@ -824,7 +798,7 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
         if node < int32(0) or node >= node_cnt:
             _rollback_duct_vloss_path_nodes(
                 tree, wid, depth, lane,
-                out_path_eids, out_path_actions, action_inflight,
+                out_path_eids, action_inflight,
                 int32(1), node_cnt, action_capacity,
             )
             cuda.syncwarp(FULL_MASK)
@@ -854,7 +828,7 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
         if not _valid_duct_action_counts(action_count0, action_count1, action_capacity):
             _rollback_duct_vloss_path_nodes(
                 tree, wid, depth, lane,
-                out_path_eids, out_path_actions, action_inflight,
+                out_path_eids, action_inflight,
                 int32(1), node_cnt, action_capacity,
             )
             cuda.syncwarp(FULL_MASK)
@@ -889,7 +863,7 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
             cuda.syncwarp(FULL_MASK)
             _rollback_duct_vloss_path_nodes(
                 tree, wid, depth, lane,
-                out_path_eids, out_path_actions, action_inflight,
+                out_path_eids, action_inflight,
                 int32(1), node_cnt, action_capacity,
             )
             cuda.syncwarp(FULL_MASK)
@@ -928,13 +902,12 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
                 expand_busy = int32(0)
             else:
                 expand_held = _duct_claim_joint_expand(
-                    edge_tgt_node, edge_actions, node_expand_inflight,
+                    edge_tgt_node, node_expand_inflight,
                     tree, node, joint_slot, lane,
                 )
                 if expand_held == int32(1):
                     _write_duct_path_step(
-                        out_path_eids, out_path_actions,
-                        tree, wid, depth, lane, node, joint_slot,
+                        out_path_eids, tree, wid, depth, lane, node, joint_slot,
                     )
                     final_packed = _pack_selection(
                         int32(SELECT_EXPAND),
@@ -953,8 +926,7 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
 
         if joint_child == int32(NODE_EXPANDED_TERMINAL):
             _write_duct_path_step(
-                out_path_eids, out_path_actions,
-                tree, wid, depth, lane, node, joint_slot,
+                out_path_eids, tree, wid, depth, lane, node, joint_slot,
             )
             cuda.syncwarp(FULL_MASK)
             final_packed = _duct_pack_terminal_selection(node, int32(REASON_OK_TERMINAL))
@@ -974,7 +946,7 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
                     tree, node, allowed, lane, log_parent_n_eff, tie_offset,
                 )
                 fallback_slot, fallback_held = _duct_claim_soft_expand_fallback(
-                    edge_tgt_node, edge_actions, node_expand_inflight,
+                    edge_tgt_node, node_expand_inflight,
                     tree, node, joint_slot, lane, wid,
                     sorted_action, sorted_score,
                 )
@@ -987,8 +959,7 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
                     )
                     cuda.syncwarp(FULL_MASK)
                     _write_duct_path_step(
-                        out_path_eids, out_path_actions,
-                        tree, wid, depth, lane, node, fallback_slot,
+                        out_path_eids, tree, wid, depth, lane, node, fallback_slot,
                     )
                     final_packed = _pack_selection(
                         int32(SELECT_EXPAND),
@@ -1005,7 +976,7 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
             cuda.syncwarp(FULL_MASK)
             _rollback_duct_vloss_path_nodes(
                 tree, wid, depth, lane,
-                out_path_eids, out_path_actions, action_inflight,
+                out_path_eids, action_inflight,
                 int32(1), node_cnt, action_capacity,
             )
             cuda.syncwarp(FULL_MASK)
@@ -1026,11 +997,9 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
             final_len = int32(0)
             break
 
-        #* Path 编码格式为 (parent_node << 8) | edge_slot。backup 时直接解码。
-        #& DUCT新增: 这里额外记录 action0/action1，供 DUCT backup 更新每个玩家的动作统计。
+        #* Path 编码格式为 (parent_node << 16) | edge_slot。backup 时直接解码。
         _write_duct_path_step(
-            out_path_eids, out_path_actions,
-            tree, wid, depth, lane, node, joint_slot,
+            out_path_eids, tree, wid, depth, lane, node, joint_slot,
         )
         cuda.syncwarp(FULL_MASK)
 
@@ -1043,7 +1012,6 @@ def _select_kernel_duct_winner_recalc(c_uct, c_pw, alpha_pw,
 
 @cuda.jit
 def _commit_expand_stage2_duct(edge_tgt_node,
-                               edge_actions,
                                action_W,
                                action_N,
                                action_inflight,
@@ -1051,20 +1019,13 @@ def _commit_expand_stage2_duct(edge_tgt_node,
                                node_N,
                                node_expand_inflight,
                                tree_nodes,
-                               out_path_eids,
-                               out_path_actions,
-                               out_path_len,
                                node_states,
-                               node_action_targets,
-                               node_action_probs,
                                expand_valid,
                                expand_parent,
                                expand_slot,
                                expand_child,
                                expand_next_states,
-                               expand_done,
-                               expand_child_action_targets,
-                               expand_child_action_probs):
+                               expand_done):
     """DUCT 扩展阶段2：提交 PyTorch/MINCO 结果并发布 child edge。
 
     并行粒度：
@@ -1076,22 +1037,23 @@ def _commit_expand_stage2_duct(edge_tgt_node,
         expand_parent/slot/child: [T, W]，stage1 分配和声明的 tree metadata。
         expand_next_states: [T, W, state_dim]，MINCO transition 后的 child state。
         expand_done: [T, W]，terminal 标记。
-        expand_child_action_probs: [T, W, 2, 16]，新 child slot 的策略概率。
-        expand_child_action_targets: [T, W, 2, 16, A, 2]，slot 对应连续 target。
 
     树内目标 shape：
         node_states: [T, N, state_dim]。
-        edge_tgt_node/edge_actions: [T, N, 256] / [T, N, 256, 2]。
+        edge_tgt_node: [T, N, 256]。
         action_W/N/inflight: [T, N, 2, 16]。
         action_counts: [T, N, 2]。
 
     关键算法路径：
         1) 校验 READY job、parent/child/slot 范围、edge 仍为 EXPANDING、next_state 有限。
-        2) 失败 job 重置 edge，并回滚 select 加上的 virtual loss。
+        2) 无效 job 只清空 staging；edge/inflight 保持无效占用，后续 backup 仅处理有效节点。
         3) 成功 job 先写 child state，再初始化 256 个 joint edge 和 2x16 边缘动作统计。
-        4) 拷贝 PyTorch 采样出的 child slot targets/probs。
-        5) 设置 node_N/action_counts，threadfence 后发布 edge_tgt_node=child 或 terminal sentinel。
-        6) 发布后释放 node_expand_inflight，并清空 expand_valid。
+        4) 设置 node_N/action_counts，threadfence 后发布 edge_tgt_node=child 或 terminal sentinel。
+        5) 发布后释放 node_expand_inflight，并清空 expand_valid。
+
+    注意：
+        child 的 node_action_targets/probs 已由 PyTorch stage2 按 child id 直接 scatter。
+        这里不再经过 expand_child_action_* staging，避免一份峰值缓冲。
 
     发布约束：
         edge_tgt_node[parent, slot] 是最后的树可见发布点；发布前 child 的统计、
@@ -1116,7 +1078,6 @@ def _commit_expand_stage2_duct(edge_tgt_node,
     node_capacity = node_states.shape[1]
     action_capacity = action_inflight.shape[3]
     state_dim = node_states.shape[2]
-    num_agents = node_action_targets.shape[4]
 
     #& 读取当前 node pool 上界，用于检查 child ticket 是否仍在有效范围内。
     node_cnt = int32(0)
@@ -1162,16 +1123,13 @@ def _commit_expand_stage2_duct(edge_tgt_node,
         node_states[tree, child, idx] = expand_next_states[tree, wid, idx]
         idx += int32(32)
 
-    #& 初始化 child 的固定 16x16 joint edge 表。edge_actions 延迟到 select 命中时也可解码，
-    #& 这里先置 -1，避免调试/断言看到旧值。
+    #& 初始化 child 的固定 16x16 joint edge 表。动作由 slot 直接解码，不再保存冗余表。
     idx = lane
     while idx < int32(DUCT_JOINT_ACTIONS):
         edge_tgt_node[tree, child, idx] = int32(DUCT_EDGE_UNEXPANDED)
-        edge_actions[tree, child, idx, int32(0)] = int32(-1)
-        edge_actions[tree, child, idx, int32(1)] = int32(-1)
         idx += int32(32)
 
-    #& 初始化两个玩家的 16 个 marginal slot 统计，并写入策略采样后的 prob。
+    #& 初始化两个玩家的 16 个 marginal slot 统计。策略 target/prob 已由 PyTorch 写入 child。
     idx = lane
     while idx < int32(DUCT_PLAYERS) * int32(DUCT_MARGINAL_ACTIONS):
         player = idx // int32(DUCT_MARGINAL_ACTIONS)
@@ -1179,25 +1137,6 @@ def _commit_expand_stage2_duct(edge_tgt_node,
         action_W[tree, child, player, action] = float32(0.0)
         action_N[tree, child, player, action] = int32(0)
         action_inflight[tree, child, player, action] = int32(0)
-        node_action_probs[tree, child, player, action] = (
-            expand_child_action_probs[tree, wid, player, action]
-        )
-        idx += int32(32)
-
-    #& Shape拷贝: expand_child_action_targets[T,W,2,16,A,2]
-    #&   -> node_action_targets[T,child,2,16,A,2].
-    idx = lane
-    total_target = int32(DUCT_PLAYERS) * int32(DUCT_MARGINAL_ACTIONS) * num_agents * int32(2)
-    while idx < total_target:
-        player = idx // (int32(DUCT_MARGINAL_ACTIONS) * num_agents * int32(2))
-        rem0 = idx - player * int32(DUCT_MARGINAL_ACTIONS) * num_agents * int32(2)
-        action = rem0 // (num_agents * int32(2))
-        rem1 = rem0 - action * num_agents * int32(2)
-        agent = rem1 >> int32(1)
-        dim = rem1 & int32(1)
-        node_action_targets[tree, child, player, action, agent, dim] = (
-            expand_child_action_targets[tree, wid, player, action, agent, dim]
-        )
         idx += int32(32)
 
     #& lane0 写节点级统计。terminal child 不再创建可遍历节点，只在 parent edge 写 sentinel。
@@ -1239,13 +1178,11 @@ class DuctExpandBridge:
     job staging shape：
         expand_valid/tree/parent/slot/child: [T, W]。
         expand_next_states: [T, W, state_dim]。
-        expand_child_action_targets: [T, W, 2, 16, A, 2]。
-        expand_child_action_probs: [T, W, 2, 16]。
 
     关键路径：
         PyTorch stage1 写 parent/slot/child；
-        Python 调 MINCO projection/transition 和 policy sampling；
-        CUDA stage2 把 next_state/slot 表提交回 tree 并发布 edge。
+        Python 调 MINCO projection/transition 和 policy sampling，并直接 scatter child slot；
+        CUDA stage2 初始化统计、提交 next_state 并发布 edge。
 
     注意：
         PyTorch tensor 是 owner；cuda.as_cuda_array 只是零拷贝 view，
@@ -1253,7 +1190,8 @@ class DuctExpandBridge:
     """
 
     def __init__(self, n_trees: int, node_capacity: int, state_dim: int,
-                 num_agents: int, max_warps: int, device: str = "cuda"):
+                 num_agents: int, max_warps: int, device: str = "cuda",
+                 target_dtype=None, prob_dtype=None):
         import torch
 
         self.n_trees = int(n_trees)
@@ -1262,6 +1200,8 @@ class DuctExpandBridge:
         self.num_agents = int(num_agents)
         self.max_warps = int(max_warps)
         self.device = torch.device(device)
+        self.target_dtype = target_dtype or torch.float16
+        self.prob_dtype = prob_dtype or torch.float16
 
         #& 树内持久 storage：child commit 后 select/backup 都从这些 tensor 读取。
         self.node_states = torch.zeros(
@@ -1271,11 +1211,11 @@ class DuctExpandBridge:
         self.node_action_targets = torch.zeros(
             (self.n_trees, self.node_capacity, DUCT_PLAYERS,
              DUCT_MARGINAL_ACTIONS, self.num_agents, 2),
-            dtype=torch.float32, device=self.device,
+            dtype=self.target_dtype, device=self.device,
         )
         self.node_action_probs = torch.zeros(
             (self.n_trees, self.node_capacity, DUCT_PLAYERS, DUCT_MARGINAL_ACTIONS),
-            dtype=torch.float32, device=self.device,
+            dtype=self.prob_dtype, device=self.device,
         )
 
         #& stage1 -> Python -> stage2 的 job staging。
@@ -1294,23 +1234,11 @@ class DuctExpandBridge:
         self.expand_done = torch.zeros(
             (self.n_trees, self.max_warps), dtype=torch.int32, device=self.device,
         )
-        self.expand_child_action_targets = torch.zeros(
-            (self.n_trees, self.max_warps, DUCT_PLAYERS,
-             DUCT_MARGINAL_ACTIONS, self.num_agents, 2),
-            dtype=torch.float32, device=self.device,
-        )
-        self.expand_child_action_probs = torch.zeros(
-            (self.n_trees, self.max_warps, DUCT_PLAYERS, DUCT_MARGINAL_ACTIONS),
-            dtype=torch.float32, device=self.device,
-        )
-
         self._refresh_dev_views()
 
     def _refresh_dev_views(self) -> None:
         """刷新 Numba CUDA view；shape 与同名 PyTorch tensor 完全一致。"""
         self.dev_node_states = cuda.as_cuda_array(self.node_states)
-        self.dev_node_action_targets = cuda.as_cuda_array(self.node_action_targets)
-        self.dev_node_action_probs = cuda.as_cuda_array(self.node_action_probs)
         self.dev_expand_valid = cuda.as_cuda_array(self.expand_valid)
         self.dev_expand_tree = cuda.as_cuda_array(self.expand_tree)
         self.dev_expand_parent = cuda.as_cuda_array(self.expand_parent)
@@ -1318,8 +1246,6 @@ class DuctExpandBridge:
         self.dev_expand_child = cuda.as_cuda_array(self.expand_child)
         self.dev_expand_next_states = cuda.as_cuda_array(self.expand_next_states)
         self.dev_expand_done = cuda.as_cuda_array(self.expand_done)
-        self.dev_expand_child_action_targets = cuda.as_cuda_array(self.expand_child_action_targets)
-        self.dev_expand_child_action_probs = cuda.as_cuda_array(self.expand_child_action_probs)
 
     def reset_jobs(self) -> None:
         """清空 staging job，不改树内 node_* storage。"""
@@ -1331,8 +1257,6 @@ class DuctExpandBridge:
         self.expand_child.fill_(-1)
         self.expand_next_states.zero_()
         self.expand_done.zero_()
-        self.expand_child_action_targets.zero_()
-        self.expand_child_action_probs.zero_()
 
 
 def prepare_duct_expand_stage1_torch(bridge: DuctExpandBridge,
@@ -1560,8 +1484,8 @@ def fill_duct_node_action_slots(bridge: DuctExpandBridge, tree_ids, node_ids,
             generator=generator,
         )
         bridge.node_states[tree_t, node_t] = states_t
-        bridge.node_action_targets[tree_t, node_t] = targets
-        bridge.node_action_probs[tree_t, node_t] = probs
+        bridge.node_action_targets[tree_t, node_t] = targets.to(dtype=bridge.node_action_targets.dtype)
+        bridge.node_action_probs[tree_t, node_t] = probs.to(dtype=bridge.node_action_probs.dtype)
         return targets, probs
 
 
@@ -1674,8 +1598,8 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_target
         bridge.expand_tree/parent/slot/child: [T, W]，stage1 输出的索引。
         bridge.expand_next_states: [T, W, state_dim]，本函数写入。
         bridge.expand_done: [T, W]，本函数写入。
-        bridge.expand_child_action_probs: [T, W, 2, 16]，本函数写入。
-        bridge.expand_child_action_targets: [T, W, 2, 16, A, 2]，本函数写入。
+        bridge.node_action_probs[tree, child]: [2, 16]，本函数直接 scatter 写入。
+        bridge.node_action_targets[tree, child]: [2, 16, A, 2]，本函数直接 scatter 写入。
 
     关键算法路径：
         1) gather READY jobs。
@@ -1709,7 +1633,7 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_target
                 bridge.node_action_targets[tree_ids, parent_nodes, 1, action1],
             ),
             dim=1,
-        )
+        ).to(dtype=torch.float32)
         full_targets = _duct_combine_player_targets(env, parent_targets, team_ids=team_ids)
         coeff, active, _ = env.unpack_state(parent_states)
         projected_targets, _, _ = env.project_target_away_from_obstacles(
@@ -1736,8 +1660,13 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_target
             uniform_sample_prob=uniform_sample_prob,
             generator=generator,
         )
-        bridge.expand_child_action_targets[job_mask] = targets
-        bridge.expand_child_action_probs[job_mask] = probs
+        child_nodes = bridge.expand_child[job_mask].to(torch.long)
+        bridge.node_action_targets[tree_ids, child_nodes] = targets.to(
+            dtype=bridge.node_action_targets.dtype,
+        )
+        bridge.node_action_probs[tree_ids, child_nodes] = probs.to(
+            dtype=bridge.node_action_probs.dtype,
+        )
 
         status = torch.where(
             ok,

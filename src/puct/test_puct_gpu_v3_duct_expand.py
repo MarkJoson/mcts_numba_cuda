@@ -83,8 +83,6 @@ class NumpyExpandBridge:
         "expand_child",
         "expand_next_states",
         "expand_done",
-        "expand_child_action_targets",
-        "expand_child_action_probs",
     )
 
     def __init__(self, trees: int, nodes: int, state_dim: int,
@@ -95,8 +93,8 @@ class NumpyExpandBridge:
         self.num_agents = num_agents
         self.max_warps = warps
         self.node_states = np.zeros((trees, nodes, state_dim), np.float32)
-        self.node_action_targets = np.zeros((trees, nodes, 2, 16, num_agents, 2), np.float32)
-        self.node_action_probs = np.zeros((trees, nodes, 2, 16), np.float32)
+        self.node_action_targets = np.zeros((trees, nodes, 2, 16, num_agents, 2), np.float16)
+        self.node_action_probs = np.zeros((trees, nodes, 2, 16), np.float16)
         self.expand_valid = np.zeros((trees, warps), np.int32)
         self.expand_tree = np.full((trees, warps), -1, np.int32)
         self.expand_parent = np.full((trees, warps), -1, np.int32)
@@ -104,8 +102,6 @@ class NumpyExpandBridge:
         self.expand_child = np.full((trees, warps), -1, np.int32)
         self.expand_next_states = np.zeros((trees, warps, state_dim), np.float32)
         self.expand_done = np.zeros((trees, warps), np.int32)
-        self.expand_child_action_targets = np.zeros((trees, warps, 2, 16, num_agents, 2), np.float32)
-        self.expand_child_action_probs = np.zeros((trees, warps, 2, 16), np.float32)
 
     def to_device(self):
         return DeviceExpandBridge(self)
@@ -130,8 +126,8 @@ class DeviceExpandBridge:
         for name in (
             "expand_next_states",
             "expand_done",
-            "expand_child_action_targets",
-            "expand_child_action_probs",
+            "node_action_targets",
+            "node_action_probs",
         ):
             getattr(self, f"dev_{name}").copy_to_device(getattr(self, name))
 
@@ -141,11 +137,6 @@ class DeviceExpandBridge:
 
 def make_case(trees=1, nodes=8, warps=1, state_dim=8, num_agents=4, actions=16):
     edge_child = np.full((trees, nodes, duct.DUCT_JOINT_ACTIONS), duct.DUCT_EDGE_UNEXPANDED, np.int32)
-    edge_actions = np.full(
-        (trees, nodes, duct.DUCT_JOINT_ACTIONS, duct.DUCT_PLAYERS),
-        -1,
-        np.int32,
-    )
     action_w = np.zeros((trees, nodes, duct.DUCT_PLAYERS, actions), np.float32)
     action_n = np.zeros((trees, nodes, duct.DUCT_PLAYERS, actions), np.int32)
     action_inflight = np.zeros((trees, nodes, duct.DUCT_PLAYERS, actions), np.int32)
@@ -155,12 +146,10 @@ def make_case(trees=1, nodes=8, warps=1, state_dim=8, num_agents=4, actions=16):
     tree_nodes = np.ones((trees,), np.int32)
     out_selected = np.full((trees, warps), v3.PACKED_INVALID, np.int32)
     out_path = np.full((trees, warps, 2), -1, np.int32)
-    out_path_actions = np.full((trees, warps, 2, duct.DUCT_PLAYERS), -1, np.int32)
     out_len = np.zeros((trees, warps), np.int32)
     bridge = NumpyExpandBridge(trees, nodes, state_dim, num_agents, warps)
     return {
         "edge_child": edge_child,
-        "edge_actions": edge_actions,
         "action_w": action_w,
         "action_n": action_n,
         "action_inflight": action_inflight,
@@ -170,7 +159,6 @@ def make_case(trees=1, nodes=8, warps=1, state_dim=8, num_agents=4, actions=16):
         "tree_nodes": tree_nodes,
         "out_selected": out_selected,
         "out_path": out_path,
-        "out_path_actions": out_path_actions,
         "out_len": out_len,
         "bridge": bridge,
         "trees": trees,
@@ -233,8 +221,9 @@ def seed_child_payload(bridge, done: int = 0):
         bridge.expand_done[0, wid] = done
         for p in range(duct.DUCT_PLAYERS):
             for a in range(duct.DUCT_MARGINAL_ACTIONS):
-                bridge.expand_child_action_probs[0, wid, p, a] = 0.01 * (a + 1 + p)
-                bridge.expand_child_action_targets[0, wid, p, a] = (
+                child = wid + 1
+                bridge.node_action_probs[0, child, p, a] = 0.01 * (a + 1 + p)
+                bridge.node_action_targets[0, child, p, a] = (
                     float(100 * wid + 10 * p + a)
                 )
     if isinstance(bridge, DeviceExpandBridge):
@@ -245,10 +234,8 @@ def mark_expand_job(case, wid: int, action0: int, action1: int):
     slot = joint_slot(action0, action1)
     case["out_selected"][0, wid] = pack_expand(0, slot)
     case["out_path"][0, wid, 0] = slot
-    case["out_path_actions"][0, wid, 0] = (action0, action1)
     case["out_len"][0, wid] = 1
     case["edge_child"][0, 0, slot] = duct.DUCT_EDGE_EXPANDING
-    case["edge_actions"][0, 0, slot] = (action0, action1)
     case["node_expand_inflight"][0, 0] += 1
     case["action_inflight"][0, 0, 0, action0] += 1
     case["action_inflight"][0, 0, 1, action1] += 1
@@ -268,7 +255,6 @@ def launch_commit(dcase):
     b = dcase["bridge"]
     duct._commit_expand_stage2_duct[dcase["trees"], dcase["warps"] * v3.WARP_SIZE](
         dcase["edge_child"],
-        dcase["edge_actions"],
         dcase["action_w"],
         dcase["action_n"],
         dcase["action_inflight"],
@@ -276,20 +262,13 @@ def launch_commit(dcase):
         dcase["node_n"],
         dcase["node_expand_inflight"],
         dcase["tree_nodes"],
-        dcase["out_path"],
-        dcase["out_path_actions"],
-        dcase["out_len"],
         b.dev_node_states,
-        b.dev_node_action_targets,
-        b.dev_node_action_probs,
         b.dev_expand_valid,
         b.dev_expand_parent,
         b.dev_expand_slot,
         b.dev_expand_child,
         b.dev_expand_next_states,
         b.dev_expand_done,
-        b.dev_expand_child_action_targets,
-        b.dev_expand_child_action_probs,
     )
 
 
