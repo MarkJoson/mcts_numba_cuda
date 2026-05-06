@@ -49,6 +49,10 @@ DUCT_EDGE_UNEXPANDED = -3
 DUCT_EDGE_EXPANDING = -2
 DUCT_PLAYER0_MASK = 0x0000FFFF
 DUCT_PLAYER1_MASK = 0xFFFF0000
+# 手动切到 "categorical" 可恢复 logits + candidate_targets 的离散策略路径。
+DUCT_POLICY_OUTPUT = "gaussian"
+DUCT_GAUSSIAN_LOG_STD_MIN = -5.0
+DUCT_GAUSSIAN_LOG_STD_MAX = 2.0
 DUCT_EXPAND_TOPK = 4
 DUCT_EXPAND_TOPK_BITS = 2
 DUCT_EXPAND_TOPK_MASK = DUCT_EXPAND_TOPK - 1
@@ -1185,102 +1189,206 @@ def _as_cuda_float_tensor(value, *, device):
     return torch.as_tensor(value, dtype=torch.float32, device=device).contiguous()
 
 
-def mix_policy_with_uniform(logits, uniform_sample_prob: float):
-    """把策略 logits 转成 DUCT marginal slot 采样分布。
+class DuctActionPolicy:
+    """DUCT action policy.
 
-    Shape:
-        logits: [B, 16]，每行对应一个节点、一个玩家的候选 action logits。
-        return: [B, 16]，已归一化的概率分布。
-
-    关键路径：
-        softmax -> 数值清理 -> 坏行退回 uniform ->
-        mixed = epsilon * uniform + (1 - epsilon) * policy。
+    这个类把 action target 表、双玩家 policy、采样 generator 和排序规则绑在一起；
+    只负责产出按概率降序排列的 action targets/probs，不接触 tree storage。
     """
-    import torch
 
-    if logits.ndim != 2 or logits.shape[1] != DUCT_MARGINAL_ACTIONS:
-        raise ValueError(
-            f"policy logits must have shape (batch, {DUCT_MARGINAL_ACTIONS}), "
-            f"got {tuple(logits.shape)}"
+    def __init__(self, candidate_targets, policy0, policy1,
+                 uniform_sample_prob: float = 0.0, generator=None):
+        self.candidate_targets = candidate_targets
+        self.policy0 = policy0
+        self.policy1 = policy1
+        self.uniform_sample_prob = float(uniform_sample_prob)
+        self.generator = generator
+        if self.uniform_sample_prob < 0.0 or self.uniform_sample_prob > 1.0:
+            raise ValueError(
+                "uniform_sample_prob must be in [0, 1], "
+                f"got {self.uniform_sample_prob}"
+            )
+
+    def rank_targets(self, states):
+        """返回 [B,2,16,A,2] target 和 [B,2,16] prob，slot 按概率降序。"""
+        import torch
+
+        with torch.no_grad():
+            states_t = _as_cuda_float_tensor(states, device=states.device)
+            table = self._candidate_target_table(device=states_t.device)
+            if DUCT_POLICY_OUTPUT == "gaussian":
+                return self._rank_gaussian(states_t, table)
+            if DUCT_POLICY_OUTPUT == "categorical":
+                return self._rank_categorical(states_t, table)
+            raise ValueError(f"unknown DUCT_POLICY_OUTPUT {DUCT_POLICY_OUTPUT!r}")
+
+    def _candidate_target_table(self, *, device):
+        table = _as_cuda_float_tensor(self.candidate_targets, device=device)
+        if table.ndim != 4:
+            raise ValueError(
+                "candidate_targets must have shape "
+                f"({DUCT_PLAYERS}, {DUCT_MARGINAL_ACTIONS}, num_agents, 2), "
+                f"got {tuple(table.shape)}"
+            )
+        expected = (DUCT_PLAYERS, DUCT_MARGINAL_ACTIONS, table.shape[-2], 2)
+        if tuple(table.shape) != expected:
+            raise ValueError(
+                "candidate_targets must have shape "
+                f"({DUCT_PLAYERS}, {DUCT_MARGINAL_ACTIONS}, num_agents, 2), "
+                f"got {tuple(table.shape)}"
+            )
+        return table
+
+    def _mix_logits_with_uniform(self, logits):
+        import torch
+
+        if logits.ndim != 2 or logits.shape[1] != DUCT_MARGINAL_ACTIONS:
+            raise ValueError(
+                f"policy logits must have shape (batch, {DUCT_MARGINAL_ACTIONS}), "
+                f"got {tuple(logits.shape)}"
+            )
+        probs = torch.softmax(logits.float(), dim=-1)
+        finite = torch.isfinite(probs).all(dim=-1)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        sums = probs.sum(dim=-1, keepdim=True)
+        good = finite & torch.isfinite(sums.squeeze(-1)) & (sums.squeeze(-1) > 0.0)
+        uniform = torch.full_like(probs, 1.0 / DUCT_MARGINAL_ACTIONS)
+        probs = torch.where(good.unsqueeze(-1), probs / torch.clamp(sums, min=1e-30), uniform)
+        mixed = self.uniform_sample_prob * uniform + (1.0 - self.uniform_sample_prob) * probs
+        mixed = torch.clamp(mixed, min=torch.finfo(mixed.dtype).tiny)
+        return mixed / mixed.sum(dim=-1, keepdim=True)
+
+    def _gaussian_policy_params(self, output, *, num_agents: int, device):
+        import torch
+
+        if isinstance(output, (tuple, list)):
+            if len(output) != 2:
+                raise ValueError("gaussian policy tuple output must be (mean, log_std)")
+            mean = _as_cuda_float_tensor(output[0], device=device)
+            log_std = _as_cuda_float_tensor(output[1], device=device)
+        else:
+            raw = _as_cuda_float_tensor(output, device=device)
+            if raw.ndim == 2 and raw.shape[1] == num_agents * 4:
+                raw = raw.view(raw.shape[0], num_agents, 4)
+            if raw.ndim == 4 and tuple(raw.shape[1:]) == (2, num_agents, 2):
+                mean = raw[:, 0]
+                log_std = raw[:, 1]
+            elif raw.ndim == 3 and tuple(raw.shape[1:]) == (num_agents, 4):
+                mean = raw[..., :2]
+                log_std = raw[..., 2:]
+            elif raw.ndim == 3 and tuple(raw.shape[1:]) == (num_agents, 2):
+                mean = raw
+                log_std = torch.zeros_like(mean)
+            else:
+                raise ValueError(
+                    "gaussian policy output must be (mean, log_std), "
+                    f"(batch, {num_agents}, 4), (batch, {num_agents * 4}), "
+                    f"or (batch, 2, {num_agents}, 2); got {tuple(raw.shape)}"
+                )
+
+        if mean.ndim != 3 or tuple(mean.shape[1:]) != (num_agents, 2):
+            raise ValueError(
+                f"gaussian policy mean must have shape (batch, {num_agents}, 2), "
+                f"got {tuple(mean.shape)}"
+            )
+        if log_std.ndim == 0:
+            log_std = torch.full_like(mean, float(log_std.item()))
+        elif log_std.ndim == 1 and log_std.numel() == 2:
+            log_std = log_std.view(1, 1, 2).expand_as(mean)
+        elif log_std.ndim == 2 and tuple(log_std.shape) == (num_agents, 2):
+            log_std = log_std.unsqueeze(0).expand_as(mean)
+        elif log_std.shape != mean.shape:
+            log_std = torch.broadcast_to(log_std, mean.shape)
+
+        return mean.contiguous(), torch.clamp(
+            log_std.contiguous(),
+            DUCT_GAUSSIAN_LOG_STD_MIN,
+            DUCT_GAUSSIAN_LOG_STD_MAX,
         )
-    eps = float(uniform_sample_prob)
-    if eps < 0.0 or eps > 1.0:
-        raise ValueError(f"uniform_sample_prob must be in [0, 1], got {eps}")
 
-    probs = torch.softmax(logits.float(), dim=-1)
-    finite = torch.isfinite(probs).all(dim=-1)
-    probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-    sums = probs.sum(dim=-1, keepdim=True)
-    good = finite & torch.isfinite(sums.squeeze(-1)) & (sums.squeeze(-1) > 0.0)
-    uniform = torch.full_like(probs, 1.0 / DUCT_MARGINAL_ACTIONS)
-    probs = torch.where(good.unsqueeze(-1), probs / torch.clamp(sums, min=1e-30), uniform)
-    mixed = eps * uniform + (1.0 - eps) * probs
-    mixed = torch.clamp(mixed, min=torch.finfo(mixed.dtype).tiny)
-    mixed = mixed / mixed.sum(dim=-1, keepdim=True)
-    return mixed
+    def _rank_gaussian(self, states, table):
+        import torch
 
-
-def sample_ranked_action_targets(states, candidate_targets, policy0, policy1,
-                                 uniform_sample_prob: float = 0.0,
-                                 generator=None):
-    """按双玩家策略分布采样并排列 child 的 16 个 marginal target slot。
-
-    Shape:
-        states: [B, state_dim]，即 child state batch。
-        candidate_targets: [2, 16, A, 2]，外部候选 target 池。
-        policy0/1(states): [B, 16] logits。
-        return targets: [B, 2, 16, A, 2]，按采样顺序 gather 后的连续 target。
-        return ordered_probs: [B, 2, 16]，slot 顺序对应的混合概率。
-
-    关键路径：
-        两个玩家分别 softmax+epsilon 混合 -> multinomial 无放回采样 16 个 slot ->
-        从 candidate_targets[player, sampled_slot] gather target，供 child 初始化写入。
-        采样 index 不落盘，树上只保留 target/prob，节省 [T,N,2,16] int32 显存。
-    """
-    import torch
-
-    table = _as_cuda_float_tensor(candidate_targets, device=states.device)
-    if table.ndim != 4:
-        raise ValueError(
-            "candidate_targets must have shape "
-            f"({DUCT_PLAYERS}, {DUCT_MARGINAL_ACTIONS}, num_agents, 2), "
-            f"got {tuple(table.shape)}"
+        batch = states.shape[0]
+        num_agents = int(table.shape[-2])
+        mean0, log_std0 = self._gaussian_policy_params(
+            self.policy0(states), num_agents=num_agents, device=states.device,
         )
-    expected = (DUCT_PLAYERS, DUCT_MARGINAL_ACTIONS, table.shape[-2], 2)
-    if tuple(table.shape) != expected:
-        raise ValueError(
-            "candidate_targets must have shape "
-            f"({DUCT_PLAYERS}, {DUCT_MARGINAL_ACTIONS}, num_agents, 2), "
-            f"got {tuple(table.shape)}"
+        mean1, log_std1 = self._gaussian_policy_params(
+            self.policy1(states), num_agents=num_agents, device=states.device,
         )
 
-    logits0 = policy0(states)
-    logits1 = policy1(states)
-    probs0 = mix_policy_with_uniform(logits0, uniform_sample_prob)
-    probs1 = mix_policy_with_uniform(logits1, uniform_sample_prob)
-    ids0 = torch.multinomial(
-        probs0, DUCT_MARGINAL_ACTIONS, replacement=False, generator=generator,
-    )
-    ids1 = torch.multinomial(
-        probs1, DUCT_MARGINAL_ACTIONS, replacement=False, generator=generator,
-    )
+        shape = (batch, DUCT_MARGINAL_ACTIONS, num_agents, 2)
+        noise0 = torch.randn(shape, dtype=torch.float32, device=states.device,
+                             generator=self.generator)
+        noise1 = torch.randn(shape, dtype=torch.float32, device=states.device,
+                             generator=self.generator)
+        samples0 = mean0.unsqueeze(1) + noise0 * torch.exp(log_std0).unsqueeze(1)
+        samples1 = mean1.unsqueeze(1) + noise1 * torch.exp(log_std1).unsqueeze(1)
+        scores0 = -0.5 * noise0.square().sum(dim=(-1, -2))
+        scores1 = -0.5 * noise1.square().sum(dim=(-1, -2))
+        rank0 = torch.argsort(scores0, dim=1, descending=True)
+        rank1 = torch.argsort(scores1, dim=1, descending=True)
+        gather_rank0 = rank0.view(batch, DUCT_MARGINAL_ACTIONS, 1, 1).expand(
+            -1, -1, num_agents, 2,
+        )
+        gather_rank1 = rank1.view(batch, DUCT_MARGINAL_ACTIONS, 1, 1).expand(
+            -1, -1, num_agents, 2,
+        )
+        targets = torch.stack(
+            (
+                torch.gather(samples0, 1, gather_rank0),
+                torch.gather(samples1, 1, gather_rank1),
+            ),
+            dim=1,
+        )
+        probs = torch.stack(
+            (
+                torch.gather(torch.softmax(scores0, dim=1), 1, rank0),
+                torch.gather(torch.softmax(scores1, dim=1), 1, rank1),
+            ),
+            dim=1,
+        )
+        return targets, probs
 
-    batch = states.shape[0]
-    targets = torch.empty(
-        (batch, DUCT_PLAYERS, DUCT_MARGINAL_ACTIONS, table.shape[-2], 2),
-        dtype=torch.float32, device=states.device,
-    )
-    targets[:, 0] = table[0].index_select(0, ids0.reshape(-1)).view(
-        batch, DUCT_MARGINAL_ACTIONS, table.shape[-2], 2,
-    )
-    targets[:, 1] = table[1].index_select(0, ids1.reshape(-1)).view(
-        batch, DUCT_MARGINAL_ACTIONS, table.shape[-2], 2,
-    )
-    ordered_probs = torch.stack(
-        (torch.gather(probs0, 1, ids0), torch.gather(probs1, 1, ids1)),
-        dim=1,
-    )
-    return targets, ordered_probs
+    def _rank_categorical(self, states, table):
+        import torch
+
+        logits0 = self.policy0(states)
+        logits1 = self.policy1(states)
+        probs0 = self._mix_logits_with_uniform(logits0)
+        probs1 = self._mix_logits_with_uniform(logits1)
+        ids0 = torch.argsort(probs0, dim=1, descending=True)
+        ids1 = torch.argsort(probs1, dim=1, descending=True)
+
+        batch = states.shape[0]
+        targets = torch.empty(
+            (batch, DUCT_PLAYERS, DUCT_MARGINAL_ACTIONS, table.shape[-2], 2),
+            dtype=torch.float32, device=states.device,
+        )
+        targets[:, 0] = table[0].index_select(0, ids0.reshape(-1)).view(
+            batch, DUCT_MARGINAL_ACTIONS, table.shape[-2], 2,
+        )
+        targets[:, 1] = table[1].index_select(0, ids1.reshape(-1)).view(
+            batch, DUCT_MARGINAL_ACTIONS, table.shape[-2], 2,
+        )
+        ordered_probs = torch.stack(
+            (torch.gather(probs0, 1, ids0), torch.gather(probs1, 1, ids1)),
+            dim=1,
+        )
+        return targets, ordered_probs
+
+
+def rank_action_targets(states, candidate_targets, policy0, policy1,
+                        uniform_sample_prob: float = 0.0,
+                        generator=None):
+    return DuctActionPolicy(
+        candidate_targets,
+        policy0,
+        policy1,
+        uniform_sample_prob=uniform_sample_prob,
+        generator=generator,
+    ).rank_targets(states)
 
 
 def fill_duct_node_action_slots(bridge: DuctExpandBridge, tree_ids, node_ids,
@@ -1297,9 +1405,16 @@ def fill_duct_node_action_slots(bridge: DuctExpandBridge, tree_ids, node_ids,
             node_action_probs[tree, node]: [2, 16]。
 
     关键路径：
-        用当前 state 调 policy0/policy1 -> 采样 slot 排列 ->
+        用当前 state 调 policy0/policy1 -> 采样 target slot ->
         只写采样后的 target/prob。root 初始化和 child 发布前的 slot 生成共用这条路径。
     """
+    action_policy = DuctActionPolicy(
+        candidate_targets,
+        policy0,
+        policy1,
+        uniform_sample_prob=uniform_sample_prob,
+        generator=generator,
+    )
     import torch
 
     with torch.no_grad():
@@ -1313,11 +1428,7 @@ def fill_duct_node_action_slots(bridge: DuctExpandBridge, tree_ids, node_ids,
         if node_t.numel() != tree_t.numel():
             raise ValueError("node_ids must match tree_ids")
 
-        targets, probs = sample_ranked_action_targets(
-            states_t, candidate_targets, policy0, policy1,
-            uniform_sample_prob=uniform_sample_prob,
-            generator=generator,
-        )
+        targets, probs = action_policy.rank_targets(states_t)
         bridge.node_states[tree_t, node_t] = states_t
         bridge.node_action_targets[tree_t, node_t] = targets.to(dtype=bridge.node_action_targets.dtype)
         bridge.node_action_probs[tree_t, node_t] = probs.to(dtype=bridge.node_action_probs.dtype)
@@ -1422,20 +1533,16 @@ def step_env_with_projected_targets(env, parent_states, projected_targets):
     return next_flat, done, valid
 
 
-def publish_expand_edges(bridge: DuctExpandBridge,
-                         edge_tgt_node,
-                         node_expand_inflight):
+def publish_expand_edges(bridge: DuctExpandBridge, edge_tgt_node):
     """批量发布 compact expand jobs 到 parent edge。
 
     child 的 state/action storage 必须已经写完；本函数只做最后可见发布点：
-    parent edge 从 EXPANDING 变成 child 或 terminal sentinel，并累计释放
-    node_expand_inflight。重复 parent 通过 bincount 累计处理。
+    parent edge 从 EXPANDING 变成 child 或 terminal sentinel。
     """
     import torch
 
     with torch.no_grad():
         edge_tgt_node = torch.as_tensor(edge_tgt_node, device=bridge.device)
-        node_expand_inflight = torch.as_tensor(node_expand_inflight, device=bridge.device)
         job_count = int(bridge.expand_count[0].item())
         if job_count <= 0:
             return {"num_published": 0}
@@ -1452,19 +1559,12 @@ def publish_expand_edges(bridge: DuctExpandBridge,
             child_nodes,
         ).to(dtype=edge_tgt_node.dtype)
         edge_tgt_node[tree_ids, parent_nodes, slot_ids] = publish
-
-        flat_parent = tree_ids * int(node_expand_inflight.shape[1]) + parent_nodes
-        releases = torch.bincount(
-            flat_parent,
-            minlength=int(node_expand_inflight.numel()),
-        ).view_as(node_expand_inflight).to(dtype=node_expand_inflight.dtype)
-        node_expand_inflight.sub_(releases)
         return {"num_published": job_count}
 
 
 def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_targets,
                                  edge_tgt_node, action_W, action_N, action_inflight,
-                                 action_counts, node_N, node_expand_inflight, tree_nodes,
+                                 action_counts, node_N, tree_nodes,
                                  policy0, policy1,
                                  uniform_sample_prob: float = 0.0,
                                  team_ids=None, generator=None):
@@ -1485,7 +1585,7 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_target
         2) 按 env.team_ids 合成 full target [B,A,2]。
         3) 调 project_target_away_from_obstacles 修正障碍约束。
         4) 用已投影 target 推进环境，得到 next_state/done/valid。
-        5) 调 policy0/policy1 生成 child 的 2x16 slot 排列。
+        5) 调 policy0/policy1 生成 child 的 2x16 target slot。
         6) PyTorch 批量初始化 child storage。
         7) 环境 invalid 作为 terminal 正常提交；最后批量发布 parent edge。
     """
@@ -1498,8 +1598,14 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_target
         action_inflight = torch.as_tensor(action_inflight, device=bridge.device)
         action_counts = torch.as_tensor(action_counts, device=bridge.device)
         node_N = torch.as_tensor(node_N, device=bridge.device)
-        node_expand_inflight = torch.as_tensor(node_expand_inflight, device=bridge.device)
         tree_nodes = torch.as_tensor(tree_nodes, device=bridge.device)
+        action_policy = DuctActionPolicy(
+            candidate_targets,
+            policy0,
+            policy1,
+            uniform_sample_prob=uniform_sample_prob,
+            generator=generator,
+        )
 
         job_count = int(bridge.expand_count[0].item())
         if job_count <= 0:
@@ -1542,14 +1648,7 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_target
         bridge.expand_next_states[:job_count] = clean_next_states
         bridge.expand_done[:job_count] = done.to(torch.int32)
 
-        targets, probs = sample_ranked_action_targets(
-            clean_next_states,
-            candidate_targets,
-            policy0,
-            policy1,
-            uniform_sample_prob=uniform_sample_prob,
-            generator=generator,
-        )
+        targets, probs = action_policy.rank_targets(clean_next_states)
         child_nodes = bridge.expand_child[:job_count].to(torch.long)
         bridge.node_states[tree_ids, child_nodes] = clean_next_states
         edge_tgt_node[tree_ids, child_nodes] = int(DUCT_EDGE_UNEXPANDED)
@@ -1572,9 +1671,7 @@ def run_duct_expand_stage2_minco(bridge: DuctExpandBridge, env, candidate_target
             dtype=bridge.node_action_probs.dtype,
         )
 
-        publish_info = publish_expand_edges(
-            bridge, edge_tgt_node, node_expand_inflight,
-        )
+        publish_info = publish_expand_edges(bridge, edge_tgt_node)
 
         return {
             "num_jobs": job_count,

@@ -251,7 +251,6 @@ def publish_seeded_jobs(case):
     return duct.publish_expand_edges(
         case["bridge"],
         case["edge_child"],
-        case["node_expand_inflight"],
     )
 
 
@@ -274,7 +273,6 @@ def test_fresh_expand_publishes_child():
     ok = (
         int(d["edge_child"][0, 0, slot].item()) == 1
         and int(d["tree_nodes"][0].item()) == 2
-        and int(d["node_expand_inflight"][0, 0].item()) == 0
         and tuple(int(x) for x in d["action_counts"][0, 1].detach().cpu().tolist()) == (16, 16)
         and int(d["action_inflight"][0, 0, 0, 2].item()) == 1
         and int(d["action_inflight"][0, 0, 1, 3].item()) == 1
@@ -304,7 +302,6 @@ def test_multi_warp_expand_allocates_unique_children():
     ok = (
         sorted(edge_children) == [1, 2, 3, 4]
         and int(d["tree_nodes"][0].item()) == 5
-        and int(d["node_expand_inflight"][0, 0].item()) == 0
         and len(set(edge_children)) == 4
     )
     record("multi-warp expand allocates unique child ids", ok, f"children={edge_children}")
@@ -328,7 +325,6 @@ def test_terminal_expand_publishes_terminal_sentinel():
     torch.cuda.synchronize()
     ok = (
         int(d["edge_child"][0, 0, slot].item()) == v3.NODE_EXPANDED_TERMINAL
-        and int(d["node_expand_inflight"][0, 0].item()) == 0
         and tuple(int(x) for x in d["action_counts"][0, 1].detach().cpu().tolist()) == (1, 1)
     )
     record("terminal expand publishes NODE_EXPANDED_TERMINAL sentinel", ok)
@@ -390,13 +386,16 @@ def test_torch_stage1_allocates_ready_jobs_without_kernel():
     record("torch stage1 compacts READY jobs without CUDA prepare kernel", ok, f"children={children}")
 
 
-class FixedPolicy(nn.Module):
-    def __init__(self, logits):
+class FixedGaussianPolicy(nn.Module):
+    def __init__(self, mean, log_std=-12.0):
         super().__init__()
-        self.register_buffer("logits", torch.tensor(logits, dtype=torch.float32))
+        self.register_buffer("mean", torch.as_tensor(mean, dtype=torch.float32).clone())
+        self.register_buffer("log_std", torch.full_like(self.mean, float(log_std)))
 
     def forward(self, x):
-        return self.logits.to(x.device).unsqueeze(0).expand(x.shape[0], -1)
+        mean = self.mean.to(x.device).unsqueeze(0).expand(x.shape[0], -1, -1)
+        log_std = self.log_std.to(x.device).unsqueeze(0).expand_as(mean)
+        return mean, log_std
 
 
 def make_candidate_targets(num_agents=2):
@@ -407,16 +406,14 @@ def make_candidate_targets(num_agents=2):
     return table
 
 
-def test_policy_sampling_prefers_policy_first_slot():
+def test_gaussian_policy_sampling_fills_continuous_slots():
     if not TORCH_CUDA:
-        record("policy sampling fills policy-biased slot permutations", True, "skipped: PyTorch CUDA unavailable")
+        record("Gaussian policy sampling fills continuous target slots", True, "skipped: PyTorch CUDA unavailable")
         return
     bridge = duct.DuctExpandBridge(1, 2, 5, 2, 1)
     states = torch.zeros((1, 5), dtype=torch.float32, device="cuda")
-    logits0 = [-20.0] * 16
-    logits1 = [-20.0] * 16
-    logits0[7] = 20.0
-    logits1[3] = 20.0
+    mean0 = torch.tensor([[-2.0, 1.0], [-1.0, 2.0]], dtype=torch.float32, device="cuda")
+    mean1 = torch.tensor([[2.0, -1.0], [1.0, -2.0]], dtype=torch.float32, device="cuda")
     gen = torch.Generator(device="cuda")
     gen.manual_seed(123)
     targets, probs = duct.fill_duct_node_action_slots(
@@ -425,46 +422,19 @@ def test_policy_sampling_prefers_policy_first_slot():
         torch.tensor([0], device="cuda"),
         states,
         make_candidate_targets(),
-        FixedPolicy(logits0).cuda(),
-        FixedPolicy(logits1).cuda(),
+        FixedGaussianPolicy(mean0).cuda(),
+        FixedGaussianPolicy(mean1).cuda(),
         uniform_sample_prob=0.0,
         generator=gen,
     )
     ok = (
         targets.shape == (1, 2, 16, 2, 2)
-        and float(probs[0, 0, 0]) > 0.99
-        and float(probs[0, 1, 0]) > 0.99
+        and torch.allclose(targets[0, 0].mean(dim=0), mean0, atol=5e-2)
+        and torch.allclose(targets[0, 1].mean(dim=0), mean1, atol=5e-2)
+        and torch.all(probs[0, 0, :-1] >= probs[0, 0, 1:]).item()
+        and torch.all(probs[0, 1, :-1] >= probs[0, 1, 1:]).item()
     )
-    record("policy sampling fills policy-biased slot permutations", ok)
-
-
-def test_uniform_sampling_uses_uniform_probabilities():
-    if not TORCH_CUDA:
-        record("uniform_sample_prob=1 uses uniform probabilities", True, "skipped: PyTorch CUDA unavailable")
-        return
-    bridge = duct.DuctExpandBridge(1, 2, 5, 2, 1)
-    states = torch.zeros((1, 5), dtype=torch.float32, device="cuda")
-    logits = [100.0] + [-100.0] * 15
-    gen = torch.Generator(device="cuda")
-    gen.manual_seed(321)
-    targets, probs = duct.fill_duct_node_action_slots(
-        bridge,
-        [0],
-        [0],
-        states,
-        make_candidate_targets(),
-        FixedPolicy(logits).cuda(),
-        FixedPolicy(logits).cuda(),
-        uniform_sample_prob=1.0,
-        generator=gen,
-    )
-    expected = torch.full((16,), 1.0 / 16.0, device="cuda")
-    ok = (
-        targets.shape == (1, 2, 16, 2, 2)
-        and torch.allclose(probs[0, 0], expected)
-        and torch.allclose(probs[0, 1], expected)
-    )
-    record("uniform_sample_prob=1 uses uniform probabilities", ok)
+    record("Gaussian policy sampling fills continuous target slots", ok)
 
 
 def test_minco_smoke_select_prepare_project_publish():
@@ -502,11 +472,10 @@ def test_minco_smoke_select_prepare_project_publish():
         d["action_inflight"],
         d["action_counts"],
         d["node_n"],
-        d["node_expand_inflight"],
         d["tree_nodes"],
-        FixedPolicy([0.0] * 16).cuda(),
-        FixedPolicy([0.0] * 16).cuda(),
-        uniform_sample_prob=1.0,
+        FixedGaussianPolicy(torch.zeros((2, 2), dtype=torch.float32, device="cuda")).cuda(),
+        FixedGaussianPolicy(torch.zeros((2, 2), dtype=torch.float32, device="cuda")).cuda(),
+        uniform_sample_prob=0.0,
     )
     cuda.synchronize()
     projected_changed = bool(
@@ -518,7 +487,6 @@ def test_minco_smoke_select_prepare_project_publish():
         and info["num_published"] == 1
         and projected_changed
         and int(d["edge_child"][0, 0, slot].item()) == 1
-        and int(d["node_expand_inflight"][0, 0].item()) == 0
         and torch.isfinite(case["bridge"].node_states[0, 1]).all().item()
     )
     record("MINCO smoke prepares, projects, steps, and publishes", ok)
@@ -541,8 +509,7 @@ def main():
     test_multi_warp_expand_allocates_unique_children()
     test_terminal_expand_publishes_terminal_sentinel()
     test_torch_stage1_allocates_ready_jobs_without_kernel()
-    test_policy_sampling_prefers_policy_first_slot()
-    test_uniform_sampling_uses_uniform_probabilities()
+    test_gaussian_policy_sampling_fills_continuous_slots()
     test_minco_smoke_select_prepare_project_publish()
     summarize_results_and_exit()
 
